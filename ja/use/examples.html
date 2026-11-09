@@ -70,8 +70,8 @@
       <p><strong>層ごとの指定（per-layer table）</strong>は、層（材料の領域）ごとにセル数と並べ方を決めるメッシュの作り方である。並べ方は等幅・等質量・等比の 3 つで、等比のときは端のセルの幅か隣のセルとの幅の比を与える。Studio が節点を計算して <code>Mesh.explicit_nodes</code> に書くので、画面に表示した格子がそのまま計算に使われる。推薦メッシュは、レーザーの条件から上限を決めるので、レーザー照射のデッキにしか作れない。輻射温度や圧力で駆動する 5 個（<code>pressure_driven_shock</code>、<code>marshak_wave</code>、<code>indirect_drive_capsule</code>、<code>sn_radiation_foil</code>、<code>burn_exploding_pusher</code>）は、層ごとの指定を使う。駆動が入る側に最も細かいセルを置き、材料の界面でセルの幅が連続になるようにして、メッシュを 2 倍細かくしたデッキと比べて収束を確かめてある。</p>
 
       <h3 id="terms-mesh-difference">メッシュの差と検証の run</h3>
-      <p><strong>メッシュの差（mesh difference）</strong>は、同じ条件を 2 倍細かいメッシュで計算した結果と、プリセットの結果との、観測量ごとの差（%）である。2 倍細かいメッシュは、セルの数を 2 倍にして、全セル（表面のセルを含む）の質量を半分にしたメッシュで、細かくしても観測量が変わらなければ、プリセットのメッシュで量が収束している。吸収エネルギーの収束の目安は 3 % である。SNB のプリセットの吸収エネルギー（7.0 %）のように、目安を超えた差も、そのまま書いてある。</p>
-      <p><strong>検証の run（verification run）</strong>は、Studio のカードで結果を載せる欄の名前で、プリセットを終了時刻まで計算し、メッシュの差を測った run である。入力を検査する <code>tenryu validate</code> や、ソルバーの検証を走らせる <code>tenryu verify</code> とは別のものである。Studio の「収束確認用の組」は、自分のデッキについて同じ細かいメッシュのデッキ（ケース名の末尾に <code>_fine</code>）を作り、同じ確かめを行えるようにする（<a href="gui.html#terms-preset">TENRYU Studio</a> の頁にある）。</p>
+      <p><strong>メッシュの差（mesh difference）</strong>は、同じ条件を 2 倍細かいメッシュで計算した結果と、プリセットの結果との、観測量ごとの差（%）である。2 倍細かいメッシュは、Studio の「収束確認用の組」がプリセットから作るデッキのメッシュで、セル数は元の 2 倍である。「一様」、「節点座標の取り込み」、および「層ごとの指定」の等幅（equal width）・等質量（equal mass）の層では、元の各セルを 2 つに分ける。「推薦メッシュ（レーザー条件から自動）」と「宣言型の指定（zoning_intent）」では、目標セル数を 2 倍にし、設定されているセルの測度（measure）の上下限を半分にしてメッシュを生成し直すため、各セルは元のセルを半分に分けたものとは限らない（詳細は <a href="gui.html#terms-verification-run">TENRYU Studio の検証の run</a> を参照）。SNB のプリセットの差は、代わりに、プリセットのメッシュのすべてのセルを 2 つに分けたメッシュとの差である。細かくしても観測量が変わらなければ、プリセットのメッシュで量が収束している。吸収エネルギーの収束の目安は 3 % である。目安を超えた差も、そのまま書いてある。</p>
+      <p><strong>検証の run（verification run）</strong>は、Studio のカードで結果を載せる欄の名前で、プリセットを終了時刻まで計算し、メッシュの差を測った run である。入力を検査する <code>tenryu validate</code> や、ソルバーの検証を走らせる <code>tenryu verify</code> とは別のものである。Studio の「収束確認用の組」は、自分のデッキについて細かいメッシュのデッキ（ケース名の末尾に <code>_fine</code>）を作り、メッシュの差を確かめられるようにする（<a href="gui.html#terms-preset">TENRYU Studio</a> の頁にある）。</p>
 
       <h3 id="terms-corona">コロナ層、ゴーストコロナ、径方向吸収</h3>
       <p>冷たい固体の表面が、1 セル分の密度の跳びで真空に接していると、351 nm の光は、吸収される経路をほとんどもたないまま臨界面（critical surface。電子密度が臨界密度に達する面）で反射し、加熱で育つコロナの種ができない（<a href="../physics/mesh/1d.html#regions-corona">1D メッシュ</a>）。これを避けるには、コロナ層（corona ramp）かゴーストコロナ（ghost corona）のどちらかを置く。また、1D のレーザーの吸収には、光線追跡（ray tracing）の <code>raytrace_2d</code> と、簡易な径方向吸収（radial absorption）の 2 つのモードがある。以下の 3 語は、この頁のレーザー照射のプリセットがどれを使うかを区別するために定義する。</p>
@@ -143,7 +143,7 @@
           <tr>
             <th><code>snb_nonlocal_foil</code><br>非局所電子熱伝導（SNB）</th>
             <td>平面、CH の箔 25 µm に 351 nm・5×10<sup>14</sup> W/cm² を 1 ns。電子の熱流束を SNB の非局所モデルで解く。1.2 ns。</td>
-            <td>吸収率 86 %。衝撃波は 0.36 ns に後面の壁に届き、それまでのアブレーション圧の平均は 58 Mbar。吸収エネルギーのメッシュの差が 7.0 % で、収束の目安（3 %）に届いていない。</td>
+            <td>吸収率 88 %。衝撃波は 0.36 ns に後面の壁に届き、それまでのアブレーション圧の平均は 47 Mbar。プリセットのメッシュのすべてのセルを 2 つに分けたメッシュとの吸収エネルギーの差は 0.7 % である。</td>
           </tr>
           <tr>
             <th><code>cbet_hot_electrons</code><br>CBET とホット電子</th>

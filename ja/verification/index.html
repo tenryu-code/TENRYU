@@ -21,7 +21,7 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>解析的な検査は、Sedov / Noh、多群（multigroup）Marshak のスペクトル、SNB（Schurtz–Nicolaï–Busquet）の Epperlein–Short 分散関係（dispersion relation）の帯、レーザーの屈折・吸収則などを、コード本体から独立した参照と比較する。</li>
+        <li>解析的な検査は、Sedov / Noh、多群（multigroup）Marshak のスペクトル、SNB（Schurtz–Nicolaï–Busquet）の線形応答（閉じた形の解および公表された SNB 曲線との比較）、レーザーの屈折・吸収則などを、コード本体から独立した参照と比較する。</li>
         <li><a href="#gxii">GXII</a>（激光 XII 号、GEKKO XII）の 1D FLD（flux-limited diffusion、流束制限拡散）の回帰試験は、爆縮（implosion）の履歴上の指標を基準解と比較する。基準解は期待どおりに通すために動かす値ではなく、物理的に説明できる変更に限り、定量的なレビューを経て取り直す。</li>
         <li>決定論的（deterministic）な 1D の経路では、実行のたびにビット単位で一致する（bitwise identical）ことが基準である。2D RZ でも、1 ステップ内の浮動小数点の和を固定順にしてあり、同じ構成の 2 本の実行にビット単位の一致を要求する。</li>
         <li>I 系列（名前に I1、I2、I3、I5、I6 を含む CTest の試験。<a href="#tag-legend">凡例</a>参照）は、グレイ（gray、振動数に依らない不透明度）の輻射衝撃波、多群 FLD のグレイ一致、S<sub>N</sub>（discrete ordinates、離散座標法）の輻射衝撃波、2 温度（two-temperature）の輻射衝撃波、S<sub>N</sub> 多群のグレイ一致を、2D RZ の連成条件での受け入れ判定へ引き上げる。</li>
@@ -59,12 +59,12 @@
         <tbody>
           <tr><th>流体</th><td>Sedov–Taylor の爆風（blast wave）は、衝撃波の半径・密度分布・エネルギーを相似解（similarity solution）と照合する。Noh は、衝撃波の位置、圧縮のプラトー（plateau）、上流の流れ、保存を、幾何ごとの解析値と照合する。</td><td><code>sedov</code>、<code>noh</code>、<code>noh_planar</code>、<code>noh_cylindrical</code></td></tr>
           <tr><th>多群 FLD</th><td>8 群の Marshak のプラトーを、独立なプランク積分（Planck integral）から得たスペクトルと照合する。振動数に依存する緩和（relaxation）では、群ごとの不透明度の配線を、閉じた形の後退オイラー応答（backward-Euler response）で検査する。</td><td><code>fld_1d_mg_planar_marshak_spectrum</code>、<code>fld_1d_mg_planar_freqdep_relaxation</code></td></tr>
-          <tr><th>SNB 熱伝導</th><td>離散的な分散関係との厳しい比較と、Epperlein–Short や VFP（Vlasov–Fokker–Planck 運動論計算）のデータに基づく物理的な帯 [4,5] とを分離する。格子と群の数を変えた一連の計算、単調性、局所極限（local limit）、保存も同じ試験群で確認する。</td><td><code>snb_local_limit_1d</code>、<code>snb_dispersion_1d</code>、<code>snb_conservation_1d</code></td></tr>
+          <tr><th>SNB 熱伝導</th><td>1D SNB を閉じた形の解（線形応答、格子の収束次数、群数に対する収束）および Brodrick ら（2017）[7] と Sherlock ら（2017）[8] の公表された SNB・VFP（Vlasov–Fokker–Planck）結果と比較し、Marocchino ら（2013）[4] の結果との比較を記録する。保存とビット単位の再現性も検査する。</td><td><a href="../physics/conduction/snb.html#verification">1D SNB の 11 個の verify 対象</a>：<code>snb1d_planar_response</code>、<code>snb1d_curvilinear_order</code>、<code>snb1d_group_convergence</code>、<code>snb1d_brodrick_fig1</code>、<code>snb1d_brodrick_hohlraum</code>、<code>snb1d_marocchino_fig1_record</code>、<code>snb1d_iteration_decay</code>、<code>snb1d_sherlock_heat_bath</code>、<code>snb1d_marocchino_fig3_record</code>、<code>snb1d_driver_unconverged_count</code>、<code>snb1d_inprocess_zero_steps</code>。各対象は <code>./build/tenryu verify &lt;target&gt;</code> と、同名の ctest で実行する。</td></tr>
           <tr><th>レーザー・不透明度</th><td>一様な媒質での Beer–Lambert 減衰、解析的な屈折率分布における転回点（turning point）、3 次元光線の吸収と沈着のエネルギー台帳を検査し、<code>rho*kappa</code> の掛け忘れや二重掛けも検出する。</td><td><code>laser_beer_lambert</code>、<code>laser_3d_beer_lambert</code>、<code>laser_3d_refraction</code></td></tr>
           <tr><th>輻射の波面</th><td>Hammer–Rosen の超音速 Marshak 波 [3] について、波面の等値面と、入射・逸出のエネルギー台帳を摂動論（perturbation theory）の解析解と照合する。</td><td><code>hammer_rosen_supersonic</code></td></tr>
         </tbody>
       </table>
-      <p>許容差は一律ではない。たとえば決定論的な Beer–Lambert の光線追跡（ray tracing）は統計誤差をもたないため、厳しい相対誤差を要求できる。一方、文献の図から読み取った SNB の物理的な帯は、離散演算子の精度に対する検査とは分けて扱い、帯を広げて、高波数側にあるモデルの既知の適用限界まで「合格」に見せることはしない。</p>
+      <p>許容差は一律ではない。たとえば決定論的な Beer–Lambert の光線追跡（ray tracing）は統計誤差をもたないため、厳しい相対誤差を要求できる。1D SNB の試験は、Brodrick らの図 1(a) [7] の公表された SNB 曲線との比較を、その曲線の読み取り不確かさ（digitization uncertainty）で判定し、その他の公表曲線との比較は合否を判定せずに記録する。公表された VFP 結果とは、公表された SNB 結果自体の偏差から作る上限を用いて比較する。</p>
     </section>
 
     <section aria-labelledby="gxii">
@@ -122,7 +122,7 @@
           <tr><th>試験群</th><th>検査する内容</th><th>CTest での見つけ方</th></tr>
         </thead>
         <tbody>
-          <tr><th>I1: グレイ輻射衝撃波の参照解</th><td>半解析的な（semi-analytic）グレイ輻射衝撃波の参照解 — LR07 と LE08 [6,7]、およびリミッタを切った FLD-CED の常微分方程式（ordinary differential equation、ODE）による参照解（<a href="#tag-legend">凡例</a>参照）— を 1D で、さらに 2D RZ の z 方向スラブでの計算（半径方向に薄いスラブ内を z 方向に走る平面衝撃波で、半径方向の不変性を判定）を用い、衝撃波、前駆領域（precursor）、保存、参照分布への一致を固定する。</td><td><code>ctest --test-dir build -R "I1|i1"</code></td></tr>
+          <tr><th>I1: グレイ輻射衝撃波の参照解</th><td>半解析的な（semi-analytic）グレイ輻射衝撃波の参照解 — LR07 と LE08 [5,6]、およびリミッタを切った FLD-CED の常微分方程式（ordinary differential equation、ODE）による参照解（<a href="#tag-legend">凡例</a>参照）— を 1D で、さらに 2D RZ の z 方向スラブでの計算（半径方向に薄いスラブ内を z 方向に走る平面衝撃波で、半径方向の不変性を判定）を用い、衝撃波、前駆領域（precursor）、保存、参照分布への一致を固定する。</td><td><code>ctest --test-dir build -R "I1|i1"</code></td></tr>
           <tr><th>I2: 多群 FLD のグレイ一致</th><td>振動数に依らない不透明度のもとで、多群 FLD の群についての和が連成したグレイ計算へ収束すること、波面の位置が群数を増やしたとき（Cauchy の収縮）と格子を細かくしたとき（Richardson の格子列）に収束すること、健全性監査（sanity audit。物質を解くニュートン反復（Newton iteration）がすべて収束し、床の発動や緊急のセル無効化といった非常の処置が一度も働かず、半径方向の不変性が保たれること）と保存を検査する。</td><td><code>ctest --test-dir build -R "I2|i2.*mgfld"</code></td></tr>
           <tr><th>I3: S<sub>N</sub> 輻射衝撃波</th><td>S<sub>N</sub> の次数（S<sub>4</sub>、S<sub>8</sub>、S<sub>16</sub>）、不透明度の倍率（1、20、200）、格子を変えた一連の計算にわたって、輻射の分布、流束、前駆領域、物質側の衝撃波、保存、FLD との順序関係、半径方向の不変性を検査する。</td><td><code>ctest --test-dir build -R "I3|i3.*radshock"</code></td></tr>
           <tr><th>I5: 2 温度の輻射衝撃波</th><td>電子温度 \(T_e\) とイオン温度 \(T_i\) を別に進める 2 温度の計算で、電子とイオンのエネルギー交換が有限の速さのため衝撃波の後ろで \(T_i\) と \(T_e\) が分離するグレイの輻射衝撃波を、2D RZ の z 方向スラブで解き、FLD-CED の 2 温度の ODE 参照解と比べる。衝撃波の前後の窓で、\(T_e\) と \(T_i\) の相対 L2 差が 0.05 以下、\(T_i/T_e-1\) のピークの相対差が 0.10 以下、半径方向の不変性が \(10^{-6}\) 以下であることを要求する。</td><td><code>ctest --test-dir build -R "I5|i5"</code>（名前に <code>expensive</code> を含む。タイムアウトは 12 時間）</td></tr>
@@ -140,12 +140,11 @@
         <thead><tr><th>タグ・用語</th><th>意味</th></tr></thead>
         <tbody>
           <tr><th>L1 / L2（レーザー）</th><td>レーザーの検査の 2 つの水準。L1 = レーザー単独の物理の検査（屈折、Beer–Lambert 減衰、エネルギー台帳、光線数に対する収束）、L2 = レーザーと流体を連成した検査。誤差ノルムの \(L_2\)/\(L_\infty\) とは無関係。</td></tr>
-          <tr><th>G1–G5（熱伝導）</th><td>SNB 非局所伝導の検査系列。G1 = SNB を切った計算と局所モデルのビット単位の一致、G2 = 局所極限と 2 次漸近、G3 = Epperlein–Short 分散、G4 = 保存、G5 = 最大値原理。</td></tr>
           <tr><th>G-R / G-K / G-P（核燃焼）</th><td>領域別の燃焼検査系列（燃焼の単体試験のなかの節の名前）。R = 反応率と燃料消費、K = Fraley の飛程と沈着の積分核（kernel）、P = 電子・イオン分配。</td></tr>
           <tr><th>H1 / H2（2D 流体）</th><td>2D RZ 流体の参照デッキ。H1 = 平面 Sod、H2 = 円筒 Noh。</td></tr>
           <tr><th>I1 / I2 / I3 / I5 / I6</th><td>2D RZ 統合試験群（<a href="#integrated">I 系列の表</a>）。I1 = グレイ輻射衝撃波、I2 = 多群 FLD のグレイ一致、I3 = S<sub>N</sub> 輻射衝撃波、I5 = 電子とイオンの温度を別に進める 2 温度の輻射衝撃波、I6 = S<sub>N</sub> 多群グレイ一致の受け入れ判定。</td></tr>
           <tr><th>R2（S<sub>N</sub>）</th><td>2D RZ の S<sub>N</sub> 輻射の試験群。S<sub>N</sub> の次数を S<sub>4</sub>、S<sub>8</sub>、S<sub>16</sub> と上げた計算の収束（S<sub>4</sub> と S<sub>16</sub> の相対 L2 差が 0.10 以下、S<sub>8</sub> と S<sub>16</sub> の差が 0.05 以下で、S<sub>8</sub> の差のほうが小さいこと）と、光学的に厚い極限での FLD との 5% 以内の一致などを検査する。EOS の電荷モーメント \(r_2\) とは無関係。</td></tr>
-          <tr><th>LR07 / LE08 / FLD-CED（I1 の参照解）</th><td>I1 の相手になる参照解。Lowrie–Rauenzahn 2007（LR07）と Lowrie–Edwards 2008（LE08）の半解析的グレイ輻射衝撃波 [6,7]、およびエディントン因子（Eddington factor）を 1/3 の定数にして（流束制限関数を使わずに）グレイ FLD を ODE として積分した参照解（FLD-CED、constant-Eddington FLD）。</td></tr>
+          <tr><th>LR07 / LE08 / FLD-CED（I1 の参照解）</th><td>I1 の相手になる参照解。Lowrie–Rauenzahn 2007（LR07）と Lowrie–Edwards 2008（LE08）の半解析的グレイ輻射衝撃波 [5,6]、およびエディントン因子（Eddington factor）を 1/3 の定数にして（流束制限関数を使わずに）グレイ FLD を ODE として積分した参照解（FLD-CED、constant-Eddington FLD）。</td></tr>
           <tr id="tag-seed-corona"><th>シード・コロナ（seed corona）</th><td>回帰デッキが、シェルの外面（外半径 250 µm）の外側に初期状態として置く、指数関数的に薄くなる低密度の層。密度は \(\rho=0.05\,e^{-(r-250\,\mu m)/2\,\mu m}\) g/cm³（デッキの変数 <code>RHO_CORONA0</code> = 0.05 g/cm³、<code>L_CORONA</code> = 2 µm）で、外半径から 10 µm（<code>R_CORONA_END</code>）までの範囲に置き、密度の下限を \(3\times10^{-4}\) g/cm³（<code>RHO_CORONA_MIN</code>）とする。初期の密度分布は、臨界密度に達する半径とセルの境界とともに<a href="#fig-seed-corona">図A</a>に示す。この層が加える質量は CH シェルの質量の約 0.5%（1% 未満）である。層がないと、冷たい固体の表面が 1 セルの密度の段になり、351 nm の光線は逆制動輻射の吸収の経路をほとんどもたないまま臨界面で反射して、パルス全体での吸収率が \(4\times10^{-4}\) にとどまり、加熱で広がるコロナが自力で立ち上がらない（デッキのコメントに記録された過去の測定値で、再測定していない）。この層は、レーザーの吸収とコロナの形成に効く。CBET の頁の「シード」（結合係数を求めるとき標本点を出す側の状態）や、乱数の種 <code>Main.seed</code> とは別のものである。</td></tr>
           <tr id="tag-chord-raytrace"><th>弦追跡（chord ray tracing）</th><td>1D 球対称の流体で、ビームごとに口径を同じ幅の環（<code>Laser.rays_per_beam</code> 個。1D の既定は 1000）に分け、環ごとに 1 本の光線を、標的の中心を通りビームの向きに固定した (R, Z) 平面の中で、屈折させながら追跡する方法。球対称なので、平面の向きは吸収の分布を変えない。回帰デッキは <code>Laser.mode="raytrace_2d"</code>、<code>rays_per_beam=1000</code> を使う。詳しくは<a href="../physics/laser/raytrace.html#chord-raytrace">レーザーの頁</a>で説明する。</td></tr>
           <tr id="tag-golden"><th>基準解（golden）</th><td>承認した実行の指標値を保存した参照値。回帰デッキの基準解は <code>examples/<wbr>verification/<wbr>gxii_1d_fld_regression/<wbr>golden.json</code> で、吸収エネルギー、最大圧縮時刻、<code>rho_peak_max</code>、<code>shell_r_min_cm</code>、<code>rhoR_max</code>、<code>Tc_max_eV</code>、実行条件 <code>run_profile</code> を含む。正解の証明ではなく、変化の検出器である。取り直しの条件と手順は<a href="#golden">基準解との回帰</a>の節にある。</td></tr>
@@ -167,7 +166,7 @@
 
 # Examples
 ctest --test-dir build -R "sedov|noh|snb|gxii_1d_fld"
-./build/tenryu verify snb_dispersion_1d</code></pre>
+./build/tenryu verify snb1d_planar_response</code></pre>
       <p>利用できる CTest の名前は <code>ctest --test-dir build -N</code> で確認できる。長時間の試験群を明示的に選ぶ場合は <code>-L expensive</code>、通常の確認から除外する場合は <code>-LE expensive</code> を使う。検査はビルドオプション、HDF5、MPI、GPU の実行環境に依存するため、スキップを合格と読み替えず、CTest のラベルと実行ログを結果と一緒に保存すること。</p>
     </section>
 
@@ -177,10 +176,11 @@ ctest --test-dir build -R "sedov|noh|snb|gxii_1d_fld"
         <li>L. I. Sedov, <i>Similarity and Dimensional Methods in Mechanics</i> (Academic Press, New York, 1959).</li>
         <li>W. F. Noh, "Errors for Calculations of Strong Shocks Using an Artificial Viscosity and an Artificial Heat Flux," J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
         <li>J. H. Hammer and M. D. Rosen, "A Consistent Approach to Solving the Radiation Diffusion Equation," Phys. Plasmas 10, 1829–1845 (2003). <a href="https://doi.org/10.1063/1.1564599">doi:10.1063/1.1564599</a></li>
-        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
         <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
         <li>R. B. Lowrie and R. M. Rauenzahn, "Radiative Shock Solutions in the Equilibrium Diffusion Limit," Shock Waves 16, 445–453 (2007). <a href="https://doi.org/10.1007/s00193-007-0081-2">doi:10.1007/s00193-007-0081-2</a></li>
         <li>R. B. Lowrie and J. D. Edwards, "Radiative Shock Solutions with Grey Nonequilibrium Diffusion," Shock Waves 18, 129–143 (2008). <a href="https://doi.org/10.1007/s00193-008-0143-0">doi:10.1007/s00193-008-0143-0</a></li>
+        <li>J. P. Brodrick, R. J. Kingham, M. M. Marinak, et al., "Testing Nonlocal Models of Electron Thermal Conduction for Magnetic and Inertial Confinement Fusion Applications," Phys. Plasmas 24, 092309 (2017). <a href="https://doi.org/10.1063/1.5001079">doi:10.1063/1.5001079</a></li>
+        <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
       </ol>
     </section>
 

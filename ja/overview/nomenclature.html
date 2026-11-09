@@ -62,7 +62,7 @@
           <tr><th>IAW</th><td>イオン音波（ion-acoustic wave）。</td></tr>
           <tr><th>IB</th><td>逆制動輻射（inverse bremsstrahlung）。衝突によるレーザー吸収。</td></tr>
           <tr><th>ICF</th><td>慣性閉じ込め核融合（inertial confinement fusion）。</td></tr>
-          <tr><th>iSNB</th><td>Implicit SNB：Cao 2015 の、ピカール反復（Picard iteration）で SNB の補正を熱伝導の時間積分へ結合する方法。</td></tr>
+          <tr><th>iSNB</th><td>Implicit SNB：1D では、群の求解を陰的伝導ステップとともに反復する方法。</td></tr>
           <tr><th>LC</th><td>Linear characteristic（線形特性法）：2D RZ の既定の \(S_N\) 空間離散化（<code>linear_characteristic</code>）。1D の既定は線形不連続法（linear discontinuous、<code>linear_discontinuous</code>）。</td></tr>
           <tr><th>LP</th><td>Levermore–Pomraning（FLD の既定の流束リミッタ、flux limiter）。</td></tr>
           <tr><th>LPI</th><td>Laser–plasma instability（ホット電子（hot electron）を駆動するパラメトリック不安定性）。</td></tr>
@@ -97,6 +97,12 @@
           <tr><th>OMEGA</th><td>米国ロチェスター大学の LLE（Laboratory for Laser Energetics）にある 60 ビームのレーザー。60 ポートの CBET プリセットとして登場。</td></tr>
           <tr><th>NIF</th><td>National Ignition Facility（国立点火施設）。LLNL（Lawrence Livermore National Laboratory）にある 192 ビームのレーザー。192 ポートの CBET プリセットとして登場。</td></tr>
           <tr><th>HELIOS</th><td>Prism Computational Sciences の商用 1D ラグランジュ輻射流体コード。コード間ベンチマークの相手。</td></tr>
+          <tr><th>IMPACT</th><td>空間 2 次元の VFP（Vlasov–Fokker–Planck）コード。分布関数の等方成分と 1 次の非等方成分を保持する拡散近似（diffusion approximation）を使う。電子・電子衝突による角度散乱（angular scattering）を省略し、Z 依存の係数で局所熱伝導率を回復する。完全陰解法（fully implicit method）で解く（Brodrick ら、2017、pp. 4–5）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
+          <tr><th>KIPP</th><td>空間 1 次元、速度 2 次元の方程式を直交格子（Cartesian grid）で解く VFP コード（Brodrick ら、2017、p. 4）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
+          <tr><th>SPRING</th><td>任意次数の直交座標のテンソル展開（Cartesian tensor expansion）を用いる線形化 VFP（linearized VFP）コード。非等方な電子・電子衝突を保持し、微小振幅の正弦波摂動（sinusoidal perturbation）に適する（Brodrick ら、2017、p. 5）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
+          <tr><th>K2</th><td>分布関数を運動量空間（momentum space）で任意次数の球面調和関数（spherical harmonics）に展開する VFP コード（Sherlock ら、2017、p. 8）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
+          <tr><th>OSHUN</th><td>完全に厳密な衝突演算子（collision operator）をもつ VFP コード（Marocchino ら、2013、pp. 4–5）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
+          <tr><th>DUED</th><td>流体コード。Marocchino らは SNB を実装して DUED-SNB とし、単一温度の 1D 平板形状（slab geometry）で計算した（Marocchino ら、2013、p. 4）。登場箇所は<a href="../physics/conduction/snb.html#verification-vfp">SNB の頁の検証</a>である。</td></tr>
           <tr><th>LILAC / DRACO</th><td>LLE の 1D / 2D 輻射流体コード。TENRYU の CBET 応答・ホット電子処方はこれらの公刊モデル系譜（Marozas、Colaïtis — CBET・ホット電子ページの文献）に従う。</td></tr>
           <tr><th>Hypre / BoomerAMG</th><td>LLNL の線形ソルバのライブラリ hypre と、その代数マルチグリッド（algebraic multigrid）前処理 BoomerAMG。現行版には hypre を使う計算の経路が無く、CMake のオプション <code>TENRYU_ENABLE_HYPRE</code>（既定 OFF）を ON にしてもリンクされるだけである。<code>Numerics.conduction.solver="hypre"</code> は、ON のビルドの 1D で警告のうえ STS で解かれ、OFF のビルドと 2D では入力検査が拒否する。</td></tr>
           <tr><th>Catch2</th><td>CTest 登録テストの C++ テストフレームワーク（<code>[.expensive]</code> 等のタグは CTest ラベルに変換される）。</td></tr>
@@ -136,7 +142,7 @@
           <tr><th>\(\psi\)</th><td>\(S_N\) の方向別の輻射強度（specific intensity）\(\psi_{g,m}\)（群 \(g\)、方向 \(m\)）／流体の CSW 形式の人工粘性では Christensen の制限関数（衝撃波の足元と後端で 0、速度が線形な圧縮で 1）／CBET では 2 本のビームの交差角（\(\cos\psi=\hat k_q\cdot\hat k_p\)）。</td></tr>
           <tr><th>\(g\)</th><td>光子・電子エネルギー群添字（輻射・SNB・ホット電子・燃焼）／CBET では利得曲線 \(P(g)\) の規格化離調 — CBET ページの集計「群」添字は第 3 の無関係な整理番号。</td></tr>
           <tr><th>\(f\)</th><td>Fleck 因子 \(f_{c,g}\)／伝導の自由流フラックス割合 <code>f_lim</code>／陽的ソース時間刻み割合 \(f_E\)（<code>explicit_source_limit</code>）／CBET 較正係数 <code>f_cbet</code>／ホット電子捕獲密度割合 \(f_s\)（<code>source_nc_fraction</code>）／燃焼のイオン加熱割合 \(f_i\)／CBET の供給側の上限（donor cap）の係数 \(f_g\)。</td></tr>
-          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／SNB の局所極限の試験（<a href="../verification/index.html#tag-legend">タグ G2</a>）のフラックス応答比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
+          <tr><th>\(R\)</th><td>FLD リミッタ引数 \(|\nabla E_g|/(\sigma_{R,g}E_g)\)／\((R,Z)\) の径座標／<a href="../physics/conduction/snb.html#verification">SNB の線形応答試験</a>における SNB 熱流束と局所熱流束の比／粘性のチャネル比 \(\eta_e/\eta_i\)。</td></tr>
           <tr><th>\(E\)</th><td>群輻射エネルギー密度 \(E_{c,g}\)／粒子運動エネルギー（ホット電子・燃焼の群格子）／2D 伝導更新の保存的セル熱エネルギー \(E_c\)／筆記体 \(\mathcal E\) は SNB 電場オプションの静電場。</td></tr>
           <tr><th>\(e\)</th><td>比内部エネルギー \(e_i,e_e\) [erg/g]（添字はイオン種・電子）／臨界密度 \(m_e\omega_0^2/(4\pi e^2)\) や衝突率の式では素電荷／\(e^{-2}\) スポット半径などでは指数の底。</td></tr>
           <tr><th>\(a\)</th><td>CBET では<a href="../physics/lpi/cbet.html#terms-impact-bin">衝突径数ビン</a>（impact-parameter bin）の番号（集計群の添字 \(g=b(2N_{bin})+\sigma N_{bin}+a\)）／\(a_{\rm eV}\) は輻射定数（下の共有定数）／添字の a は、\(\mathbf{k}_a\)・\(c_a\)・\(\nu_a\) ではイオン音波（acoustic）、\(\sigma\) の添字では吸収（absorption）／ALE のページの辺 \(e=(a,b)\) は、節点 \(a\) と \(b\) を結ぶ／ホット電子の飽和形 \(1-e^{-a\sqrt{g-1}}\) では係数。</td></tr>
@@ -170,7 +176,7 @@
 
     <section aria-labelledby="tags">
       <h2 id="tags">試験のタグと再現性の判定方式</h2>
-      <p>試験名と各物理カーネルのページに現れるタグ — L1/L2（レーザー）、G1–G5（SNB の熱伝導）、G-R/G-K/G-P（核燃焼）、H1/H2（2D 流体）、I1/I2/I3/I5/I6（2D RZ の統合試験群）、R2（2D RZ の S<sub>N</sub> 輻射の試験群）、LR07/LE08/FLD-CED（I1 の参照解）— の意味と、再現性の判定方式（ビット単位、縮約順序の帯、雑音帯、機能オフの一致、envelope）は、<a href="../verification/index.html#tag-legend">検証とベンチマークのページのタグ凡例</a>と<a href="../verification/index.html#reproducibility">再現性の検査</a>で定義している。</p>
+      <p>試験名と各物理カーネルのページに現れるタグ — L1/L2（レーザー）、G-R/G-K/G-P（核燃焼）、H1/H2（2D 流体）、I1/I2/I3/I5/I6（2D RZ の統合試験群）、R2（2D RZ の S<sub>N</sub> 輻射の試験群）、LR07/LE08/FLD-CED（I1 の参照解）— の意味と、再現性の判定方式（ビット単位、縮約順序の帯、雑音帯、機能オフの一致、envelope）は、<a href="../verification/index.html#tag-legend">検証とベンチマークのページのタグ凡例</a>と<a href="../verification/index.html#reproducibility">再現性の検査</a>で定義している。</p>
     </section>
 
     <div id="page-footer"></div>

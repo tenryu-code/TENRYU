@@ -32,7 +32,7 @@
       \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
       $$
       <p>ここで \(\kappa_0\) は cgs + eV 単位系での Spitzer 前置係数、\(\xi(\bar Z)\) は下の箇条書きで詳述する Z 依存補正、\(\ln\Lambda\) はクーロン対数（Coulomb logarithm）、\(\mathbf q_{SH}\) が得られる制限前の熱流束である。</p>
-      <p>1D では流束制限を面ごとに適用する。面の電子密度と温度（いずれも左右セルの算術平均）と、その温度から求めた熱速度から \(q_{max}\) を作り、機構節で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
+      <p>1D の局所モデルでは流束制限を面ごとに適用する。1D SNB は流束制限を適用しない。面の電子密度と温度（いずれも左右セルの算術平均）と、その温度から求めた熱速度から \(q_{max}\) を作り、機構節で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
       $$
       v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
       q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad
@@ -41,29 +41,29 @@
       <p>2D RZ では、流束制限をセルごとに適用する。そのセルの電子密度と温度から \(q_{max}\) を作り、セルの温度勾配の大きさ \(|\nabla T_e|\)（セルの節点の勾配の大きさの平均）から \(q_{raw}=\kappa_{SH}|\nabla T_e|\) を作って、セルの実効伝導率 \(\kappa_{eff}=\theta\kappa_{SH}\) を求める。</p>
       <ul>
         <li><strong>\(\xi(Z)\)：</strong>γ<sub>0</sub>(Z) は Braginskii 輸送理論の無次元電子熱伝導係数（dimensionless electron heat-conduction coefficient。Spitzer 型伝導率の前置数。Z=1 で 3.16）であり、ξ(Z) はその Z 依存を Z=1 で 1 になるよう規格化した Epperlein–Short の近似式である（ξ(1)=1、ξ(∞)=4.19）。Z=1 の成分（3.16）は κ<sub>0</sub> に折り込み済みである。ξ(Z) は 1D と 2D、材料別の保存モード、SNB の基底となる SH 流束を含むすべての経路で適用され、無効にする設定はない。</li>
-        <li><strong>\(q_{max}\) と \(\theta\)：</strong>\(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) が自由飛行の流束に対する割合を定め、θ が調和的な補間を与える。局所経路は \(q_{raw}=q_{SH}\)、SNB は \(q_{raw}=q_{SH}+\delta q\) を使う。SH と SH+δq が二重に制限されることはなく、通るのはひとつの共通した流束制限だけである（<a href="#fig-conduction-flux-composition">図A</a>）。</li>
+        <li><strong>\(q_{max}\) と \(\theta\)：</strong>\(q_{max}=f_{lim}n_ek_BT_ev_{th,e}\) が自由飛行の流束に対する割合を定め、θ が調和的な補間を与える。局所経路は \(q_{raw}=q_{SH}\) を使い、流束制限を 1 回だけ通る。1D SNB は流束制限を適用しない（<a href="#fig-conduction-flux-composition">図A</a>）。</li>
         <li><strong>面の伝導率の作り方：</strong>1D で面の κ を左右セルの値からどう作るかは <code>face_kappa_policy</code> が決める（既定は Kirchhoff 割線 <code>kirchhoff_same_material</code>）。定義と式は<a href="discretization.html#terms-face-kappa">用語の節</a>、使い方は<a href="discretization.html#faces-materials">面の伝導率の節</a>にある。制限に使う SH の推定値と、実際に適用する流束は、常に同じ面の κ を使う。</li>
         <li><strong>ボイド：</strong><code>cell_is_void</code> は κ<sub>eff</sub>=0 を強制して断熱境界を作り、下限密度しかもたない外側のセルが<a href="time-integration.html#terms-sts">陽的な安定限界（explicit stability limit）</a> Δt<sub>exp</sub> を潰してしまうのを防ぐ。SNB ではボイドを恒等行とし、隣接する群の拡散係数を 0 にする。</li>
-        <li><strong>SNB の群：</strong>電子エネルギーを温度で規格化した β̂=E/(k<sub>B</sub> max T<sub>e</sub>) について、最も低い群を [0, 0.1] とし、それより上の群境界は 0.1 から <code>snb_E_max_over_Te</code> までの等比数列で張る（既定の 24 群では、等比の区間が 23）。各群の重み（group weight）ξ<sub>g</sub>=P(β<sub>g</sub>)−P(β<sub>g−1</sub>) は、原始関数（antiderivative）の厳密な差として作る。平均自由行程には、既定の <code>geometric_r2</code> と Schurtz の原型の 2 通りがある。群と重みの定義は<a href="snb.html#terms-snb">用語の節</a>、群境界と重みの図は<a href="snb.html#fig-conduction-snb-groups">図B</a>にある。</li>
-        <li><strong>iSNB のピカール反復：</strong>Cao 2015 型の連成は (θ, δq) を固定したうえで、\(T_e^n\) から STS の<a href="time-integration.html#terms-sts">大ステップ（superstep）</a>を繰り返し、補正を計算し直す。最低 2 回は反復し、流束の最大ノルム（maximum norm）の相対許容値で収束を判定する。収束したときの増幅率（amplification factor）は任意の Δt で (0,1) に入り、無条件安定（unconditionally stable）である。反復の定義は<a href="snb.html#terms-snb">用語の節</a>にある。</li>
+        <li><strong>SNB の群：</strong>1D では原始関数（antiderivative）P を等分配するビンの最初を細分して群境界を定め、既定は 60 群である。群境界を β<sub>g</sub> とすると、各群の重み（group weight）ξ<sub>g</sub>=P(β<sub>g</sub>)−P(β<sub>g−1</sub>) は、原始関数の厳密な差として作る。1D では <code>snb_mfp</code> の指定を拒否する。群と重みの定義は<a href="snb.html#terms-snb">用語の節</a>、1D の群境界と重みの図は<a href="snb.html#fig-conduction-snb-groups">図A</a>にある。</li>
+        <li><strong>iSNB のピカール反復（Picard iteration）：</strong>1D では、群の求解を陰的伝導ステップとともに反復し、除外されていないすべてのセルで <code>snb_iter_alpha</code> により収束を判定し、<code>snb_iter_max</code> を反復上限とする。反復の定義は<a href="snb.html#terms-snb">用語の節</a>にある。</li>
       </ul>
 
       <figure id="fig-conduction-flux-composition">
         <img src="../../../assets/conduction-flux-composition-ja.png" width="960" height="380" style="max-width:100%;height:auto" alt="左は流れ図。Spitzer–Härm 流束 q_SH と SNB の非局所補正 δq を足して制限前の流束 q_raw とし、共通の調和型の流束制限を通して適用後の流束 q を得る。右は流束制限の応答で、横軸 |q_raw|/q_max、縦軸 |q|/q_max。青の実線は q_raw が小さいと点線（q≈q_raw）に沿い、大きいと破線（q_max）に漸近する">
-        <figcaption>図A. 流束の合成と調和型の流束制限。左：SH 流束 q<sub>SH</sub> に、SNB を使うときだけ非局所補正 δq を加えて制限前の流束 q<sub>raw</sub> とし、共通の調和型の流束制限（係数 θ）を 1 回だけ通して適用後の流束 q を得る。<code>nonlocal_model="none"</code> では δq=0 となり、局所モデルの制限付き SH 流束に戻る。右：流束制限の応答 |q|/q<sub>max</sub>=x/(1+x)（x=|q<sub>raw</sub>|/q<sub>max</sub>、青の実線）。点線は拡散的な極限 q≈q<sub>raw</sub>、破線は自由飛行の上限 q<sub>max</sub>で、実線はどの x でも両者の下にある。</figcaption>
+        <figcaption>図A. 局所モデルの流束の合成と調和型の流束制限。1D SNB はこの制限を通らず、左の「SNB の非局所補正」の枠から流束制限へ入る経路を使わない。左：局所モデルでは、SH 流束 q<sub>SH</sub> をそのまま制限前の流束 q<sub>raw</sub> とし（q<sub>raw</sub>=q<sub>SH</sub>）、共通の調和型の流束制限（係数 θ）を 1 回だけ通して適用後の流束 q を得る。<code>nonlocal_model="none"</code> では非局所補正 δq=0 となり、局所モデルの制限付き SH 流束に戻る。右：流束制限の応答 |q|/q<sub>max</sub>=x/(1+x)（x=|q<sub>raw</sub>|/q<sub>max</sub>、青の実線）。点線は拡散的な極限 q≈q<sub>raw</sub>、破線は自由飛行の上限 q<sub>max</sub>で、実線はどの x でも両者の下にある。</figcaption>
       </figure>
     </section>
 
     <section aria-labelledby="controls">
       <h2 id="controls">namelist による制御</h2>
-      <p>以下は <code>Numerics.conduction</code> のうち、局所モデルのキーである。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。Studio が書き出す値がこれと違うのは <code>f_lim</code> だけで、SNB を選ぶと 0.5 になる。</p>
+      <p>以下は <code>Numerics.conduction</code> のうち、局所モデルのキーである。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。Studio で 1D SNB を選ぶと、<code>f_lim</code> の入力欄を隠し、デッキに書き出さない。</p>
       <table class="quick-facts">
         <thead>
           <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
           <tr><th><code>conduction.enabled</code></th><td><code>True</code></td><td>電子熱伝導の演算子全体を有効化。</td></tr>
-          <tr><th><code>f_lim</code></th><td><code>0.06</code></td><td>局所モデルと SNB が共通に使う、調和型の流束制限の係数（自由飛行の流束に対する割合）。SNB では、非局所効果を調整する値ではなく、異常な合成流束を止める上限として 0.5 を明示する（GUI は自動で切り替える）。</td></tr>
+          <tr><th><code>f_lim</code></th><td><code>0.06</code></td><td>局所モデルが使う、調和型の流束制限の係数（自由飛行の流束に対する割合）。1D SNB は明示指定を拒否し、Studio も書き出さない。</td></tr>
         </tbody>
       </table>
 
@@ -72,7 +72,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li><strong>SNB を切った計算との一致：</strong><code>nonlocal_model="none"</code> のとき、<a href="../../verification/index.html#gxii">GXII</a> の FLD の 6 つの指標が、SNB を足す前の局所モデルの計算とビット単位で同一（相対差 0）に保たれる。</li>
+        <li><strong>衝突電荷と GXII の回帰試験の参照値：</strong><code>nonlocal_model="none"</code> のとき、非局所補正は計算しない。1D の熱伝導率はセル内の混合イオンの衝突電荷 ⟨<i>Z</i>²⟩/⟨<i>Z</i>⟩ を使い、<i>Z</i> はイオン種の電荷、山括弧はセル内のイオン種にわたる平均を表す（<a href="../eos-opacity/ionization.html#ionization">電荷のモーメント</a>を参照）。従来の熱伝導率とビット単位で一致するのは、正の重みをもつ材料がひとつで組成指定のないセルに限られる。<a href="../../verification/index.html#gxii">GXII</a> の回帰試験デッキの CH シェルは C/H 組成をもつ。前の版の参照値に対する FLD の 6 つの指標の相対変化は最大 0.79 %（ピーク密度）であり、参照値はこの版から再生成した。</li>
       </ul>
     </section>
 

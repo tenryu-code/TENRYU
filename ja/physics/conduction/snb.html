@@ -16,24 +16,24 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>SNB 非局所モデル</h1>
-    <p class="abstract">SNB（Schurtz–Nicolaï–Busquet）モデルは、電子熱伝導の非局所補正（nonlocal correction）を電子エネルギーの多群（multigroup）で計算する簡約運動論モデル（reduced kinetic model）である。1D の平面・円筒・球と 2D RZ で、<code>nonlocal_model="snb"</code> により明示的に有効にする。補正は局所 SH 流束への加算で、補正後の流束がひとつの共通の調和型の流束制限を通る。時間方向には、Cao らの implicit-SNB（iSNB）ピカール反復（Picard iteration）で連成する。この頁は、群の構成、輸送場の方程式、平均自由行程、補正の手順を述べる。</p>
+    <p class="abstract">SNB（Schurtz–Nicolaï–Busquet）モデルは、電子熱伝導の非局所補正（nonlocal correction）を電子エネルギーの多群（multigroup）で計算する簡約運動論モデル（reduced kinetic model）である。1D の平面・円筒・球で、<code>nonlocal_model="snb"</code> により明示的に有効にする。補正は局所 SH 流束への加算である。1D では、流束制限も伝導率制限も適用しない。時間方向には、Cao らの implicit-SNB（iSNB）ピカール反復（Picard iteration）で連成する。この頁は、群の構成、輸送場の方程式、平均自由行程、補正の手順を述べる。</p>
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
       <p>SNB には、TENRYU の実装に固有の意味で使う語がある。群、群の重み、輸送場、群の平均自由行程、非局所補正、iSNB のピカール反復である。これらをまとめて定義する。</p>
 
       <h3 id="terms-snb">SNB の量</h3>
-      <p><strong>群（group）</strong>は、電子のエネルギー \(E\) を区切った区間である。SNB は、エネルギー群ごとに非局所の輸送を解く。群境界は、そのステップの最大の電子温度 \(\max T_e\)（全セルの最大値）で規格化したエネルギー \(\hat\beta=E/(k_B\max T_e)\) で張る。最も低い群は \([0,\,0.1]\)、それより上の境界は 0.1 から \(\hat\beta_{max}\) までの等比数列である。群数は <code>snb_n_groups</code>（既定 24、2 以上）、上端 \(\hat\beta_{max}\) は <code>snb_E_max_over_Te</code>（既定 20、1 より大きい）である。\(\hat\beta\) の群境界に \(k_B\max T_e\) を掛けた物理エネルギー \(E_g\) を、そのステップのあいだ保持する。群を代表するエネルギーは \(\varepsilon_g=(E_{g-1}+E_g)/2\) である。</p>
-      <p><strong>群の重み（group weight）\(\xi_g\)</strong>は、局所の SH 流束のうち、群 \(g\) の電子が運ぶ割合である（群境界と重みの図は<a href="#fig-conduction-snb-groups">図B</a>）。SH 流束はエネルギーについて \(\beta^4e^{-\beta}/24\)（\(\beta=E/(k_BT_e)\)）の重みをもつので、\(\xi_g=P(\beta_g)-P(\beta_{g-1})\)、\(P(\beta)=1-e^{-\beta}(\beta^4+4\beta^3+12\beta^2+24\beta+24)/24\) と、解析的な累積分布関数（cumulative distribution function）の差で決まる（数値求積（numerical quadrature）は使わない）。\(\beta_g=E_g/(k_BT_e)\) は、群境界 \(E_g\) をセルの局所温度で規格化した値である。同じ \(E_g\) でも、局所温度が低いセルほど \(\beta_g\) が大きく、重みはエネルギーの小さい群に集まる。Z 依存補正の \(\xi(\bar Z)\) とは別の量である。</p>
+      <p><strong>群（group）</strong>は、電子のエネルギー \(E\) を区切った区間である。SNB は、エネルギー群ごとに非局所の輸送を解く。1D では、群境界を β=E/(k<sub>B</sub>T<sub>ref</sub>) で張る。T<sub>ref</sub> は熱伝導を解くセルにおける、熱伝導ステップ開始時の電子温度 T<sup>n</sup> の最大値（除外するセルは<a href="#snb">SNB の節</a>に示す）である。群数 G は <code>snb_n_groups</code>（既定 60）、低エネルギー側の群数 G<sub>c</sub> は <code>snb_n_cold_groups</code>（既定 20）である。後述の累積分布関数（cumulative distribution function）P を β<sub>max</sub>=<code>snb_E_max_over_Te</code>（既定 20）まで N<sub>w</sub>=G−G<sub>c</sub>+1 個の等分配のビンに分け、最初のビン [0, β<sub>1</sub>] を β に等間隔な G<sub>c</sub> 群に分割する。群境界に k<sub>B</sub>T<sub>ref</sub> を掛けた物理エネルギー E<sub>g</sub> を、そのステップのあいだ保持する。群を代表するエネルギーは \(\varepsilon_g=(E_{g-1}+E_g)/2\) である。</p>
+      <p><strong>群の重み（group weight）\(\xi_g\)</strong>は、局所の SH 流束のうち、群 \(g\) の電子が運ぶ割合である（群境界と重みの図は<a href="#fig-conduction-snb-groups">図A</a>）。SH 流束はエネルギーについて \(\beta^4e^{-\beta}/24\)（\(\beta=E/(k_BT_e)\)）の重みをもつので、\(\xi_g=P(\beta_g)-P(\beta_{g-1})\)、\(P(\beta)=1-e^{-\beta}(\beta^4+4\beta^3+12\beta^2+24\beta+24)/24\) と、解析的な累積分布関数の差で決まる（数値求積（numerical quadrature）は使わない）。\(\beta_g=E_g/(k_BT_e)\) は、群境界 \(E_g\) を重みを評価する局所温度（1D では面を挟む 2 セルの平均温度）で規格化した値である。同じ \(E_g\) でも、その温度が低いほど \(\beta_g\) が大きく、重みはエネルギーの小さい群に集まる。<a href="#snb">平均自由行程</a>の Z 依存補正 \(\xi(Z)\) とは別の量である。</p>
       <p><strong>輸送場（transport field）\(H_g\)</strong>は、群 \(g\) の電子が非局所に運ぶ熱流束の場である（次元は熱流束）。群ごとに、局所の SH 流束の群配分 \(U_g=\xi_gq_{SH}\) を源泉とする拡散型の方程式（<a href="#snb">SNB の節</a>）を解いて得る。\(H_g\) は、源泉が群の平均自由行程のスケールで周囲へ広がった分布である。</p>
-      <p><strong>群の平均自由行程（group mean free path）\(\lambda_g^{abs}\)、\(\lambda_g^{tr}\)</strong>は、\(H_g\) の方程式に入る 2 つの長さである。\(\lambda_g^{abs}\)（添字 abs は吸収）は \(H_g/\lambda_g^{abs}\) の項で、源泉から離れるにつれて \(H_g\) が減る距離を決める。\(\lambda_g^{tr}\)（添字 tr は輸送）は拡散項の係数 \(\lambda_g^{tr}/3\) で、\(H_g\) が広がる速さを決める。どちらも、群の代表エネルギー \(\varepsilon_g\) の電子の平均自由行程 \(\lambda_g\)（式は<a href="#snb">SNB の節</a>、キー <code>snb_mfp</code>）に等しい。ただし <code>snb_efield="local"</code> では、輸送側だけ、\(1/\lambda_g^{tr}\) に局所静電場の項を加えて短くする。</p>
-      <p><strong>非局所補正（nonlocal correction）\(\delta q\)</strong>は、\(H_g\) の勾配から作る熱流束の補正 \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である。局所の SH 流束に加えて、制限前の流束 \(q_{raw}=q_{SH}+\delta q\) とする。勾配が急な点では \(\delta q\) が SH 流束を減らし（流束抑制）、その前方では熱を運ぶ（予熱）。</p>
-      <p><strong>iSNB（implicit-SNB）のピカール反復</strong>は、非局所補正を時間方向に連成する反復である（Cao らの方法）。補正 \(\delta q\) と制限係数 \(\theta\) を固定して、STS の大ステップ全体を \(T_e^n\) からやり直し、区間の端の温度で補正を計算し直す。補正の変化の最大値が、SH 流束の最大値と補正の最大値の和の <code>snb_picard_rtol</code>（既定 0.01）倍以下になるまで繰り返す。反復は最低 2 回、最大 <code>snb_picard_max_iters</code>（既定 8、2 以上）回である。収束したときの増幅率は、任意の \(\Delta t\) で (0, 1) に入る。</p>
+      <p><strong>群の平均自由行程（group mean free path）\(\lambda_g^{abs}\)、\(\lambda_g^{tr}\)</strong>は、\(H_g\) の方程式に入る 2 つの長さである。\(\lambda_g^{abs}\)（上付きの abs は吸収）は \(H_g/\lambda_g^{abs}\) の項で、源泉から離れるにつれて \(H_g\) が減る距離を決める。\(\lambda_g^{tr}\)（上付きの tr は輸送）は拡散項の係数 \(\lambda_g^{tr}/3\) で、\(H_g\) が広がる速さを決める。1D では、両者を<a href="#snb">SNB の節</a>に示す分離した式で定め、<code>snb_mfp</code> は使わない。輸送側だけを短くするオプション <code>snb_efield="local"</code> は、1D で拒否する。</p>
+      <p><strong>非局所補正（nonlocal correction）\(\delta q\)</strong>は、\(H_g\) の勾配から作る熱流束の補正 \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である。和 \(q_{raw}=q_{SH}+\delta q\) は、制限を適用しない 1D では流束そのものである。勾配が急な点では \(\delta q\) が SH 流束を減らし（流束抑制）、その前方では熱を運ぶ（予熱）。</p>
+      <p><strong>iSNB（implicit-SNB）のピカール反復</strong>は、非局所補正を時間方向に連成する反復である（Cao らの方法）。1D では、<a href="#snb">SNB の節</a>に示すように、群の求解を陰的伝導ステップに連成する。</p>
     </section>
 
     <section aria-labelledby="snb">
       <h2 id="snb">SNB 多群非局所モデル</h2>
-      <p><code>nonlocal_model="snb"</code> は、1D の平面・円筒・球と 2D RZ の電子熱伝導に、明示的に有効化する Schurtz–Nicolaï–Busquet 補正を加える。三重対角系を使う以下の離散化は 1D のものである。2D RZ では、各群の方程式を節点局所の演算子で組み（拡散項の伝導率に \(\lambda_g^{tr}/3\) を、対角に \(V/\lambda_g^{abs}\) を使う）、全群をまとめて、Jacobi 前処理（Jacobi preconditioner）付きの共役勾配法（conjugate gradient method）で解く（2D RZ では <code>snb_efield="local"</code> は使えない）。熱伝導ステップごとに、規格化電子エネルギー β̂=E/(k<sub>B</sub> max T<sub>e</sub>) の群境界を作り直す。最も低い群は [0, 0.1] で、それより上の境界は 0.1 から <code>snb_E_max_over_Te</code> までを等比に区切る（既定は 24 群で、等比の区間が 23）。群境界は大域の \(\hat\beta\) で張ったうえで物理エネルギー \(E_g\) へ写して保持し、重み \(\xi_g\) の評価では境界を各セルの局所温度による \(\beta_g=E_g/(k_BT_e)\) に読み替えて \(P\) を評価する（1D の面では面平均の \(T_e\)、2D RZ ではセルの対の平均の \(T_e\) を使う）。各群では、輸送場 \(H_g\)（次元は熱流束）に対する次の拡散型方程式を解く。右辺の源泉は局所 SH 流束の群配分 \(U_g\) の発散である。源泉として注入された \(U_g\) が平均自由行程のスケールで周囲へ拡散し広がったものが \(H_g\) で、その勾配から後述の非局所補正を再構成する。</p>
+      <p><code>nonlocal_model="snb"</code> は、1D の平面・円筒・球の電子熱伝導に、明示的に有効化する Schurtz–Nicolaï–Busquet 補正を加える。三重対角系を使う以下の離散化は 1D のものである。1D では、熱伝導ステップごとに<a href="#terms-snb">前述の群配置</a>を使う。重み \(\xi_g\) の評価では境界を局所温度による \(\beta_g=E_g/(k_BT_e)\) に読み替えて \(P\) を評価する。1D の面では面平均の \(T_e\) を使う。各群では、輸送場 \(H_g\)（次元は熱流束）に対する次の拡散型方程式を解く。右辺の源泉は局所 SH 流束の群配分 \(U_g\) の発散である。源泉として注入された \(U_g\) が平均自由行程のスケールで周囲へ拡散し広がったものが \(H_g\) で、その勾配から後述の非局所補正を再構成する。</p>
       $$
       \frac{H_g}{\lambda_g^{abs}}-
       \nabla\!\cdot\!\left(\frac{\lambda_g^{tr}}{3}\nabla H_g\right)
@@ -44,61 +44,54 @@
       P(\beta)=1-\frac{e^{-\beta}}{24}
       (\beta^4+4\beta^3+12\beta^2+24\beta+24).
       $$
-      <p>ここで \(P(\beta)\) は、Spitzer–Härm 熱流束を規格化電子エネルギーについて累積した分布関数である — 流束は \(\beta^4e^{-\beta}/24\) のスペクトル重みをもち、\(P\) はその積分である。したがって ξ<sub>g</sub> は解析的な原始関数の差であり、数値求積は使わない。補正の総和は \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である。1D では、セル中心の H<sub>g</sub> を体積積分した有限体積の式は、厳密に対角優位（diagonally dominant）な三重対角系となり、全群をストライド付きの一括処理（strided batch）で解く。面の拡散係数は左右の λ<sup>tr</sup> の調和平均を 3 で割った値で、閉じた境界では反射条件（reflecting boundary condition）を課す。</p>
+      <p>ここで \(P(\beta)\) は、Spitzer–Härm 熱流束を規格化電子エネルギーについて累積した分布関数である — 流束は \(\beta^4e^{-\beta}/24\) のスペクトル重みをもち、\(P\) はその積分である。したがって ξ<sub>g</sub> は解析的な原始関数の差であり、数値求積は使わない。補正の総和は \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である。1D では、セル中心の H<sub>g</sub> を体積積分した有限体積の式は、厳密に対角優位（diagonally dominant）な三重対角系となり、前進消去と後退代入（forward elimination and backward substitution）により面の補正電力を直接求める。吸収項が拡散項に比べて小さい場合にも保持されるよう、行和と非対角の重みを別々に保持する。面の拡散係数は左右の λ<sup>tr</sup> の調和平均を 3 で割った値で、閉じた境界では反射条件（reflecting boundary condition）を課す。</p>
 
       <figure id="fig-conduction-snb-groups">
-        <img src="../../../assets/conduction-snb-group-ladder-ja.png" width="920" height="640" style="max-width:100%;height:auto" alt="上は大域の群境界。最も低い群 g=1 は [0, 0.1]、g=2 から g=24 は 0.1 から 20 までの等比で、g=12 を濃い青で示す。左下は累積分布関数 P(β)（青の太線）とスペクトル重み w(β)（灰色の線）で、局所温度が max T_e の場合（青の縦線）と 0.25 max T_e の場合（橙の縦線）の群境界の位置と、群 12 の重み ξ12 を示す。右下は 24 群それぞれの重み ξ_g の棒グラフで、局所温度が低い（橙）ほど重みがエネルギーの小さい群に寄る">
-        <figcaption>図B. SNB の群境界と群の重み。上：大域の群境界を β̂=E/(k<sub>B</sub>max T<sub>e</sub>) で示す（既定の 24 群。最も低い群 g=1 は [0, 0.1]、g=2〜24 の 23 群は 0.1 から 20 までの等比。上の軸は max T<sub>e</sub>=2 keV とした場合のエネルギー）。左下：群境界 E<sub>g</sub> を局所の β=E/(k<sub>B</sub>T<sub>e</sub>) に読み替え、P の差を群の重み ξ<sub>g</sub> とする（青：T<sub>e</sub>=max T<sub>e</sub>、橙：T<sub>e</sub>=0.25 max T<sub>e</sub>。縦線は群境界、灰色の線は w(β)=β<sup>4</sup>e<sup>−β</sup>/24、ξ<sub>12</sub> は群 12 の重み）。右下：群ごとの ξ<sub>g</sub>（同じ色分け）。T<sub>e</sub>=max T<sub>e</sub> では重みの和が P(20)=0.99998 で、1 に足りない分は群の上端 β̂=20 より上の流束である。</figcaption>
+        <img src="../../../assets/conduction-snb-group-ladder-ja.png" width="920" height="640" style="max-width:100%;height:auto" alt="1D SNB。上は60群の61境界で、最初のP等分配ビンを等間隔な20群に分け、その上にP等分配の40ビンを置く。群30を濃い青で示す。左下はPとw、局所温度での群境界と群30の重み。右下は60群の重み。青はTe=T_ref、橙はTe=0.25 T_ref">
+        <figcaption>図A. G=60、G<sub>c</sub>=20、β<sub>max</sub>=20 とした 1D SNB の群境界と群の重み。上：β=E/(k<sub>B</sub>T<sub>ref</sub>) で示す 61 個の境界。P を等分配する 41 ビンのうち、最初のビンを β に等間隔な 20 群に分割し、その上の 40 ビンはそれぞれ P(20)/41 を担う。群 30 を濃い青で示す。上の軸は T<sub>ref</sub>=2 keV とした場合のエネルギーである。左下：群境界 E<sub>g</sub> を局所の β=E/(k<sub>B</sub>T<sub>e</sub>) に読み替え、P の差を群の重み ξ<sub>g</sub> とする（青：T<sub>e</sub>=T<sub>ref</sub>、橙：T<sub>e</sub>=0.25 T<sub>ref</sub>。縦線は群境界、灰色の線は w(β)=β<sup>4</sup>e<sup>−β</sup>/24、ξ<sub>30</sub> は群 30 の重み）。右下：群ごとの ξ<sub>g</sub>（同じ色分け）。T<sub>e</sub>=T<sub>ref</sub> では重みの和が P(20)=0.99998 で、1 に足りない分は β=20 より上の流束として局所成分に残る。</figcaption>
       </figure>
 
-      <p>群を代表するエネルギー \(\varepsilon_g=(E_{g-1}+E_g)/2\) は erg で評価する。群の平均自由行程 \(\lambda_g\) の式には次の 2 通りがある。下の電場オプションが輸送側を短くしないかぎり、\(\lambda_g^{abs}\) と \(\lambda_g^{tr}\) はどちらもこの \(\lambda_g\) に等しい。</p>
+      <p>1D では、吸収と輸送の平均自由行程を分離する。</p>
       $$
-      \lambda_g=
-      \begin{cases}
-      \dfrac{2\sqrt2\,\varepsilon_g^2}
-      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z\varphi}},
-      &amp; \texttt{geometric_r2}\quad(\text{Sherlock 2017; default}),\\[6pt]
-      \dfrac{2\,\varepsilon_g^2}
-      {4\pi n_e e^4\ln\Lambda\,\sqrt{\bar Z+1}},
-      &amp; \texttt{original}\quad(\text{Schurtz 2000}),
-      \end{cases}
-      \qquad \varphi=\frac{\bar Z+4.2}{\bar Z+0.24}.
+      \begin{aligned}
+      \lambda_T&amp;=\frac{(k_BT_e)^2}{4\pi n_e e^4\ln\Lambda},&amp;
+      \lambda_{ei,g}&amp;=\frac{4\lambda_T}{Z^*}\left(\frac{\varepsilon_g}{k_BT_e}\right)^2,\\
+      \lambda_g^{abs}&amp;=2\lambda_T\left(\frac{\varepsilon_g}{k_BT_e}\right)^2,&amp;
+      \lambda_g^{tr}&amp;=\xi(Z^*)\lambda_{ei,g},\\
+      \xi(Z)&amp;=\frac{Z+0.24}{Z+4.2}.
+      \end{aligned}
       $$
-      <p>通常は λ<sup>abs</sup>=λ<sup>tr</sup> である。<code>snb_efield="local"</code> は輸送側の平均自由行程だけを \(1/\lambda_g^{tr}\mathrel{+}=|e\mathcal E|/\varepsilon_g\) によって短くするが（\(\mathcal E\) は筆記体で表した局所静電場の大きさ — エネルギーの \(E\) との衝突を避けた記法 — で、プラズマ状態から評価する）、既定は <code>none</code> である。r=2 の較正がすでに電場による抑制を含むため、併用すると二重計上になり得る。</p>
+      <p>ここで λ<sub>T</sub> は上式で定める熱的な長さの尺度、λ<sub>ei,g</sub> は電子–イオン平均自由行程、ε<sub>g</sub> は群の中点エネルギー、n<sub>e</sub> は電子数密度、e は電気素量、ln Λ はクーロン対数である。衝突電荷 Z*=〈Z²〉/〈Z〉はセル内のイオン種についての平均で、SH 伝導率と共通である。これは r=2 の分離した平均自由行程の式であり、<code>snb_mfp</code> の明示指定は拒否する。電場オプションは <code>none</code> に限る。</p>
+      <p>群を代表するエネルギー \(\varepsilon_g=(E_{g-1}+E_g)/2\) は erg で評価する。</p>
+      <p>1D では <code>snb_efield</code> は <code>"none"</code> に限り、Schurtz らによる輸送平均自由行程の電場補正 <code>"local"</code> は拒否する。1D の r=2 の分離した式は、電場のない試験で定めたものである。</p>
       <h3>SNB 補正の手順</h3>
-      <ol>
-        <li><p><strong>群を作り直す。</strong>熱伝導ステップごとに、最大の \(T_e\) から、大域的な β̂ の群境界（最も低い群は [0, 0.1]、それより上は 0.1 から <code>snb_E_max_over_Te</code> までの等比数列）を作り直し、原始関数の厳密な差から ξ<sub>g</sub> を作る。</p></li>
-        <li><p><strong>平均自由行程を評価する。</strong>局所の電子密度、クーロン対数、電離状態、群の中心エネルギーから各 λ<sub>g</sub> を計算する。式は既定の <code>geometric_r2</code>、または Schurtz の <code>original</code> を使う。</p></li>
-        <li><p><strong>連立系を組み立てる。</strong>1D では、各群のセル中心の有限体積方程式を体積積分し、厳密に対角優位な三重対角系にする。反射境界で領域を閉じ、ボイドは恒等行、隣接する拡散係数は 0 とする。2D RZ では、各群の演算子を節点局所の演算子で組み、対角に \(V/\lambda_g^{abs}\) を加える。境界は反射とし、ボイドのセル、\(\rho c_v\le0\) のセル、平均自由行程のないセルの行は恒等行（\(H_g=0\)）にする。</p></li>
-        <li><p><strong>全群を解く。</strong>1D では、全群をストライド付き一括の三重対角求解としてまとめて実行し、\(H_g\) を得る。2D RZ では、全群をまとめた Jacobi 前処理付き共役勾配法で解く。相対残差の許容値は \(10^{-10}\)、反復の上限は 1000 で、どちらもキーのない固定値である。上限までに収束しないときは警告を出して、最後の反復結果を採用する。</p></li>
-        <li>
-          <p><strong>補正を再構成する。</strong>群の順序を固定して次を加算する。</p>
-          $$
-          \delta q=-\sum_g\frac{\lambda_g^{tr}}{3}\nabla H_g.
-          $$
-        </li>
-        <li><p><strong>制限前の流束を合成する。</strong>1D では、局所 SH 経路と同じ作り方の面の κ を使い、\(q_{raw}=q_{SH}+\delta q\) を作る。2D RZ では、基底の SH 流束を作る節点局所の演算子に流束制限も割線も使わず（\(\kappa_{SH}\) を使う）、対の電力に非局所補正の対の電力を加える。</p></li>
-        <li><p><strong>共通の流束制限を適用する。</strong>\(\theta=1/(1+|q_{raw}|/q_{max})\) を 1 回だけ評価し、\(q=\theta q_{raw}\) を適用する。SNB 専用の 2 つ目の制限はない。2D RZ では、\(\theta_c\) をセルごとに作り（\(q_{raw}\) は、セルの節点の勾配の平均から求めた \(-\kappa_{SH}\nabla T_e-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) である）、セル \(c\) と \(d\) の対の電力には \(\min(\theta_c,\theta_d)\) を掛ける。</p></li>
-        <li><p><strong>iSNB のピカール反復を閉じる。</strong>(θ, δq) を固定し、\(T_e^n\) から STS の大ステップ全体をやり直して、区間の端で補正を計算し直す。最低 2 回は反復し、<code>snb_picard_max_iters</code> に達するまで、流束の最大ノルムの相対値を <code>snb_picard_rtol</code> と比較する。収束しなかった場合はその旨を報告し、最後の反復結果を採用する。収束したときの増幅率は、任意の Δt で (0,1) に入る。</p></li>
-      </ol>
-      <p>SNB と組み合わせる <code>f_lim</code> は 0.5 と緩い。流束をどれだけ抑えるかは SNB 自身が計算するので、この値で非局所効果の強さを調整するわけではない。緩い流束制限は、非局所補正を加えた合成流束が異常に大きくなったときにだけ働く。GUI（<a href="../../use/gui.html">Studio</a>）は SNB を選ぶとこの値に切り替えるが、ソルバの既定値は SNB でも 0.06 なので、手で書くデッキでは 0.5 を明示する。</p>
+      <p>1D の陰的伝導ステップでは、伝導率、平均自由行程、群のエネルギー、重み、T<sub>ref</sub> を T<sup>n</sup> で固定する。各反復では、直前の非局所補正を右辺に入れた伝導の三重対角系を解く。最初の補正は 0 とする。更新した温度から、各群の前進消去と後退代入によって面の補正電力を直接求め、群の順に加算する。ボイド、電子の体積熱容量 ρC<sub>v,e</sub> が非正のセル、電子密度 n<sub>e</sub> が非正のセルを除外する。端面と除外セルに接する面は反射境界とし、除外セルは H<sub>g</sub>=0 とする。</p>
+      $$
+      \begin{aligned}
+      |D_i^k-D_i^{k-1}|&amp;\le\alpha M_iT_i^k/\Delta t,\\
+      D_i^k&amp;=P_{sh,R}(T^k)-P_{sh,L}(T^k),\quad M_i=(\rho C_{v,e})_iV_i,\\
+      r_k&amp;=\max_i\frac{|D_i^k-D_i^{k-1}|\Delta t}{M_iT_i^k}.
+      \end{aligned}
+      $$
+      <p>ここで k は反復番号、i は除外されていないセル、P<sub>sh,R</sub> と P<sub>sh,L</sub> はそれぞれ右面と左面の SH 電力、M<sub>i</sub> は電子熱容量、V<sub>i</sub> は体積、T<sub>i</sub><sup>k</sup> は更新した温度、Δt は伝導の時間間隔である。k=2 から、すべての除外されていないセルでこの不等式を満たせば収束とする。α は <code>snb_iter_alpha</code>（既定 0.01）である。反復上限 <code>snb_iter_max</code> は既定 21、最小 3 である。上限で未収束の場合、r<sub>k</sub> が r<sub>k−1</sub> より小さくなったときだけ受け入れ、未収束のステップとして記録する。それ以外、または温度が非有限の場合は診断を出して停止する。除外されていないセルの T<sub>i</sub><sup>k</sup> が非正または非有限の場合は収束判定を不合格とし、r<sub>k</sub> = +∞ とするため、その反復結果は受け入れない。SNB 固有の時間刻み制限も流束制限も設けない。</p>
+      <p>1D の SNB は流束制限も伝導率制限も適用せず、<code>f_lim</code> の明示指定を拒否する。GUI（<a href="../../use/gui.html">Studio</a>）が作る SNB のフォームは 1D のみであり、SNB では <code>f_lim</code> を隠して書き出さない。</p>
     </section>
 
     <section aria-labelledby="controls">
       <h2 id="controls">namelist による制御</h2>
-      <p>以下は <code>Numerics.conduction</code> のうち、非局所モデルのキーである。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。入力検査は、<code>nonlocal_model="snb"</code> に次を要求する。1D_SPH または 2D_RZ であること、<code>solver="sts"</code> であること、2 温度モデルであること、<code>conduction.enabled=True</code> であること、材料別の保存モードが無効であること。</p>
+      <p>以下は <code>Numerics.conduction</code> のうち、非局所モデルのキーである。全項目と検証規則は <a href="../../use/namelist.html">namelist リファレンス</a>を参照のこと。表の既定値は、デッキで指定しないときの値である。入力検査は、<code>nonlocal_model="snb"</code> に対し、1D では 1D_SPH であることと <code>solver="implicit"</code> を要求する。共通の要求は、2 温度モデルであること、<code>conduction.enabled=True</code> であること、材料別の保存モードが無効であることである。</p>
       <table class="quick-facts">
         <thead>
-          <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
+          <tr><th>キー</th><th>1D の既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code>、または 1D と 2D RZ の <code>"snb"</code>。Studio が書くのは 1D だけである。</td></tr>
-          <tr><th><code>snb_n_groups</code></th><td><code>24</code></td><td>SNB のエネルギー群数（最も低い群 [0, 0.1] を含む。2 以上）。</td></tr>
-          <tr><th><code>snb_E_max_over_Te</code></th><td><code>20</code></td><td>群境界の上端（β̂ の最大値。1 より大きい）。0.1 から上端までを等比に区切る。</td></tr>
-          <tr><th><code>snb_mfp</code></th><td><code>"geometric_r2"</code></td><td>Sherlock の r=2 が既定、または <code>"original"</code>。</td></tr>
-          <tr><th><code>snb_efield</code></th><td><code>"none"</code></td><td>任意選択の局所電場による平均自由行程の補正は <code>"local"</code>。</td></tr>
-          <tr><th><code>snb_picard_max_iters</code></th><td><code>8</code></td><td>iSNB のピカール反復の上限。最低 2 回は反復する。</td></tr>
-          <tr><th><code>snb_picard_rtol</code></th><td><code>0.01</code></td><td>流束の最大ノルムによる相対収束判定。</td></tr>
+          <tr><th><code>nonlocal_model</code></th><td><code>"none"</code></td><td><code>"none"</code>、または 1D の <code>"snb"</code>。Studio が書くのは 1D だけである。</td></tr>
+          <tr><th><code>snb_n_groups</code></th><td><code>60</code></td><td>SNB のエネルギー群数 G。2 以上で、1D では G<sub>c</sub> より大きい。</td></tr>
+          <tr><th><code>snb_E_max_over_Te</code></th><td><code>20</code></td><td>規格化エネルギーの上端。1 より大きい。1D は P の等分配ビンの最初を細分する。</td></tr>
+          <tr><th><code>snb_efield</code></th><td><code>"none"</code></td><td>1D では <code>"none"</code> に限り、<code>"local"</code> は拒否する。</td></tr>
+          <tr><th><code>snb_n_cold_groups</code></th><td><code>20</code></td><td>1D の低エネルギー側の群数 G<sub>c</sub>。1 以上 G−1 以下。</td></tr>
+          <tr><th><code>snb_iter_max</code></th><td><code>21</code></td><td>1D の陰的伝導の反復上限。3 以上。</td></tr>
+          <tr><th><code>snb_iter_alpha</code></th><td><code>0.01</code></td><td>1D のセルごとの収束判定の許容値 α。正の値。</td></tr>
         </tbody>
       </table>
 
@@ -106,11 +99,89 @@
 
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
+      <p>1D の試験は、モデルを閉じた形の解および Brodrick ら（2017）[6]、Sherlock ら（2017）[3]、Marocchino ら（2013）[5] の公表結果と比較し、以下の値は 2026-11-09 の検証実行の値である。</p>
       <ul>
-        <li><strong>SNB の局所極限（<code>snb_local_limit_1d</code>）：</strong>平均自由行程 λ→0 で SNB が局所 SH に戻ることを、正弦的な温度摂動に対する流束低減比（分散応答、dispersion response）\(R(k)=\sum_g\xi_g/(1+\lambda_g^{abs}\lambda_g^{tr}k^2/3)\) で確かめ、離散演算子の値 \(R_{disc}\) が許容値 10<sup>−3</sup> のもとで ∣R−R<sub>disc</sub>∣≤5.5×10<sup>−8</sup> に収まることを見る。さらに、小さな k での漸近挙動（asymptotics）\((1-R)\propto k^2\) を log–log 勾配 1.986（≈2）で確かめる。幅を 10 倍変えた 2 段の tanh 温度ランプでは、SNB 流束の SH 流束からの相対逸脱がいずれも導出した面局所の曲率上界に収まり、段間の逸脱比 100.7 が局所極限の二次法則の期待（約 100）と一致することを検査する。</li>
-        <li><strong>SNB と解析解の比較（<code>snb_dispersion_1d</code>）：</strong>離散化した Epperlein–Short の解析解と 7.2×10<sup>−7</sup> 以内で一致する（判定値は 3×10<sup>−3</sup>、分散関係（dispersion relation）の検査は \(k\lambda_{ei}&lt;0.5\) の帯が対象である）。</li>
-        <li><strong>SNB の保存（<code>snb_conservation_1d_planar</code>、<code>snb_conservation_1d_spherical</code>、<code>snb_conservation_1d_cylindrical</code>）：</strong>平面・円筒・球の保存収支を、判定値 10<sup>−14</sup> に対して 7.4×10<sup>−17</sup> まで閉じる。</li>
-        <li><strong>SNB の最大値原理（maximum principle。<code>snb_max_principle_1d</code>）：</strong>希薄な受け手の帯をもつ球対称のホットスポットで、各ステップの電子温度の最大値が入口の値を超えないこと、入口の最大温度へのクランプで除いたエネルギーを含めて全区間のエネルギーが 10<sup>−13</sup> で閉じること、希薄な帯のない対照の計算ではそのクランプが一度も働かないことを確かめる。</li>
+        <li><strong>線形応答（<code>snb1d_planar_response</code>）：</strong>電子温度の微小な正弦波摂動に対し、SNB 熱流束と局所 Spitzer–Härm 熱流束の比 R を、60 エネルギー群のモデルの閉じた形の応答 R<sub>h</sub> と比較する。846 ケースはイオン電荷数 Z = 1 と Z = 8、平均電荷数 Z̄ = 4 の混合物と、1e-3 から 1.627 までの kλ<sub>ei</sub> を覆う。k は摂動の波数、λ<sub>ei</sub> は Brodrick ら [6] が式 2 で定義する電子・イオン平均自由行程である。|R − R<sub>h</sub>| の最大値は、許容値 1e-5 に対して 2.73e-7 である。同じ格子上でセルの値の順序を反転しても応答 R′ は同じで、補正の符号は反転する。|R′ − R<sub>h</sub>| の最大値は 2.73e-7 である。</li>
+        <li><strong>曲線座標と不等間隔格子（<code>snb1d_curvilinear_order</code>）：</strong>平面・円筒・球の幾何形状と、等間隔・不等間隔の格子を 24 ケースで検査する。閉じた形の解に対する誤差はセル幅の二乗に比例して減少する。観測した収束次数は、要求値 1.8 以上に対して 1.967 から 2.002 である。</li>
+        <li><strong>エネルギー群（<code>snb1d_group_convergence</code>）：</strong>60 群の応答 R<sub>h,G</sub> を、適応求積（adaptive quadrature）で求めた連続体の応答 R<sub>∞</sub> と、Brodrick らの図 1 [6] の 834 点で比較する。|R<sub>h,G</sub>/R<sub>∞</sub> − 1| の最大値は 6.64e-3 であり、各点の許容値に対する比は最大 0.901 である。許容値は公表曲線を数値化するときの相対的な読み取り不確かさ（relative digitization uncertainty）である。応答の小さな波数に対する展開の係数 b<sub>o</sub> は、b<sub>o</sub> = ∫<sub>0</sub><sup>60</sup> (16ξβ<sup>4</sup>/(27π)) dP として評価する。β は電子エネルギーをエネルギー単位の基準温度で割った値、P は源のスペクトルの累積積分、ξ は電荷数に依存する補正係数である。この積分は論文の閉じた形の式と一致し、相対差は Z = 1 で 0、Z = 8 で 4.4e-16 である。論文の表 II [6] はこの係数を 633.8ξ/r として示している。r は平均自由行程の係数であり、ここでは r = 2 である。計算した係数は、印刷された 4 桁でこの式と一致する。Z = 1 と Z = 8 で評価すると、表の式はそれぞれ 75.5685 と 214.0374 を与え、計算値はそれぞれ 75.5673 と 214.0341 である。</li>
+        <li><strong>公表された SNB・VFP 曲線（<code>snb1d_brodrick_fig1</code>）：</strong>Brodrick らの図 1(a) [6] の SNB 曲線（Z = 1）で使用した 834 点において、曲線の読み取り不確かさを単位とする偏差の最大値は、R<sub>∞</sub> で 0.501、60 群で 0.930 である。この不確かさが許容値である。平均自由行程の係数 r を 2 から 3 に変えると、不合格となるべき 420 点すべてで比較が不合格となる。図 3(a) [6] の Z = 8 の曲線との比較と、VFP（Vlasov–Fokker–Planck）曲線からの偏差は、合否を判定せずに記録する。図 3(a) における偏差の最大値は、読み取り不確かさを単位として R<sub>∞</sub> で 2.79、60 群で 2.82 である。（<a href="#verification-vfp-response">VFP との比較</a>）</li>
+        <li><strong>ホーラムの分布（<code>snb1d_brodrick_hohlraum</code>）：</strong>Brodrick らのホーラム（hohlraum）の分布 [6] における熱流束を、VFP コード IMPACT と比較する。IMPACT に対するピーク値の相対偏差 d = 0.2327 は、公表された SNB 結果自体の相対偏差 d<sub>pub</sub> = 0.1628 に、読み取りと入力の不確かさを加えた上限 0.6283 以下でなければならない。熱流束のピーク値は 9.466e20 erg s<sup>−1</sup> cm<sup>−2</sup>、IMPACT は 1.2337e21 erg s<sup>−1</sup> cm<sup>−2</sup>、公表された SNB は 1.4345e21 erg s<sup>−1</sup> cm<sup>−2</sup> である。（<a href="#verification-vfp">VFP との比較</a>）</li>
+        <li><strong>熱浴（<code>snb1d_sherlock_heat_bath</code>）：</strong>Sherlock らの熱浴（heat bath）の問題 [3] の熱流束のピーク値 q<sub>peak</sub> を、VFP コード K2 と比較する。ピーク値は 1.8127e19 erg s<sup>−1</sup> cm<sup>−2</sup>、K2 は 1.9619e19 erg s<sup>−1</sup> cm<sup>−2</sup>、公表された SNB は 2.2155e19 erg s<sup>−1</sup> cm<sup>−2</sup> である。K2 に対するピーク値の相対偏差 d = 0.0760 は、公表された SNB 結果自体の偏差と読み取りの不確かさから同様に作る上限 0.1567 以内である。（<a href="#verification-vfp">VFP との比較</a>）</li>
+        <li><strong>反復（<code>snb1d_iteration_decay</code>）：</strong>各時間刻みで測定した温度モードの減衰は、反復して解く陰的な時間刻みの閉じた形の増幅率と一致する。相対差の最大値は、上限 1e-5 に対して 5.7e-8 である。</li>
+        <li><strong>Marocchino ら（2013）の記録（<code>snb1d_marocchino_fig1_record</code>、<code>snb1d_marocchino_fig3_record</code>）：</strong>線形応答では、Marocchino らの図 1(c) [5]（Z = 4）の公表曲線からの偏差を記録する。ホットスポットの問題では、公表曲線とは比較せず、温度と熱流束を論文の記述と並べて記録する。どちらの記録にも合否の判定はない。（<a href="#verification-vfp-response">VFP との比較</a>）</li>
+        <li><strong>保存・再現性と統合した計算の再実行：</strong><code>snb1d_iteration_decay</code>、<code>snb1d_sherlock_heat_bath</code>、<code>snb1d_marocchino_fig3_record</code> で伝導の処理を直接呼ぶたびに、算術誤差の上限内でエネルギー収支が閉じる。スクリプト <code>tests/coupling/snb1d/run_checks.sh</code> は、繰り返し実行、再開、MPI の 1・2・4 ランクでの実行がビット単位で一致することを比較し、統合した計算を再実行する。12 ns の球対称爆縮デッキ <code>examples/implosion/gxii_square_240J_12ns_fld_nr450.py</code>（450 セル）の後期のチェックポイントから SNB を 1 時間刻み進める計算は、2 回の反復で受理された。</li>
+        <li><strong>不変条件の単体試験：</strong>一様温度で補正が厳密にゼロであること、源のスペクトルと群の求解を少なくとも 1024 ビット演算の参照値と比較すること、融合積和演算（fused multiply-add）の縮約を無効にしても結果が同じであること、停止規則、小さな格子、1D での平均自由行程リミッタの拒否を検査し、すべて合格した。</li>
+      </ul>
+
+      <h3 id="verification-vfp">VFP との比較</h3>
+      <p>VFP（Vlasov–Fokker–Planck）コードは、電子の分布関数（distribution function）の運動論方程式（kinetic equation）を直接解く（Brodrick ら [6] p. 3）。SNB は分布関数を解かずに非局所熱流束を近似する。Brodrick ら [6]、Sherlock ら [3]、Marocchino ら [5] は、SNB を VFP コードと比較して検証した。TENRYU の 1D SNB も同じ問題で同じ VFP 結果と比較する。VFP 結果は再計算せず、論文の図の曲線と点を数値化する。各読み取り値には、線幅と描画解像度による読み取り不確かさがある。VFP コードは Brodrick らの <a href="../../overview/nomenclature.html#external-names">IMPACT</a>、<a href="../../overview/nomenclature.html#external-names">KIPP</a>、<a href="../../overview/nomenclature.html#external-names">SPRING</a>、Sherlock らの <a href="../../overview/nomenclature.html#external-names">K2</a>、Marocchino らの <a href="../../overview/nomenclature.html#external-names">OSHUN</a> である。</p>
+      <p>ホーラムの問題は、Brodrick ら [6] pp. 11–12、図 7(a)、8(a) による。Brodrick らは、ヘリウムガスを充填したガドリニウム製ホーラムを HYDRA コードで 1D 球対称形状としてレーザー加熱し、20 ns の電子温度 T<sub>e</sub>、電子数密度 n<sub>e</sub>、電荷数 Z の分布を平面形状の IMPACT 計算の初期条件に用いた。ヘリウムとガドリニウムの界面付近の約 100 μm で、プラズマは T<sub>e</sub> = 2.5 keV、n<sub>e</sub> = 5e20 cm<sup>−3</sup>、Z = 2 から、T<sub>e</sub> = 0.3 keV、n<sub>e</sub> = 5e21 cm<sup>−3</sup>、Z = 39 へ変化する。クーロン対数 ln Λ は 2.1484 に固定される。論文の図 8(a) は、IMPACT を 5 ps 進めた後の T<sub>e</sub> 分布で求めた SNB 熱流束を IMPACT と比較する。TENRYU は図 7(a) の線から、その T<sub>e</sub> と、IMPACT では変化しない n<sub>e</sub>、Z を読み取る。3 本の線すべてが描かれた s = 0.912–1.868 mm を、幅 0.999 μm の等間隔な 956 セルに配置する。s は論文の図の位置座標である。平面形状、両端の反射境界、ln Λ = 2.1484 のもとで、この状態の SNB 流束を 1 回評価し、時間発展は行わない。</p>
+      <p>熱浴の問題は、Sherlock ら [3] p. 3、図 2(a) による。初期温度は x &lt; 400 μm で T = 1000 eV、その先の 100 μm で線形に 100 eV まで下がり、領域の長さは 700 μm である。n<sub>e</sub> = 2.47e20 cm<sup>−3</sup>（2.47e26 m<sup>−3</sup>）、Z = 50、ln Λ = 7.1 を固定し、論文の図 2(a) は 10 ps の熱流束を示す。TENRYU は幅 1 μm の 700 セルと両端の反射境界を使い、電子温度だけを熱伝導で時間発展させる。流体運動、輻射、電子・イオン間のエネルギー交換は含めない。Sherlock らもこの問題ではこれらを挙げていない。等しい 540 時間刻みで 10 ps まで進め、その状態の SNB 流束を求める。</p>
+      <p>ピーク熱流束の合否は次式で判定する。</p>
+      $$
+      \begin{aligned}
+      d &amp;\le d_{pub}+(1+d_{pub})\,(\delta_{SNB}+2\,\delta_{VFP}+\delta_{in}),\\
+      d &amp;=\left|q_{peak}/q_{peak,VFP}-1\right|,\qquad
+      d_{pub}=\left|q_{peak,pub}/q_{peak,VFP}-1\right|.
+      \end{aligned}
+      $$
+      <p>ここで q<sub>peak</sub> は TENRYU のピーク熱流束、q<sub>peak,VFP</sub> は読み取った VFP 曲線のピーク、q<sub>peak,pub</sub> は公表 SNB 曲線のピークである。d と d<sub>pub</sub> は、それぞれ TENRYU と公表 SNB の VFP に対するピークの相対偏差である。δ<sub>SNB</sub> と δ<sub>VFP</sub> は、それぞれ公表 SNB 曲線と VFP 曲線のピークにおける相対的な読み取り不確かさである。δ<sub>in</sub> は、ホーラムの入力分布 T<sub>e</sub>、n<sub>e</sub>、Z の読み取り不確かさによる TENRYU のピークの相対変化を、下記の一次近似と帯の上下端での評価から見積もる量である。</p>
+      <p>この規則は、各論文が自身の SNB と VFP のピークのずれを一致として示した検証に従う。Brodrick らはピーク熱流のずれが 16 % 以内と述べる（[6] p. 12）。Sherlock らは、Spitzer に対するピークの特徴的な低減について妥当な一致があると述べる（[3] p. 3）。TENRYU の VFP からの偏差が、読み取り不確かさを考慮した公表 SNB の偏差を超えないときに合格とする。</p>
+      <p>2δ<sub>VFP</sub> は、VFP の読み取りが d と d<sub>pub</sub> の両方に入ることによる。係数 1 + d<sub>pub</sub> は、相対的な読み取り誤差が、大きさ約 1 + d<sub>pub</sub> のピーク比に掛かることによる。</p>
+      <p>入力の不確かさには δ<sub>in</sub> = max(δ<sub>lin</sub>, δ<sub>env</sub>) を使う。δ<sub>lin</sub> は、各線の読み取り帯に収まり、読み取り位置の量子化誤差と、線の連続部分での隣接セル間の変化に対する制約を満たす入力分布について、ピークの相対変化の上限を一次近似で求めた値である。局所感度（local sensitivity）は、1 セルの入力値だけを微小に動かしたときの流束の変化率から求める。δ<sub>env</sub> は、各入力を帯の上端または下端に置き換えたときのピークの変化のうち大きい方を、3 入力について加えた値である。熱浴の入力は論文本文に印刷された数値なので、δ<sub>in</sub> = 0 である。</p>
+      <table id="table-snb-vfp-peaks" class="quick-facts">
+        <caption>ピーク熱流束と判定。流束の単位は erg s<sup>−1</sup> cm<sup>−2</sup> である。</caption>
+        <thead><tr><th>量</th><th>ホーラム</th><th>熱浴</th></tr></thead>
+        <tbody>
+          <tr><th>VFP コード</th><td>IMPACT</td><td>K2</td></tr>
+          <tr><th>q<sub>peak</sub></th><td>9.466e20</td><td>1.8127e19</td></tr>
+          <tr><th>q<sub>peak,VFP</sub></th><td>1.2337e21</td><td>1.9619e19</td></tr>
+          <tr><th>q<sub>peak,pub</sub></th><td>1.4345e21</td><td>2.2155e19</td></tr>
+          <tr><th>d</th><td>0.2327</td><td>0.0760</td></tr>
+          <tr><th>d<sub>pub</sub></th><td>0.1628</td><td>0.1292</td></tr>
+          <tr><th>δ<sub>SNB</sub></th><td>4.15e-3</td><td>7.43e-3</td></tr>
+          <tr><th>δ<sub>VFP</sub></th><td>4.82e-3</td><td>8.44e-3</td></tr>
+          <tr><th>δ<sub>in</sub></th><td>0.3866（δ<sub>lin</sub>；δ<sub>env</sub> = 0.0950）</td><td>0</td></tr>
+          <tr><th>上限（右辺）</th><td>0.6283</td><td>0.1567</td></tr>
+          <tr><th>判定</th><td>合格</td><td>合格</td></tr>
+        </tbody>
+      </table>
+      <p>ホーラムは δ<sub>in</sub> を含めた場合にだけ合格する。δ<sub>in</sub> を除くと上限は 0.179 であり、d = 0.2327 はこれを超える。δ<sub>env</sub> の各入力の変化は、帯の上端、下端の順で、T<sub>e</sub> が 6.0e-3、4.5e-3、n<sub>e</sub> が 3.16e-2、3.16e-2、Z が 5.75e-2、4.67e-2 である。セル数を 1912 に倍増するとピークは 5.8e-4 変化する。領域を n<sub>e</sub> の線の終端 1.883 mm まで延長し、971 セルとし、T<sub>e</sub> と Z を各線の最後の値で保持すると、変化は 3.1e-4 である。どちらも δ<sub>SNB</sub>/2 = 2.07e-3 以内である。</p>
+      <figure id="fig-conduction-snb-vfp-flux">
+        <img src="../../../assets/conduction-snb-vfp-flux-ja.png" width="880" height="360" style="max-width:100%;height:auto" alt="ホーラムと熱浴の熱流束。青実線は TENRYU SNB、濃色一点鎖線は VFP、橙破線は公表 SNB、灰点線は論文の局所流束。熱浴の水色二点鎖線は TENRYU の局所 Spitzer–Härm 流束">
+        <figcaption>図B. (a) ホーラム：Brodrick ら [6] 図 8(a) の Q（10<sup>14</sup> W cm<sup>−2</sup>）と s（mm）。(b) 熱浴：Sherlock ら [3] 図 2(a) の 10 ps の q（10<sup>16</sup> W m<sup>−2</sup>）と x（μm）。単位は各論文に従う（1 W cm<sup>−2</sup> = 1e7 erg s<sup>−1</sup> cm<sup>−2</sup>）。青実線は TENRYU SNB、水色二点鎖線（(b) のみ）は同じ状態における TENRYU の局所 Spitzer–Härm 流束、濃色一点鎖線は VFP（IMPACT、K2）、橙破線は公表 SNB（(a) は平均自由行程を分離した r = 2 の SNB）、灰点線は論文の局所流束（(a) は Brodrick らの Q<sup>(B)</sup>、(b) は Sherlock らの Spitzer 流束）である。論文の曲線の切れ目は、他の線との重なりや交差、または枠外への逸脱によって読み取り値がない区間である。(a) の局所曲線は枠の上端 2.5 を超える。TENRYU の局所流束は (a) に描いていない。読み取った入力では、隣接 2 セルの T<sub>e</sub> が等しい内部面 223 個でゼロとなり、格子に沿って方向が 36 回反転し、|Q| = 41.4e14 W cm<sup>−2</sup> に達するためである。</figcaption>
+      </figure>
+      <p><a href="#fig-conduction-snb-vfp-flux">図B</a>の TENRYU のピークは VFP より低く、IMPACT の 0.767 倍、K2 の 0.924 倍である。公表 SNB のピークは VFP より高く、それぞれ 1.163 倍、1.129 倍である。TENRYU のピークは公表 SNB の 0.660 倍、0.818 倍である。</p>
+      <p>ホーラムの領域は TENRYU の試験で定義する。Brodrick らはこれらの領域を定義していない。q<sub>IMPACT</sub> は IMPACT の熱流束、q<sub>peak,IMPACT</sub> はそのピークである。ガス充填部（gas fill）は、Z &lt; 3 のセル同士の面（ヘリウムは Z = 2）のうち、q<sub>IMPACT</sub> ≥ 0.01 q<sub>peak,IMPACT</sub> を満たす面である。予熱部（preheat）は、IMPACT のピークよりガドリニウム側（Z が大きい側）にあり、0.01 q<sub>peak,IMPACT</sub> ≤ q<sub>IMPACT</sub> ≤ q<sub>peak,IMPACT</sub>/2 を満たす面である。q は各 SNB の熱流束であり、q/q<sub>IMPACT</sub> の中央値は、ガス充填部では TENRYU が 0.954、公表 SNB が 2.074、予熱部では 0.443、1.217 である。Brodrick ら [6] p. 12 は、ガス充填部の熱流がなお約 2 倍大きいことと、予熱を非常によく予測することを述べている。</p>
+      <p>モデルには既知の違いがあるが、これらの差への影響は確かめていない。両論文の SNB は電場によって平均自由行程を補正する（Brodrick ら [6] 式 19、p. 6；Sherlock ら [3] pp. 7–8）。TENRYU の 1D SNB はこの補正を行わない（<a href="#controls"><code>snb_efield="none"</code></a>）。Sherlock らの SNB は平均自由行程の幾何平均（geometric mean）を使う（[3] p. 3）。TENRYU は Brodrick らの分離した曲線と同じく、平均自由行程を分離する。Brodrick ら [6] p. 12 は、幾何平均が有効なのは電離状態が一様な場合だけと述べている。</p>
+      <p>熱浴では、TENRYU の 10 ps の状態における局所 Spitzer–Härm 流束は、416 μm でピーク 4.663e16 W m<sup>−2</sup> をとる。論文の Spitzer 曲線のピークは約 4.2e16 W m<sup>−2</sup> である。論文は Spitzer 曲線をどの温度分布で計算したかを述べていないため、両者は比較しない。</p>
+
+      <h3 id="verification-vfp-response">線形応答の VFP との比較</h3>
+      <p>線形応答（linear response）の問題は、一様プラズマの電子温度に微小な正弦波摂動（sinusoidal perturbation）を与えるものである。論文は有効熱伝導率（effective thermal conductivity）と局所熱伝導率の比を示す。Brodrick らは κ/κ<sup>(B)</sup> を kλ<sup>(B)</sup><sub>ei</sub> に対して示し、κ<sup>(B)</sup> は Braginskii の無次元の局所熱伝導率である（[6] 式 1、p. 2）。Marocchino らは κ/κ<sub>SH</sub> を kλ<sub>ei</sub> に対して示し、κ<sub>SH</sub> は Spitzer–Härm 熱伝導率である。<a href="#verification">上の検証一覧</a>で定義した SNB と局所 Spitzer–Härm の流束比 R をこれらの比と比較する。k と λ<sub>ei</sub> も同一覧の定義を使い、λ<sup>(B)</sup><sub>ei</sub> は Brodrick らの表記である。</p>
+      <figure id="fig-conduction-snb-vfp-response">
+        <img src="../../../assets/conduction-snb-vfp-response-ja.png" width="880" height="330" style="max-width:100%;height:auto" alt="3 面の両対数図。青は TENRYU の応答、橙破線は公表 SNB、黒の記号は VFP。Z = 1 の KIPP、Z = 8 の IMPACT と SPRING、Z = 4 の OSHUN と比較する">
+        <figcaption>図C. (a) Brodrick ら [6] 図 1(a)、Z = 1。(b) 同論文の図 3(a)、Z = 8。横軸は √Z kλ<sup>(B)</sup><sub>ei</sub> と読む（<a href="#verification-vfp-abscissa">下記</a>）。(c) Marocchino ら [5] 図 1(c)、Z = 4。すべて両対数軸である。青実線は、(a)、(b) では TENRYU の 60 群の応答、(c) では正弦波摂動を与えた格子で伝導処理を 1 回評価した応答である。(c) の線は <a href="../../overview/nomenclature.html#external-names">DUED</a>-SNB 曲線の横座標、青の白抜き丸は OSHUN の点の横座標で評価する。橙破線は公表 SNB 曲線（(a)、(b) は r = 2、(c) は流体コード DUED 内の SNB）、黒の記号は VFP（(a) は × KIPP、(b) は × IMPACT と ◆ SPRING、(c) は ▲ OSHUN）である。</figcaption>
+      </figure>
+      <p id="verification-vfp-abscissa">Brodrick らの図 3(a) の横軸は、論文では kλ<sup>(B)</sup><sub>ei</sub> と印刷されている（[6] p. 8）。TENRYU はこの横座標 x を √Z kλ<sup>(B)</sup><sub>ei</sub> と読み、kλ<sup>(B)</sup><sub>ei</sub> = x/√8 で応答を評価する。印刷どおりに読むと、連続体の応答 R<sub>∞</sub> は公表 SNB 曲線を 29–81 % 下回る。√Z kλ<sup>(B)</sup><sub>ei</sub> と読むと、R<sub>∞</sub> は 0.6–5.8 %、60 群の応答 R<sub>h,G</sub> は 0.15–5.8 % 上回る。印刷どおりの読み方は、論文自身の流体力学的極限（hydrodynamic limit）の展開（式 23、展開係数 b は表 I の b(8) = 157）と一致しない。x = 0.02763 の SPRING の点は 0.846 であり、1 − b x<sup>2</sup> は 0.880（√Z を含めた読み方）、1 − 8 b x<sup>2</sup> は 0.041（印刷どおりの読み方）となる。論文は √Z で規格化した横軸を定義していないため、図 3(a) は合否を判定せず記録する。</p>
+      <p>図 3(a) の公表 SNB 曲線の読み取り不確かさを単位とする偏差の最大値は、R<sub>∞</sub> で 2.79、60 群で 2.82、中央値はそれぞれ 1.92、1.96 である。合否を判定するのは図 1(a) との比較であり、<a href="#verification">上の一覧</a>に示した。図 1(a) の KIPP の点は κ/κ<sup>(B)</sup> = 0.111 である。SNB が運動論の結果から離れ始める 0.2 未満にあるため（Brodrick ら [6] p. 8）、この点の偏差は記録しない。</p>
+      <p><a href="#table-snb-vfp-points">次の表</a>は、図 3(a) の κ<sub>VFP</sub>/κ<sup>(B)</sup> ≥ 0.2 の VFP 点を示す。κ<sub>VFP</sub> は VFP の有効熱伝導率である。R<sub>∞</sub> と R<sub>h,G</sub> は<a href="#verification">上の一覧</a>の連続体と 60 群の応答、R<sub>VFP</sub> は VFP 点の比、R<sub>pub</sub> は横座標 x における公表 SNB 曲線の値である。</p>
+      <table id="table-snb-vfp-points" class="quick-facts">
+        <thead><tr><th>コード</th><th>x = √Z kλ<sup>(B)</sup><sub>ei</sub></th><th>|R<sub>∞</sub> − R<sub>VFP</sub>|</th><th>|R<sub>h,G</sub> − R<sub>VFP</sub>|</th><th>|R<sub>pub</sub> − R<sub>VFP</sub>|</th></tr></thead>
+        <tbody>
+          <tr><th>IMPACT</th><td>0.1462</td><td>0.0101</td><td>0.0105</td><td>0.0211</td></tr>
+          <tr><th>IMPACT</th><td>0.2967</td><td>0.0228</td><td>0.0228</td><td>0.0313</td></tr>
+          <tr><th>SPRING</th><td>0.0276</td><td>0.0530</td><td>0.0478</td><td>—</td></tr>
+          <tr><th>SPRING</th><td>0.2767</td><td>0.0153</td><td>0.0154</td><td>—</td></tr>
+        </tbody>
+      </table>
+      <p>「—」は、その位置に読み取った公表曲線の値がないことを示す。0.0276 は最初の点 0.0319 より左にあり、0.2767 は曲線が記号と重なって数値化しなかった 0.265–0.296 にある。2 つの IMPACT 点では、TENRYU はどちらも公表 SNB 曲線より IMPACT に近い。</p>
+      <p>Marocchino らの図 1(c) は Z = 4、n = 1e23 cm<sup>−3</sup>、基準温度 T<sub>0</sub> = 307 eV の問題である（[5] pp. 4–5）。曲線の値 R<sub>curve</sub> に対する TENRYU の応答の相対偏差 R/R<sub>curve</sub> − 1 は、OSHUN の 19 点で中央値 −0.108、範囲 −0.445 から −0.028、DUED-SNB の 812 点で中央値 −0.408、範囲 −0.498 から −0.245 である。読み取り不確かさを単位とする符号付き偏差は、OSHUN で絶対値最大の値が −4.57（中央値 −1.14）、DUED-SNB で −16.8（中央値 −14.5）である。TENRYU はどちらの曲線も下回る。DUED の SNB との差の原因は確かめていない。</p>
+
+      <h3 id="verification-vfp-not-compared">比較しなかった結果</h3>
+      <ul>
+        <li>Brodrick ら [6] 図 5（密度と電離状態が一様）は、入力分布が公表されていない（p. 10）。</li>
+        <li>Marocchino ら [5] 図 1(a)、(b)（Z = 1、2）は、図の軸から値への変換（較正、calibration）が検査に合格しなかったため、比較用に数値化していない。</li>
+        <li>Marocchino ら [5] 図 3 のホットスポット（hot spot）は、公表曲線を使わず、電子・イオン衝突時間（electron–ion collision time）の 2 倍と 30 倍の時刻の温度 T と熱流束 q を、論文の記述（p. 6）と並べて記録する。図の 1–3 行目は較正の検査に合格せず、4 行目は TENRYU の 1D SNB が省略する電場である。</li>
       </ul>
     </section>
 
@@ -122,6 +193,7 @@
         <li>M. Sherlock, J. P. Brodrick, and C. P. Ridgers, "A Comparison of Non-Local Electron Transport Models for Laser-Plasmas Relevant to Inertial Confinement Fusion," Phys. Plasmas 24, 082706 (2017). <a href="https://doi.org/10.1063/1.4986095">doi:10.1063/1.4986095</a></li>
         <li>D. Cao, G. Moses, and J. Delettrez, "Improved Non-Local Electron Thermal Transport Model for Two-Dimensional Radiation Hydrodynamics Simulations," Phys. Plasmas 22, 082308 (2015). <a href="https://doi.org/10.1063/1.4928445">doi:10.1063/1.4928445</a></li>
         <li>A. Marocchino, M. Tzoufras, S. Atzeni, et al., "Comparison for Non-Local Hydrodynamic Thermal Conduction Models," Phys. Plasmas 20, 022702 (2013). <a href="https://doi.org/10.1063/1.4789878">doi:10.1063/1.4789878</a></li>
+        <li>J. P. Brodrick, R. J. Kingham, M. M. Marinak, et al., "Testing Nonlocal Models of Electron Thermal Conduction for Magnetic and Inertial Confinement Fusion Applications," Phys. Plasmas 24, 092309 (2017). <a href="https://doi.org/10.1063/1.5001079">doi:10.1063/1.5001079</a></li>
       </ol>
     </section>
 
