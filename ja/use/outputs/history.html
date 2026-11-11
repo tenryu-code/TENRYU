@@ -54,13 +54,13 @@
         <thead><tr><th>チャネル</th><th>内容</th></tr></thead>
         <tbody>
           <tr><th><code>laser_incident</code> / <code>laser_deposited</code> / <code>laser_escaped</code></th><td>レーザーの入射・吸収・未吸収の累積 [erg]。吸収を入射で割った値が吸収率になる。</td></tr>
-          <tr><th><code>E_cbet_iaw</code> / <code>E_cbet_iaw_step</code></th><td>CBET が光から取り除いてイオン音波（IAW）へ渡したエネルギーの、符号付きの累積と、そのステップの値 [erg]。常に書き出す（CBET が無効のとき、または離調が 0 のときは 0）。</td></tr>
-          <tr><th><code>laser_ra_deposited</code></th><td>共鳴吸収（<code>Laser.ra.enable=True</code>）で吸収されたレーザーエネルギーの累積 [erg]。<code>laser_deposited</code> の内数である。常に書き出す（共鳴吸収が無効なら 0）。</td></tr>
+          <tr><th><code>E_cbet_iaw</code> / <code>E_cbet_iaw_step</code></th><td>CBET が光から取り除いてイオン音波（IAW）へ渡したエネルギーの、符号付きの累積と、そのステップの値 [erg]。常に書き出す（CBET が無効のとき、または離調が 0 のときは 0）。1D の <code>port_section</code> モードは周波数差の分をイオン音波へ渡すパワーとして記帳しないので、常に 0 である（<a href="../../physics/lpi/cbet.html#detuning-action">CBET</a>参照）。</td></tr>
+          <tr><th><code>laser_ra_deposited</code></th><td>共鳴吸収（<code>Laser.ra.enable=True</code>）で吸収されたレーザーエネルギーの累積 [erg]。<code>laser_deposited</code> の内数である。常に書き出す（共鳴吸収が無効なら 0）。1D CBET が有効な場合も、最終の再計算で転回点の共鳴吸収が沈着したパワーを光線ごとの行から固定順に合算し、時間積分する。2026-10-27 より前は CBET 有効時に 0 だった。</td></tr>
           <tr><th><code>marshak_in</code> / <code>radiation_escaped</code></th><td>Marshak 境界から入射したエネルギーの累積と、輻射が境界から逸出（escape）したエネルギーの累積 [erg]（全輻射群の合算）。</td></tr>
           <tr><th><code>pdv_boundary</code></th><td>境界の圧力が外へした PdV 仕事（PdV work。膨張で正）の累積 [erg]。</td></tr>
           <tr><th><code>state_supply</code> / <code>state_supply_step</code> / <code>supply_flow_work</code> / <code>supply_flow_work_step</code></th><td>2D RZ の run が状態供給の面（<code>Numerics.hydro.boundary_2d</code> の <code>z_bottom</code>・<code>z_top</code> に <code>type="state_supply"</code> を指定した面）を持つときだけ書く。面が出し入れしたエネルギー（上書き・速度の復元・リマップの境界流束として記帳した変化）と、面を通る流れの仕事の、領域へ入る向きを正とする符号付きの累積と、そのステップの値 [erg]。保存誤差では流入として数える。</td></tr>
           <tr><th><code>kinetic</code> / <code>internal_electron</code> / <code>internal_ion</code> / <code>radiation_field</code></th><td>運動・電子内部・イオン内部・輻射場の各エネルギー合計 [erg]。</td></tr>
-          <tr><th><code>numerical_loss</code></th><td>数値的喪失（numerical loss）の累積 [erg]。アルゴリズム上の限界のために物質へ入れられなかった、または系から落ちたエネルギー（たとえば受け皿がなく捨てられたレーザーパワー）で、保存誤差では既知の流出として数える。</td></tr>
+          <tr><th><code>numerical_loss</code></th><td>数値的喪失（numerical loss）の累積 [erg]。アルゴリズム上の限界のために物質へ入れられなかった、または系から落ちたエネルギー（たとえば受け皿がなく捨てられたレーザーパワー）で、保存誤差では既知の流出として数える。1D CBET では、受理した再計算の符号付きパワー残差 \(R\) [erg/s] に、そのレーザー演算の時間幅を掛けて、呼び出しごとにランク 0 で一度だけ加算する。\(R&gt;0\) は光のパワーの消失を表し、負ならこの累積値は減少し得る。ほかの数値的喪失の時間刻みごとの非負クランプは維持する。この残差は <code>laser_deposited</code> に含めない。旧ファイルに <code>energy/E_numerical_loss</code> だけがある場合は、その系列へ追記する。</td></tr>
           <tr><th><code>floor_injected</code> / <code>safety_injected</code></th><td>床補正・安全補正（<a href="#terms-ledger">用語</a>）の累積 [erg]。現在の実装は伝導の補正も床補正に含めて記帳し、安全補正に床補正と同じ値を入れるので、2 つの系列は同じ値になる。保存誤差では人工項として全エネルギー変化から差し引くので、保存誤差に数えない。</td></tr>
           <tr><th><code>redistribution_unresolved</code></th><td>ALE 再分配の未解決分（<a href="#terms-ledger">用語</a>）の、そのステップの値 [erg]。累積ではなく、<code>_step</code> の系列もない。2D RZ の ALE のリマップが質量の床に落ちたセルを床の状態に置いたときのエネルギー差と、運動エネルギー・クロージャの再配分（<code>Numerics.ale.ke_closure_redistribute_floor</code>）が吸収しきれなかった不足の和で、ALE を使わなければ 0 である。保存誤差では人工項として差し引く。</td></tr>
           <tr><th><code>solver_residual</code></th><td>陰的ソルバの残差（<a href="#terms-ledger">用語</a>）の累積 [erg]。記帳の欄だけがあり、どの演算子も加算しないので常に 0 である。0 以外の値は、符号に応じて流入または流出として保存誤差に入る。</td></tr>
@@ -91,6 +91,7 @@
       </table>
 
       <h3>laser/ — レーザーの時系列（常時。レーザーが無効なら 0）</h3>
+      <p>以下の <code>cbet_newton_zero_records</code> から <code>cbet_newton_theta</code> までの 6 項目は 1D CBET の診断であり、2D ではすべて 0 である。</p>
       <table class="quick-facts">
         <thead><tr><th>チャネル</th><th>内容</th></tr></thead>
         <tbody>
@@ -99,9 +100,17 @@
           <tr><th><code>commanded_power_total</code> / <code>unabsorbed_power_total</code> / <code>trace_unabsorbed_power_total</code></th><td>入射・未吸収（最終／光線追跡の直後）の各パワー [erg/s]。</td></tr>
           <tr><th><code>absorption_efficiency_total</code> / <code>trace_absorption_efficiency_total</code></th><td>総吸収効率（最終／光線追跡の直後）。</td></tr>
           <tr><th><code>transfer_blocked_power_total</code></th><td>受け皿がなく捨てられたパワー [erg/s]。</td></tr>
-          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾のクロージャ（tail closure。残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../../physics/laser/index.html">レーザー</a>参照）で終端した光線の数とその吸収パワー、臨界面で打ち切られた光線の数。1D の既定の特性曲線積分は臨界半径で光線を反射させるので、裾のクロージャは使わない。</td></tr>
+          <tr><th><code>tail_closure_count</code> / <code>tail_closure_absorbed_power_total</code> / <code>critical_surface_hit_count</code></th><td>臨界面近傍の裾のクロージャ（tail closure。残存パワーを解析的に沈着させて光線を終端する処理 — <a href="../../physics/laser/index.html">レーザー</a>参照）で終端した光線の数とその吸収パワー、臨界面で打ち切られた光線の数。1D の既定の特性曲線積分は臨界半径で光線を反射させるので、裾のクロージャは使わない。吸収パワーの単位は erg/s である。1D CBET が有効な場合も、最終の再計算で裾のクロージャが沈着したパワーを光線ごとの行から固定順に合算する。2026-10-27 より前は CBET 有効時の <code>tail_closure_absorbed_power_total</code> は 0 だった。</td></tr>
           <tr><th><code>ghost_corona_width</code></th><td>1D のゴーストコロナ（ghost corona、キー <code>Laser.lasermesh.ghost_corona</code>）の幅 [cm]（無効なら 0）。ゴーストコロナは、最外の物質セルの外側に光線追跡のためだけにレーザー格子上へ置く仮想の低密度コロナで、流体の状態は変えない。</td></tr>
           <tr><th><code>cbet_exchanged_power_total</code> / <code>cbet_ledger_residual_rel</code> / <code>cbet_iterations</code> / <code>cbet_clamp_count</code></th><td>CBET の交換パワー・エネルギー台帳の残差・反復数・クランプ数。CBET 無効でも 0 値で常に出力される。</td></tr>
+          <tr><th><code>cbet_multiplier</code> / <code>cbet_multiplier_iters</code></th><td>1D の <code>port_section</code> モードで、その時間刻みに採用したポンプ乗数 [無次元] と、試したポンプ乗数の数（候補ごとに交換を解く）[count]（<a href="../../physics/lpi/cbet.html#multiplier">CBET のポンプ乗数</a>参照）。ほかのモードと CBET 無効のときは 0。</td></tr>
+          <tr><th><code>cbet_residual_uncorrected</code> / <code>cbet_residual_published</code></th><td>1D の <code>port_section</code> モードの保存の残差 [erg/s]。交換で光が失う正味のパワー（交換の総和の符号を変えたもの）で、正は光のパワーの消失を表す。前者はポンプ乗数を 1 としたときの値、後者は採用したポンプ乗数での値で、後者が数値損失としてエネルギー台帳に記帳される。ほかのモードと CBET 無効のときは 0。</td></tr>
+          <tr><th><code>cbet_newton_zero_records</code></th><td>受理した再計算で、パワーの路程積分が 0 となる交換区間の数 [count]。交換区間は、保存した光線経路のうち CBET の交換を適用する区間である。</td></tr>
+          <tr><th><code>cbet_newton_last_step</code></th><td>受理判定で線形化した方程式を解いて求めた、光線パワーの対数の補正の最大絶対値 [無次元]。1D の <code>cbet_error_estimate</code> と同じ値であり、端点パワーの大きい方が <code>2.2e-308</code> erg/s 以上の交換区間を対象とする。</td></tr>
+          <tr><th><code>cbet_newton_floor_max</code></th><td>入口と出口のパワーの大きい方が <code>2.2e-308</code> erg/s 以上の記録について、対数の連鎖における丸め誤差の床の最大値 [無次元]。</td></tr>
+          <tr><th><code>cbet_reamplified_fraction</code></th><td>各（光線、ポート）の連鎖で、自身または上流の交換入口のパワーの対数が、その連鎖の発射パワーの対数から 30 を引いた値より小さくなった交換区間について、入口・出口のパワー差の絶対値を合算し、全交換区間の同じ和で割った値 [無次元]（分母 0 なら 0）。</td></tr>
+          <tr><th><code>cbet_newton_cutoff_nodes</code></th><td>従来の幾何モデルにおける（セル、有効な対、求積点）のうち、イオン音波の波数と光波の波数の比が <code>1e-6</code> 未満の数 [count]。<code>port_section</code> では 0。</td></tr>
+          <tr><th><code>cbet_newton_theta</code></th><td>受理判定の対数パワー補正の最大絶対値を、最後のニュートン方向の最大絶対値で割った比 [無次元]。対象は端点パワーの大きい方が <code>2.2e-308</code> erg/s 以上の交換区間であり、この判定を免除した場合は 0。</td></tr>
           <tr><th><code>absorbed_fraction_beam_&lt;i&gt;</code></th><td>ビーム別の吸収配分重み（単一ビームでは常に 1）。</td></tr>
         </tbody>
       </table>
@@ -113,6 +122,7 @@
           <tr><th><code>radiation/fld_outer_*</code></th><td>常時（FLD 無効時 0）。外側のピカール反復（Picard iteration）の回数・終了残差・収束フラグ。</td></tr>
           <tr><th><code>radiation/sn_*</code></th><td><code>mode="sn_transport"</code> の run だけ。外側反復（1D の線形不連続法（linear discontinuous method）は節点温度のニュートン法（Newton's method）、ほかは物質のピカール反復）と内側反復（線形不連続法は GMRES（generalized minimal residual method）の Krylov 反復、ほかは源反復（source iteration））のステップ内の合計、外側反復の終了残差、収束フラグ（<code>sn_outer_iterations</code>・<code>sn_inner_iterations</code>・<code>sn_outer_residual</code>・<code>sn_converged</code>）。</td></tr>
           <tr><th><code>radiation/overshoot_count</code>・<code>overshoot_max</code></th><td>常時（輻射が無効なら 0）。最大値原理（maximum principle）の超過を記録する。輻射の段（演算子分割の 1 段。<a href="../../overview/numerics-foundations.html#operator-splitting">定義</a>）の後の電子温度が \(T_{max}=\max\)（段の前の最大電子温度、Marshak 駆動温度）を超えたセルの数と、最大の \((T_e-T_{max})/T_{max}\)。<code>Numerics.safety.overshoot_warn</code> はこの値で判定する。2026-09-29 までは <code>mc/overshoot_*</code> にあった。</td></tr>
+          <tr><th><code>/diagnostics/cbet_1d_kappa/v1/</code></th><td><code>Main.dimension="1D_SPH"</code>、<code>Laser.enabled=True</code>、<code>Laser.cbet.enable=True</code> の場合だけ、履歴の記録ごとに 1 行を書く。<code>cycle</code> は計算のステップ番号 [count]、<code>kappa_max</code> は受理した状態の結合指標 κ の最大値 [無次元]、<code>kappa_cells_over</code> は κ が 0.1 を超える（<a href="../../physics/lpi/cbet.html#terms">集計群</a>、セル）の数 [count]、<code>exchange_residual_power</code> は受理した再計算の符号付き残差パワー [erg/s]（正は光のパワーの消失）である。κ は精度の保証を与えない。旧ファイルのほかの系列との行の一致を仮定せず、このグループの <code>cycle</code> を使う。</td></tr>
           <tr><th><code>diagnostics/icf/v1/</code></th><td><code>Numerics.diagnostics.icf.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。シェル半径 <code>shell_radius_cm</code>・厚さ <code>shell_thickness_cm</code>・IFAR・シェルの収束比 <code>CR</code>（<a href="#terms-shell">用語</a>）。</td></tr>
           <tr><th><code>diagnostics/hotspot_gas/v1/</code></th><td><code>Numerics.diagnostics.hotspot_gas.enabled</code>。ホットスポットのガス（<a href="#terms-hotspot">用語</a>）の質量、半径 R50・R90・R95・R99 とそれぞれの収束比、密度・圧力・K の統計、Te/Ti の統計、エネルギーと仕事プロキシ。</td></tr>
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td><code>Numerics.diagnostics.ale_provenance_emission.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。<code>Numerics.profile.icf_standard_ale</code> は、ALE の設定を標準の組に限り、メッシュを修復する機構（セルの緊急無効化、境界と内部の局所修復、軸の変分射影など）を禁じるプロファイルである。このグループは、禁じた設定を有効にした数（<code>forbidden_config_violations</code>）、メッシュの救済処理（mesh rescue。許可した上で、禁じた修復機構が実際に動いたこと）の回数（<code>escape_valve_activations</code>）、メッシュの幾何の失敗のカウンタ、救済処理ごとのイベント表（<code>escape_valve_events/</code>）、run 終了時の状態を記す属性（<code>final_claim_level</code>・<code>reached_t_end</code> など）を持つ。</td></tr>
