@@ -220,7 +220,7 @@
         breadcrumb: "パンくずリスト",
         previous: "前へ",
         next: "次へ",
-        footer: "TENRYU ドキュメント — 2026-11-11。",
+        footer: "TENRYU ドキュメント — 2026-11-12。",
         subtitle: "輻射流体コード"
       }
     : {
@@ -232,7 +232,7 @@
         breadcrumb: "Breadcrumb",
         previous: "Previous",
         next: "Next",
-        footer: "TENRYU documentation — 2026-11-11.",
+        footer: "TENRYU documentation — 2026-11-12.",
         subtitle: "Radiation Hydrodynamics Code"
       };
 

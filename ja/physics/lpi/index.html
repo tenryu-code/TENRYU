@@ -34,7 +34,8 @@
         <li>TPD・SRS の波の成長と飽和。ホット電子の変換効率 η(t) は較正した入力で、<code>eta_mode="model"</code> を選んでも、局所のプラズマ量で駆動する縮約した緩和の式であり、波の方程式は解かない。</li>
         <li>SRS・SBS（誘導ブリルアン散乱、stimulated Brillouin scattering）の後方散乱で失われる反射光。散乱光の反射率を与えるキーも、反射した光線を追跡する処理もない。CBET が SBS と同じ三波結合に基づくのは、相手のビームが種（seed）になる前方の交換に限る。</li>
         <li>フィラメンテーション（filamentation）、自己集束（self-focusing）、スペックル（speckle）と波動光学（干渉、回折）。レーザーの経路は幾何光学の光線であり、コード内にこれらを扱う処理はない。</li>
-        <li>CBET の火面（caustic）補正、スペックル統計、偏光のダイナミクス、広帯域の照射（<a href="cbet.html#mechanism">CBET の頁</a>に理由を書いている）。</li>
+        <li>既定の従来の縮約（<code>geometry_mode="legacy"</code>。ポート配置を使わず、二つの光線のあいだの方位角について平均する扱い）での、コースティック（caustic。光線の族の包絡線で、幾何光学の強度が発散する所 [3]）の近くの強度の補正。<code>port_section</code>（実際のポート配置を使う再構成）は、コースティックの近くの強度の上限と、コースティックの近くの寄与がある場合に保存の残差を減らす<a href="cbet.html#multiplier">ポンプ乗数</a>を含む。どちらのモードも、コースティックの近くの波の場そのものは解かない。</li>
+        <li>スペックル統計、偏光のダイナミクス、広帯域の照射（<a href="cbet.html#mechanism">CBET の頁</a>に理由を書いている）。</li>
       </ul>
       <p>結果は、指定した CBET 係数とホット電子の生成クロージャ（変換効率と温度）に対するプラズマの応答として読むこと。LPI の第一原理的な予測にはならない。</p>
     </section>
@@ -96,6 +97,7 @@
       <ol class="references">
         <li>J. A. Marozas et al., "Wavelength-Detuning Cross-Beam Energy Transfer Mitigation Scheme for Direct Drive: Modeling and Evidence from National Ignition Facility Implosions," Phys. Plasmas 25, 056314 (2018). <a href="https://doi.org/10.1063/1.5022181">doi:10.1063/1.5022181</a></li>
         <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+        <li>Yu. A. Kravtsov and Yu. I. Orlov, <i>Caustics, Catastrophes and Wave Fields</i>, 2nd ed. (Springer, 1993), Sec. 2.3.1, pp. 30–31. <a href="https://doi.org/10.1007/978-3-642-59887-6">doi:10.1007/978-3-642-59887-6</a></li>
       </ol>
     </section>
 

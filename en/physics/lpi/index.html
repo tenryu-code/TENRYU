@@ -34,7 +34,8 @@
         <li>The growth and saturation of the TPD and SRS waves. The hot-electron conversion efficiency η(t) is a calibrated input; even with <code>eta_mode="model"</code> it is a reduced relaxation formula driven by local plasma quantities, and no wave equation is solved.</li>
         <li>Light lost to SRS and SBS (stimulated Brillouin scattering) backscatter. There is no key for a scattered-light reflectivity and no code that traces reflected rays. CBET rests on the same three-wave coupling as SBS only for the forward exchange, in which the other beam is the seed.</li>
         <li>Filamentation, self-focusing, speckle, and wave optics (interference, diffraction). The laser path is geometric-optics rays, and the code has no treatment of these.</li>
-        <li>The CBET caustic correction, speckle statistics, polarization dynamics, and broadband illumination (the <a href="cbet.html#mechanism">CBET page</a> gives the reasons).</li>
+        <li>A correction of the intensity near a caustic (the envelope of a family of rays, where the geometric-optics intensity diverges [3]) in the default legacy reduction (<code>geometry_mode="legacy"</code>, which uses no port layout and averages over the azimuth between two rays). <code>port_section</code> (the reconstruction that uses the actual port layout) includes an intensity cap near caustics and a <a href="cbet.html#multiplier">pump multiplier</a> that reduces the conservation residual when contributions near caustics are present. Neither mode solves the wave field near a caustic itself.</li>
+        <li>Speckle statistics, polarization dynamics, and broadband illumination (the <a href="cbet.html#mechanism">CBET page</a> gives the reasons).</li>
       </ul>
       <p>Read the results as the response of the plasma to the specified CBET coefficient and hot-electron source closure (conversion efficiency and temperature). They are not a first-principles prediction of LPI.</p>
     </section>
@@ -96,6 +97,7 @@
       <ol class="references">
         <li>J. A. Marozas et al., "Wavelength-Detuning Cross-Beam Energy Transfer Mitigation Scheme for Direct Drive: Modeling and Evidence from National Ignition Facility Implosions," Phys. Plasmas 25, 056314 (2018). <a href="https://doi.org/10.1063/1.5022181">doi:10.1063/1.5022181</a></li>
         <li>A. Colaïtis et al., "Coupled Hydrodynamic Model for Laser-Plasma Interaction and Hot Electron Generation," Phys. Rev. E 92, 041101(R) (2015). <a href="https://doi.org/10.1103/PhysRevE.92.041101">doi:10.1103/PhysRevE.92.041101</a></li>
+        <li>Yu. A. Kravtsov and Yu. I. Orlov, <i>Caustics, Catastrophes and Wave Fields</i>, 2nd ed. (Springer, 1993), Sec. 2.3.1, pp. 30–31. <a href="https://doi.org/10.1007/978-3-642-59887-6">doi:10.1007/978-3-642-59887-6</a></li>
       </ol>
     </section>
 
