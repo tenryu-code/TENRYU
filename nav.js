@@ -47,6 +47,7 @@
           { id: "hydro-av", title: "Artificial viscosity & hourglass control", href: "physics/hydrodynamics/artificial-viscosity.html", parent: "hydrodynamics" },
           { id: "hydro-momentum", title: "RZ momentum schemes", href: "physics/hydrodynamics/momentum-schemes.html", parent: "hydrodynamics" },
           { id: "viscosity", title: "Plasma viscosity", href: "physics/hydrodynamics/plasma-viscosity.html", parent: "hydrodynamics" },
+          { id: "hydro-standard", title: "Standard problems", href: "physics/hydrodynamics/standard-problems.html", parent: "hydrodynamics" },
           { id: "mesh", title: "Meshes & geometry", href: "physics/mesh/index.html" },
           { id: "mesh-1d", title: "1D meshes & regions", href: "physics/mesh/1d.html", parent: "mesh" },
           { id: "mesh-2d", title: "2D RZ mesh families", href: "physics/mesh/2d.html", parent: "mesh" },
@@ -145,6 +146,7 @@
           { id: "hydro-av", title: "人工粘性と砂時計モードの制御", href: "physics/hydrodynamics/artificial-viscosity.html", parent: "hydrodynamics" },
           { id: "hydro-momentum", title: "RZ 運動量スキーム", href: "physics/hydrodynamics/momentum-schemes.html", parent: "hydrodynamics" },
           { id: "viscosity", title: "プラズマ粘性", href: "physics/hydrodynamics/plasma-viscosity.html", parent: "hydrodynamics" },
+          { id: "hydro-standard", title: "標準問題による検証", href: "physics/hydrodynamics/standard-problems.html", parent: "hydrodynamics" },
           { id: "mesh", title: "メッシュと幾何", href: "physics/mesh/index.html" },
           { id: "mesh-1d", title: "1D メッシュと領域", href: "physics/mesh/1d.html", parent: "mesh" },
           { id: "mesh-2d", title: "2D RZ メッシュ族", href: "physics/mesh/2d.html", parent: "mesh" },
@@ -220,7 +222,7 @@
         breadcrumb: "パンくずリスト",
         previous: "前へ",
         next: "次へ",
-        footer: "TENRYU ドキュメント — 2026-11-12。",
+        footer: "TENRYU ドキュメント — 2026-11-19。",
         subtitle: "輻射流体コード"
       }
     : {
@@ -232,7 +234,7 @@
         breadcrumb: "Breadcrumb",
         previous: "Previous",
         next: "Next",
-        footer: "TENRYU documentation — 2026-11-12.",
+        footer: "TENRYU documentation — 2026-11-19.",
         subtitle: "Radiation Hydrodynamics Code"
       };
 

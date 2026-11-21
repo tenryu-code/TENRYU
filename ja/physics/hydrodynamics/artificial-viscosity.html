@@ -16,7 +16,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>人工粘性と砂時計モードの制御</h1>
-    <p class="abstract">衝撃波の捕捉（shock capturing）に使う人工粘性（artificial viscosity、AV）として、スカラー vNR（von Neumann–Richtmyer）粘性、1D の CSW 形式、2D RZ の CSW98（Caramana–Shashkov–Whalen 1998）の辺人工粘性を述べる。あわせて、双一次四辺形に生じるゼロエネルギーの砂時計モード（hourglass mode）を抑えるサブゾーン圧力と、従来の砂時計抑制の経路を述べる。この計算に固有の用語（サブゾーン圧力、辺人工粘性）は<a href="#terms">用語の節</a>で説明する。</p>
+    <p class="abstract">1D の流体ステップは、CSW98（Caramana–Shashkov–Whalen 1998）の人工粘性（artificial viscosity、AV）で衝撃波を捕捉する。</p>
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
@@ -53,19 +53,23 @@
 
     <section aria-labelledby="artificial-viscosity">
       <h2 id="artificial-viscosity">人工粘性</h2>
-      <p>従来のスカラー von Neumann–Richtmyer 粘性 [1] は圧縮時にのみ働く。以下は 2D RZ の <code>scalar_vnr_legacy</code> の式である。TENRYU の 2 次項の係数は \(C_2\) ではなく \(C_2^2\) である。</p>
+      <p id="csw98-1d">1D の CSW98 粘性は半径方向の垂直応力（radial normal stress）として働き、平面幾何では粘性圧力に相当する。応力は、流体演算が活性で、幅と密度が正で、圧縮中のセルでのみ評価し、ほかのセルではゼロである。圧縮中のセルでは NUMERICS §3.1.6 に従い、次の式で求める。</p>
       $$
-      Q_c=
-      \begin{cases}
-      \rho_c\left[C_2^2(\Delta l_c)^2(\nabla\!\cdot\!\mathbf u_c)^2
-      +C_1\Delta l_c\,c_{s,c}\lvert\nabla\!\cdot\!\mathbf u_c\rvert\right],
-      &amp; \nabla\!\cdot\!\mathbf u_c&lt;0,\\
-      0, &amp; \text{otherwise},
-      \end{cases}
-      \qquad \Delta l_c=\sqrt{A_c}.
+      \begin{aligned}
+      Q_i &= \rho_i W_i(1-\psi_i)|\Delta u_i|,\\
+      W_i &= p_i+s_i,\qquad p_i=c_2\Gamma_i D_i,\qquad s_i=\sqrt{p_i^2+(c_1 c_{s,i})^2},\\
+      \Gamma_i &= (\gamma_i+1)/4,\qquad D_i=\max(0,-\Delta u_i).
+      \end{aligned}
       $$
-      <p>ここで \(c_{s,c}\) はセルの音速、\(\nabla\!\cdot\mathbf u_c\) はセル平均の速度発散、\(C_1\)・\(C_2\) は直後に既定値を示す線形・2 次の係数である。1D の <code>vnr</code> は、この式の \(\nabla\!\cdot\mathbf u_c\) の代わりに、節点の傾きを制限して再構成した速度から作る圧縮速度（compression rate。セルの速度勾配の負の部分、単位 1/s）を使い、衝撃波の判定に基づく重みを掛ける。</p>
-      <p>一般的な既定値は <code>av_C1=0.1</code>、<code>av_C2=1.5</code> である。1D では <code>av_type</code> が <code>vnr</code>、任意選択のリーマン形式（Riemann-solver-based AV）、1D の CSW 形式を切り替え、1D のデッキで指定しないときは CSW 形式になる（構造体の既定は <code>vnr</code>）。1D の CSW 形式（<code>av_type="csw"</code>）は、CSW98 の制限関数を使う 1 次元の粘性である。節点の傾きを制限して再構成したセル端の速度から圧縮速度 \(\chi\) を作るので、速度が線形な圧縮では粘性が 0 になる。圧縮しているセルでは、この圧縮速度に、生の圧縮速度の \(f\,(1-\psi)\) 倍の下限を課す（\(f\) は <code>csw_shock_limiter_floor</code>、既定 0.65。\(\psi\) は CSW98 の式 12 の Christensen の制限関数で、隣のセルが圧縮していない衝撃波の足元・後端で 0、3 セルにわたって速度が線形な圧縮で 1）。\(\psi\) は速度の連続関数なので、粘性も速度の連続関数になる。2D では <code>av_model</code> が、従来の <code>scalar_vnr_legacy</code> か、エネルギー整合な辺力モデルかを選ぶ。2D RZ のデッキで省略したときの既定は <code>csw_edge_csw98</code> である。</p>
+      <p>セル \(i\) の \(Q_i\) は人工粘性の応力、\(\rho_i\) は密度、\(\psi_i\) は制限関数（limiter）、\(\Delta u_i\) は外側の節点の速度から内側の節点の速度を引いた差である。圧縮速度 \(D_i\) と物質の音速 \(c_{s,i}\) は、Kuropatenko の波速 \(W_i\) の 2 つの寄与を決める。2 次項の \(p_i\) に入る係数は \(\Gamma_i\) である。すべての状態方程式で、\(\gamma_i\) には <code>ideal_gas_gamma</code> の体積分率による加重平均を [1, 3] に制限した値を用いる。平方根の項 \(s_i\) は 2 次項と線形項を合成する。非負の係数 \(c_1\)・\(c_2\) は <code>csw98_C1</code>・<code>csw98_C2</code> である。各評価には、その段の状態を用いる。</p>
+      $$
+      \begin{aligned}
+      \psi_i &= \max\!\left(0,\min\!\left((r_l+r_r)/2,\,2r_l,\,2r_r,\,1\right)\right),\\
+      r_l &= g_{i-1}/g_i,\qquad r_r=g_{i+1}/g_i,\qquad g_i=\Delta u_i/\Delta r_i .
+      \end{aligned}
+      $$
+      <p>比 \(r_l\)・\(r_r\) は、内側・外側の隣接セルの速度勾配を、セル \(i\) の速度勾配 \(g_i\) で割った値である。セル幅 \(\Delta r_i\) は外側の節点の位置から内側の節点の位置を引いた差である。隣接セルがない場合、非活性の場合、または幅が正でない場合、対応する比には 1 を使う。制限関数による減衰係数 \(1-\psi_i\) に下限はない。圧縮中のセルでは、制限後の圧縮速度 \(\chi_i\Delta r_i\) は \((1-\psi_i)|\Delta u_i|\) に等しい。</p>
+      <p>1D の人工粘性は CSW98 形式のみである。従来のスカラー形式 <code>vnr</code>、リーマン（Riemann）形式 <code>riemann</code>・<code>riemann_compatible</code>、旧形式 <code>csw</code> を含め、<code>av_type</code> は値にかかわらず入力検証で拒否される。<code>ConfigError</code> はキーの削除を指示する。廃止された <code>csw_C1</code>・<code>csw_C2</code> を指定すると、エラーはそれぞれ <code>csw98_C1</code>・<code>csw98_C2</code> への変更を指示する。1D では <code>av_C1</code>（別名 <code>av_linear</code>）と <code>av_C2</code>（別名 <code>av_quadratic</code>）にも同じ変更先を使う。</p>
       <p><code>csw_edge_csw98</code> は、旧実装 <code>csw_edge</code> の欠陥 — 辺ベクトルに、原典のメディアンメッシュのベクトルではなく辺自身の面積ベクトルを使っていたため、格子に整列した圧縮では力が構造的にゼロになる — を正した、2D RZ の既定のエネルギー整合な辺人工粘性である。<a href="#terms-edge-av">メディアンメッシュ上の辺ベクトル</a>に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせて、辺の力を作る。連続辺（同じ論理線上で隣り合う辺）の制限関数は速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸（artificial dissipation）を抑える。2D の CSW 辺モデル（<code>csw_edge</code>、<code>csw_edge_csw98</code>）で <code>av_C1</code>・<code>av_C2</code> を省略した場合は、原論文と同じ \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、過去の検証結果を引き継げるように、ビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
     </section>
 
@@ -83,12 +87,7 @@
           <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>av_type</code></th><td><code>"vnr"</code>（1D で未指定なら <code>"csw"</code>）</td><td>1D の衝撃波捕捉方式の選択：<code>vnr</code>、<code>riemann</code>、<code>riemann_compatible</code>、<code>csw</code>。</td></tr>
-          <tr><th><code>csw_C1</code> / <code>csw_C2</code></th><td><code>0.5</code> / <code>2.0</code></td><td>1D の CSW 形式の線形・2 次の係数（<code>av_C1</code>・<code>av_C2</code> とは別）。</td></tr>
-          <tr><th><code>csw_shock_limiter_floor</code></th><td><code>0.65</code></td><td>1D の CSW 形式の衝撃波での下限 \(f\)。下限は \(f(1-\psi)\) 倍の生の圧縮速度。</td></tr>
-          <tr><th><code>av_model</code></th><td>2D RZ のデッキで省略したとき <code>"csw_edge_csw98"</code>、構造体の既定は <code>"scalar_vnr_legacy"</code></td><td>2D RZ の衝撃波捕捉方式。<code>scalar_vnr_legacy</code>、<code>csw_edge</code>、<code>csw_edge_csw98</code>、<code>mimetic_tensor_v1</code>、<code>mimetic_tensor_rz_v2</code> から選ぶ（<code>csw_edge_plus_tensor_limited</code> は未実装で拒否される）。<code>csw_edge_csw98</code> は上記の欠陥を修正したエネルギー整合な CSW98 辺人工粘性である。</td></tr>
-          <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>線形人工粘性の係数。2D の CSW 辺モデルで省略した場合は 1.0（2D RZ のデッキで <code>av_model</code> も省略したときを含む）。</td></tr>
-          <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>2 次人工粘性の係数。スカラー vNR では \(C_2^2\) として入り、2D の CSW 辺モデルで省略した場合は 1.0。</td></tr>
+          <tr><th><code>csw98_C1</code> / <code>csw98_C2</code></th><td><code>1.0</code> / <code>1.0</code></td><td>それぞれ 1D 専用の線形・2 次の係数。</td></tr>
           <tr><th><code>subzonal_pressure_enabled</code></th><td>2D RZ のデッキで省略したとき <code>True</code>、構造体の既定は <code>False</code></td><td>Caramana–Shashkov のサブゾーン圧力の力（エネルギー整合）を有効化する。</td></tr>
           <tr><th><code>hourglass.enabled</code></th><td><code>False</code></td><td>2D RZ における従来の線形化砂時計モード抑制経路を有効化する。サブゾーン圧力を無効にしたときだけ働く。</td></tr>
         </tbody>
@@ -99,6 +98,7 @@
       <h2 id="verification">検証</h2>
       <ul>
         <li>Noh・Sod 系の解析解による検査は、強衝撃波の位置と密度のプラトー、平面の厳密リーマン解における三波構造、質量と力積の収支、1D のエネルギー保存を確認する。2D RZ の検証デッキ <code>2d_rz_h1_sod_planar</code> と <code>2d_rz_h2_noh_cyl</code> は、平面 Sod と円筒 Noh の配置を実行する。</li>
+        <li><a href="standard-problems.html">標準問題による検証</a> 平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存。</li>
       </ul>
     </section>
 

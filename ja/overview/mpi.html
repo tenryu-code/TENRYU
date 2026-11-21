@@ -140,7 +140,6 @@
           <tr><th>中点法</th><td>2D_RZ の <code>Numerics.<wbr>hydro.<wbr>time_integration="midpoint_v1"</code>（既定）</td><td><code>"pc_v0"</code>（予測子・修正子法）を明示する。1D には適用されない。</td></tr>
           <tr><th>Braginskii 粘性（<a href="../physics/hydrodynamics/plasma-viscosity.html">プラズマ粘性</a>）</th><td><code>Numerics.<wbr>hydro.<wbr>plasma_viscosity.<wbr>enabled</code></td><td>1D と 2D の両方で拒否する。</td></tr>
           <tr><th>1D のボイド（void）セル（<a href="../physics/eos-opacity/index.html#void-materials">ボイド材料</a>）</th><td><code>cell_is_void</code> が立つセル（<code>Material.is_void</code> の材料だけで満たされたセル）を 1 つでも含む 1D の構成</td><td>ボイドの連なりを全線で走査する処理が、複数ランクに対応していないため。</td></tr>
-          <tr><th>1D の適応人工粘性（adaptive artificial viscosity）</th><td><code>Numerics.<wbr>hydro.<wbr>adaptive_av.<wbr>enabled</code>（<code>Numerics.<wbr>hydro.<wbr>av_type="vnr"</code> のとき）</td><td>先頭の衝撃波を全線から探す処理が、複数ランクに対応していないため。</td></tr>
           <tr><th>CSW98（Caramana–Shashkov–Whalen 1998）の感度ガード（sensitivity guard）</th><td><code>Numerics.<wbr>hydro.<wbr>csw98_av_sensitivity_guard_enabled</code></td><td>1 ランクに限る。</td></tr>
           <tr><th>材料別の保存（per-material conservation）</th><td><code>Numerics.<wbr>materials.<wbr>per_material_conservation_enabled</code></td><td>材料ごとの状態方程式（equation of state、EOS）への射影が、ランク分割を持たないため。1D と 2D の両方で拒否する。</td></tr>
           <tr><th>2D の電子熱伝導（<a href="../physics/conduction/discretization.html">熱伝導の空間離散化</a>）</th><td>2D_RZ で <code>Numerics.<wbr>conduction.<wbr>enabled</code>（既定 True）</td><td>2D の熱伝導は節点局所の演算子（node-local operator）で動き、ランクをまたぐ交換を持たないため。</td></tr>

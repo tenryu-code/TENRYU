@@ -16,12 +16,14 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>時間積分</h1>
-    <p class="abstract">流体は、演算子の列の中で半ステップ演算子として実行される。この頁は、1D の積分器（<code>legacy_pc</code>、<code>midpoint_v2</code>）と 2D RZ の積分器（<code>midpoint_v1</code>、<code>pc_v0</code>）の違い、<code>midpoint_v1</code> による流体半ステップ 1 回の手順、手順の前にドライバが選ぶ時間刻みの候補とメッシュ品質の判定を述べる。</p>
+    <p class="abstract">1D の流体半ステップは、エネルギー整合な更新を伴う RK2-Average で進める。</p>
 
     <section aria-labelledby="time-integration">
       <h2 id="time-integration">時間積分</h2>
       <p>ドライバのレベルでは、流体は「レーザー全ステップ → 流体半ステップ → 熱伝導全ステップ → 輻射全ステップ → 流体半ステップ」という既定の順序に組み込まれた半ステップ演算子である。各流体半ステップは、その半区間に対して選択した積分器の 1 サイクルを完全に実行し、後続の演算子が状態を読む前に EOS を再クロージャする。積分器は、この半区間を自分の 1 ステップとして進める。以下では、その区間の中央を中点（midpoint）、区間の全体を進める更新を全ステップ更新と呼ぶ。</p>
-      <p>1D の積分器は、2D の <code>time_integration</code> とは別のキー <code>Numerics.hydro.time_integrator</code> で選ぶ。省略したときの既定は <code>legacy_pc</code> で、従来の予測子–修正子法である。この方法は、予測段（predictor stage）でエネルギーを進めず、エネルギーの仕事に \((P^n+P^{n+1/2})/2\) の平均圧力を使うので、エネルギーの更新は時間 1 次である。<code>midpoint_v2</code> は、予測段でエネルギーも中点へ進め、エネルギーの仕事に中点の圧力と人工粘性を直接使う 2 次の中点法で、1D 専用である。2D RZ で <code>midpoint_v2</code> を指定すると、入力検証が拒否する。</p>
+      <p>1D のラグランジュステップでは RK2-Average のみを用いる（NUMERICS §3.1.10）。廃止された <code>Numerics.hydro.time_integrator</code> は値にかかわらず入力検証で <code>ConfigError</code> となり、エラーはキーの削除を指示する。</p>
+      <p>予測段（predictor stage）では、開始時の力を用いて流体の積分区間の半分だけ節点を進める。予測したセル体積から中点の密度を求め、実際の体積変化、開始時の圧力、開始時の粘性仕事を用いて内部エネルギーを進める。この状態に状態方程式を適用して中点の圧力と物質の音速を求め、中点の状態から人工粘性を評価する。</p>
+      <p>修正段（corrector stage）では、開始時の状態から中点の圧力と粘性を用いて節点速度を更新する。力の幾何学的な尺度は、予測した中点速度で積分区間を進めたときの試行変位から求める。節点の拘束条件を適用した後、開始時と修正後の速度の平均で節点を動かす。エネルギー整合な更新では、同じ変位と力の幾何学的な尺度を用いて圧力仕事と粘性仕事を求める。交換を無効にし、電離状態を開始時の値に固定した滑らかな流体運動では、時間 2 次精度である。電子–イオン交換を分割して解く場合、または変化する電離状態を各呼び出しの開始時の値に固定して結合する場合は、時間精度を 1 次とする。</p>
       <p>2D RZ の <code>pc_v0</code> は、<code>time_integration</code> のキーがなかった時代の<a href="../../use/running.html#terms-freeze">凍結設定</a>を再現するために残してある。このキーを持たない凍結設定は <code>pc_v0</code> として読まれる。<code>pc_v0</code> は、旧時刻の力から中点の位置と速度を予測し、中点での幾何と力を評価して、全ステップ更新を修正する。予測段階で内部エネルギーを進めないため、圧縮中の圧力クロージャが古いままとなり、滑らかな流れの時間収束では約 1 次と測定されている。</p>
       <p><code>midpoint_v1</code>（単一ブロックメッシュの既定）は、中点までのエネルギー整合な仕事を行い、中点の幾何から厳密に \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を再クロージャする。運動量、仕事、エネルギー収支の検査はひとつの中点コーナー力の組を共有する。暫定的な全ステップ更新のあと、修正した中点で力を厳密に 1 回だけ、決定論的に再評価する。最終状態はあらためて \(t^n\) から進め、\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使う。滑らかな流れでの精度次数の測定値（2026-07-27、検証デッキ <code>2d_rz_v3_smooth_temporal</code> による）は \(p_\rho=2.0000\)、\(p_e=1.9999\) で、<code>pc_v0</code> は約 1.0007 である。マルチブロックメッシュ（接続関係を CSR、compressed sparse row 形式で保持する）では、<code>time_integration</code> を省略すると <code>pc_v0</code> になり、<code>midpoint_v1</code> を明示すると中点法が使える。ただし、マルチブロックの中点法では、<code>av_model="scalar_vnr_legacy"</code> と <code>state_supply</code> の境界を入力検証が拒否する。また、混合セル（mixed cell。複数の材料が共存するセル）の圧力緩和（pressure relaxation、<code>Numerics.materials.mixed_cell_closure="pressure_relaxation"</code>。<a href="../../overview/timestep.html#mixed-cell-dt">時間刻み制御</a>の頁に述べた）は中点の段をもたないので、<code>midpoint_v1</code> との組を入力検証が拒否する。HLLC（Harten–Lax–van Leer-contact 近似リーマン解法、approximate Riemann solver）の経路と<a href="../mesh/2d.html#terms-center">中心ボタン</a>（center button） — 極中心を組み立てた「ボタン」メッシュ — の経路は、<code>time_integration</code> の値によらず <code>pc_v0</code> のままである。なお 2 ランク以上の MPI（Message Passing Interface）ではドライバが <code>midpoint_v1</code> を明示的に拒否するため、複数ランクの 2D デッキでは <code>pc_v0</code> を指定する必要がある（<a href="../../overview/mpi.html">MPI ページ</a>参照）。</p>
 
@@ -60,7 +62,6 @@
         </thead>
         <tbody>
           <tr><th><code>time_integration</code></th><td><code>"midpoint_v1"</code>（マルチブロックメッシュで省略すると <code>"pc_v0"</code>）</td><td>2D RZ の時間積分器。<code>pc_v0</code> は従来経路を保持する。</td></tr>
-          <tr><th><code>time_integrator</code></th><td><code>"legacy_pc"</code></td><td>1D の時間積分器。<code>midpoint_v2</code> は 1D 専用で、2D RZ では拒否される。</td></tr>
         </tbody>
       </table>
     </section>
@@ -69,6 +70,7 @@
       <h2 id="verification">検証</h2>
       <ul>
         <li><code>2d_rz_v3_smooth_temporal</code> は、上記 <code>midpoint_v1</code> の密度とエネルギーの精度次数を測定し、保持されている <code>pc_v0</code> の次数と区別する。</li>
+        <li><a href="standard-problems.html">標準問題による検証</a> 平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存。</li>
       </ul>
     </section>
 

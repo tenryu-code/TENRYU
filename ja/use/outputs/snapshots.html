@@ -55,7 +55,6 @@
           <tr><th><code>volFrac</code></th><td>材料の体積分率（volume fraction）[N_cell, N_mat]（多材料時）。</td></tr>
           <tr><th><code>burn_rate</code>, <code>burn_Q_e</code>, <code>burn_Q_i</code>, <code>burn_eps_cum</code>, <code>burn_n_*</code></th><td>optional（核燃焼（nuclear burn）を有効にした <code>Burn.enabled=True</code> のとき）。反応率密度 [1/cm³/s]、燃焼生成物による電子・イオンの加熱率 [erg/cm³/s]、累積の比沈着エネルギー [erg/g]、D・T・He3・He4・p の数密度 [1/cm³]。1D では、セルで生まれた中性子の累積数 <code>burn_neutron_cum</code> も書く。</td></tr>
           <tr><th><code>shock_time</code></th><td>optional。最後に衝撃波を検知した時刻 [s]（post-shock 系機能の有効時）。</td></tr>
-          <tr><th><code>adaptive_av_gate</code>, <code>adaptive_av_mode_cell</code></th><td>optional。適応人工粘性（adaptive artificial viscosity、AV）のセルごとの重み g_i（データセット名の gate。無次元）と、g_i &gt; 10<sup>-6</sup> のセルを 1 とする可視化用マスク（<code>Numerics.hydro.adaptive_av.enabled=True</code> のとき。1D の <code>av_type="vnr"</code> 専用）。</td></tr>
           <tr><th><code>corner_mass</code></th><td>optional。2D のサブゾーンコーナー質量（subzonal corner mass。<a href="../../physics/hydrodynamics/discretization.html#terms-corner">定義</a>）[g]（ラグランジュ不変量）。</td></tr>
           <tr><th><code>eta_compatible</code></th><td>optional。旧 compatible 診断の体積差不整合 [cm³]。</td></tr>
           <tr><th><code>per_material/v1/</code></th><td>optional。材料別の質量 <code>mass</code> [g] と電子・イオンの内部エネルギー <code>Ee</code>・<code>Ei</code> [erg]（セルと材料の組ごと。<code>Numerics.materials.per_material_conservation_enabled=True</code> 時）。</td></tr>

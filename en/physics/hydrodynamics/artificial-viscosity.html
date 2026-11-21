@@ -16,7 +16,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Artificial viscosity and hourglass control</h1>
-    <p class="abstract">This page describes the artificial viscosity (AV) used for shock capturing: the scalar vNR (von Neumann–Richtmyer) viscosity, the 1D CSW form, and the CSW98 (Caramana–Shashkov–Whalen 1998) edge AV of 2D RZ. It also describes the subzonal pressure and the legacy hourglass-suppression path, which suppress the zero-energy hourglass mode of bilinear quadrilaterals. Terms specific to this calculation (subzonal pressure and edge AV) are defined in the <a href="#terms">terms section</a>.</p>
+    <p class="abstract">The 1D hydrodynamic step captures shocks with the CSW98 (Caramana–Shashkov–Whalen 1998) artificial viscosity (AV). </p>
 
     <section aria-labelledby="terms">
       <h2 id="terms">Terms used in this calculation</h2>
@@ -53,19 +53,23 @@
 
     <section aria-labelledby="artificial-viscosity">
       <h2 id="artificial-viscosity">Artificial viscosity</h2>
-      <p>The legacy scalar von Neumann–Richtmyer viscosity [1] is active only in compression. The formula below is that of <code>scalar_vnr_legacy</code> in 2D RZ. TENRYU uses \(C_2^2\), rather than \(C_2\), as the quadratic coefficient:</p>
+      <p id="csw98-1d">The CSW98 viscosity in 1D acts as a radial normal stress (a viscous pressure in planar geometry). The stress is zero unless the cell is hydrodynamically active, has positive width and density, and is compressing. In a compressing cell, NUMERICS §3.1.6 gives</p>
       $$
-      Q_c=
-      \begin{cases}
-      \rho_c\left[C_2^2(\Delta l_c)^2(\nabla\!\cdot\!\mathbf u_c)^2
-      +C_1\Delta l_c\,c_{s,c}\lvert\nabla\!\cdot\!\mathbf u_c\rvert\right],
-      &amp; \nabla\!\cdot\!\mathbf u_c&lt;0,\\
-      0, &amp; \text{otherwise},
-      \end{cases}
-      \qquad \Delta l_c=\sqrt{A_c}.
+      \begin{aligned}
+      Q_i &= \rho_i W_i(1-\psi_i)|\Delta u_i|,\\
+      W_i &= p_i+s_i,\qquad p_i=c_2\Gamma_i D_i,\qquad s_i=\sqrt{p_i^2+(c_1 c_{s,i})^2},\\
+      \Gamma_i &= (\gamma_i+1)/4,\qquad D_i=\max(0,-\Delta u_i).
+      \end{aligned}
       $$
-      <p>Here \(c_{s,c}\) is the cell sound speed, \(\nabla\!\cdot\mathbf u_c\) is the cell-average velocity divergence, and \(C_1\), \(C_2\) are the linear and quadratic coefficients whose defaults follow. The 1D <code>vnr</code> uses, instead of \(\nabla\!\cdot\mathbf u_c\), a compression rate (the negative part of the cell velocity gradient, in 1/s) made from velocities reconstructed with limited nodal slopes, and multiplies it by weights that depend on shock detection.</p>
-      <p>The general defaults are <code>av_C1=0.1</code> and <code>av_C2=1.5</code>. In 1D, <code>av_type</code> selects <code>vnr</code>, the optional Riemann-solver-based form, or the 1D CSW form; a 1D deck that does not set it runs the CSW form (the structure default is <code>vnr</code>). The 1D CSW form (<code>av_type="csw"</code>) is a one-dimensional viscosity that uses the limiter of CSW98. It takes the compression rate \(\chi\) from cell-edge velocities reconstructed with limited nodal slopes, so a compression with a linear velocity has no viscosity. In a compressing cell the rate is floored at \(f\,(1-\psi)\) times the raw compression rate (\(f\) is <code>csw_shock_limiter_floor</code>, default 0.65; \(\psi\) is the Christensen limiter of CSW98 equation 12, 0 at the foot and the tail of a shock where the neighboring cell does not compress and 1 in a compression with a velocity linear over three cells). \(\psi\) is a continuous function of the velocity, and so is the viscosity. In 2D, the <code>av_model</code> key selects legacy <code>scalar_vnr_legacy</code> or a compatible edge-force model; a 2D RZ deck that omits it gets <code>csw_edge_csw98</code>.</p>
+      <p>For cell \(i\), \(Q_i\) is the artificial viscous stress, \(\rho_i\) is the density, \(\psi_i\) is the limiter, and \(\Delta u_i\) is the outer node's velocity minus the inner node's velocity. The compression speed \(D_i\) and the matter sound speed \(c_{s,i}\) set the two contributions to the Kuropatenko wave speed \(W_i\). The quadratic part \(p_i\) uses the factor \(\Gamma_i\), with \(\gamma_i\) the volume-fraction average of <code>ideal_gas_gamma</code> clamped to [1, 3] for every equation of state. The square-root term \(s_i\) combines the quadratic part with the linear contribution. The nonnegative coefficients \(c_1\) and \(c_2\) are <code>csw98_C1</code> and <code>csw98_C2</code>. Each evaluation uses the current stage's state.</p>
+      $$
+      \begin{aligned}
+      \psi_i &= \max\!\left(0,\min\!\left((r_l+r_r)/2,\,2r_l,\,2r_r,\,1\right)\right),\\
+      r_l &= g_{i-1}/g_i,\qquad r_r=g_{i+1}/g_i,\qquad g_i=\Delta u_i/\Delta r_i .
+      \end{aligned}
+      $$
+      <p>The ratios \(r_l\) and \(r_r\) compare the inner and outer neighbors' velocity gradients with \(g_i\), the gradient in cell \(i\). The width \(\Delta r_i\) is the outer node's position minus the inner node's position. An absent or inactive neighbor or one with nonpositive width supplies a ratio of one. The limiter attenuation \(1-\psi_i\) has no floor. For the compressing cell, the limited compression speed \(\chi_i\Delta r_i\) equals \((1-\psi_i)|\Delta u_i|\).</p>
+      <p>The 1D CSW98 form is the sole artificial viscosity in 1D. Input validation rejects <code>av_type</code> for every value, including the former scalar <code>vnr</code>, Riemann <code>riemann</code> and <code>riemann_compatible</code>, and older <code>csw</code> forms. The <code>ConfigError</code> instructs the user to delete the key. For the retired <code>csw_C1</code> and <code>csw_C2</code>, the error names <code>csw98_C1</code> and <code>csw98_C2</code> as the respective replacements. The same replacements apply to <code>av_C1</code> (alias <code>av_linear</code>) and <code>av_C2</code> (alias <code>av_quadratic</code>) in 1D.</p>
       <p><code>csw_edge_csw98</code> is the 2D RZ default, a compatible edge AV that corrects the defect of the earlier <code>csw_edge</code> implementation — it used the area vector of the edge itself as the edge vector instead of the median-mesh vector of the original construction, so grid-aligned compression produced structurally zero force. It builds the force of an edge from the <a href="#terms-edge-av">edge vector on the median mesh</a>, a strict compression switch, the Kuropatenko wave speed [4], and signed compatible work. The limiter of a continuation edge (the neighboring edge on the same logical line) compares velocity gradients; self-similar compression, rigid rotation, and linear grid shear give limiter ratio one and suppress artificial dissipation. If a 2D CSW edge model (<code>csw_edge</code> or <code>csw_edge_csw98</code>) is used and <code>av_C1</code> and <code>av_C2</code> are omitted, the published values \(C_1=C_2=1\) are used. The earlier <code>csw_edge</code> mode is retained bit-identically so that earlier verification results carry over; the placeholder namelist value <code>csw_edge_plus_tensor_limited</code> is not implemented and is rejected by input validation.</p>
     </section>
 
@@ -83,12 +87,7 @@
           <tr><th>Key</th><th>Default</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>av_type</code></th><td><code>"vnr"</code> (<code>"csw"</code> when a 1D deck does not set it)</td><td>1D shock-support selector: <code>vnr</code>, <code>riemann</code>, <code>riemann_compatible</code>, or <code>csw</code>.</td></tr>
-          <tr><th><code>csw_C1</code> / <code>csw_C2</code></th><td><code>0.5</code> / <code>2.0</code></td><td>Linear and quadratic coefficients of the 1D CSW form (separate from <code>av_C1</code>, <code>av_C2</code>).</td></tr>
-          <tr><th><code>csw_shock_limiter_floor</code></th><td><code>0.65</code></td><td>Shock floor \(f\) of the 1D CSW form; the floor is \(f(1-\psi)\) times the raw compression rate.</td></tr>
-          <tr><th><code>av_model</code></th><td><code>"csw_edge_csw98"</code> when a 2D RZ deck omits it; the structure default is <code>"scalar_vnr_legacy"</code></td><td>2D RZ shock-support selector: <code>scalar_vnr_legacy</code>, <code>csw_edge</code>, <code>csw_edge_csw98</code>, <code>mimetic_tensor_v1</code>, or <code>mimetic_tensor_rz_v2</code> (<code>csw_edge_plus_tensor_limited</code> is not implemented and is rejected). <code>csw_edge_csw98</code> is the compatible CSW98 edge AV with the defect above corrected.</td></tr>
-          <tr><th><code>av_C1</code></th><td><code>0.1</code></td><td>Linear AV coefficient; 1.0 when omitted with a 2D CSW edge model (including a 2D RZ deck that also omits <code>av_model</code>).</td></tr>
-          <tr><th><code>av_C2</code></th><td><code>1.5</code></td><td>Quadratic AV coefficient; scalar vNR uses \(C_2^2\); 1.0 when omitted with a 2D CSW edge model.</td></tr>
+          <tr><th><code>csw98_C1</code> / <code>csw98_C2</code></th><td><code>1.0</code> / <code>1.0</code></td><td>1D-only linear and quadratic coefficients, respectively. </td></tr>
           <tr><th><code>subzonal_pressure_enabled</code></th><td><code>True</code> when a 2D RZ deck omits it; the structure default is <code>False</code></td><td>Enables the Caramana–Shashkov subzonal-pressure forces (compatible).</td></tr>
           <tr><th><code>hourglass.enabled</code></th><td><code>False</code></td><td>Enables the legacy linearized anti-hourglass path in 2D RZ. It acts only when subzonal pressure is disabled.</td></tr>
         </tbody>
@@ -99,6 +98,7 @@
       <h2 id="verification">Verification</h2>
       <ul>
         <li>Noh and Sod-class analytic checks cover strong-shock position and density plateaus, the exact planar Riemann three-wave structure, mass/impulse balances, and 1D energy conservation; the 2D RZ decks <code>2d_rz_h1_sod_planar</code> and <code>2d_rz_h2_noh_cyl</code> exercise planar Sod and cylindrical Noh layouts.</li>
+        <li><a href="standard-problems.html">Standard problems</a> — Comparisons with exact solutions for planar Sod, spherical Noh, and Kidder, with mesh convergence and mass and energy conservation.</li>
       </ul>
     </section>
 
