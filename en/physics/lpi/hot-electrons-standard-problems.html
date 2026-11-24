@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hot-electron transport verification against analytic solutions — TENRYU documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <link rel="icon" href="../../../favicon.ico" sizes="32x32">
+  <link rel="icon" href="../../../favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="../../../apple-touch-icon.png">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Hot-electron transport verification against analytic solutions<span class="badge">reference</span></h1>
+
+    <section aria-labelledby="abstract">
+      <h2 id="abstract">Abstract</h2>
+      <p class="abstract">Three one-dimensional problems verify hot-electron transport against analytic solutions: slowing down on six chords through a spherical shell, repeated reflection on a diameter of a full sphere, and reflection with partial escape in a slab. On the finest meshes the normalized maximum errors are 1.31 × 10<sup>−5</sup>, 8.76 × 10<sup>−6</sup>, and 4.66 × 10<sup>−6</sup>, respectively. The observed orders are 0.9994–1.0000, above the required 0.9. The largest normalized energy ledger residual among the three problems is 1.30 × 10<sup>−15</sup>.</p>
+    </section>
+
+    <section aria-labelledby="introduction">
+      <h2 id="introduction">Introduction</h2>
+      <p><a href="hot-electrons.html">Hot-electron transport</a> follows straight chords through the plasma. Collisions reduce the kinetic energy and, when scattering is included, shorten the projected path along a chord. A boundary can return electrons into the domain, a process called reflux. These problems compare energy deposited in the medium, energy escaping the domain, and energy remaining in flight with values derived from the analytic solution along each chord.</p>
+      <p>The published range integrals [1, 2] supply the starting equations. The tests prescribe the stopping and scattering coefficients so that the transport equations can be integrated independently of the mesh used to advance the electrons.</p>
+    </section>
+
+    <section aria-labelledby="setup">
+      <h2 id="setup">Setup</h2>
+      <p>All three problems use carbon at 1 g/cm³. The source is 10<sup>−6</sup> times the initial cell width inside the outer face. Its axis points inward along the face normal, with a direction cosine of −1 relative to the outward normal. A single energy group represents a three-dimensional Maxwellian between 0.95 and 1.05 times the hot-electron temperature of 50 keV. Its representative energy, calculated as the second energy moment divided by the first over that window, is about 50.02085 keV. The source power during emission is 2<sup>60</sup> erg/s.</p>
+      <table class="quick-facts">
+        <caption>Table 1. Plasma, geometry, and timing.</caption>
+        <thead><tr><th>Problem</th><th>Domain and plasma</th><th>Source and boundary behavior</th><th>Cells</th></tr></thead>
+        <tbody>
+          <tr><th>Spherical shell</th><td>Inner radius 0.75 times the outer radius. Electron temperature 300 eV and mean ion charge 4. Uniform radial mesh.</td><td>One 1 ns call in adiabatic tracking mode. A 30° cone half-angle gives six distinct chords. All electrons reaching the outer boundary escape.</td><td>64, 128, 256</td></tr>
+          <tr><th>Full sphere</th><td>From the center to the outer radius. Electron temperature 12.5 keV and mean ion charge 6. Initially uniform radial mesh. Interior faces shift by +0.3 initial cell widths on odd calls and −0.3 on even calls. Both endpoints stay fixed. Each call sets the density to 1 g/cm³.</td><td>Time-dependent tracking on one diameter, with zero cone half-angle and zero reflection deviation. The boundary reflects all electrons. The source emits in calls 1–12 and is off in calls 13–20.</td><td>1024, 2048, 4096</td></tr>
+          <tr><th>Slab</th><td>Static, uniform planar mesh. Electron temperature 12.5 keV and mean ion charge 6.</td><td>Same emission schedule and time-dependent tracking, on one normal chord. Both faces use a sheath boundary. At each arrival, half the electrons escape and the other half reflect without angular deviation.</td><td>1024, 2048, 4096</td></tr>
+        </tbody>
+      </table>
+      <p>At a given electron energy, the shell's mass stopping power in its outer radial half, from 0.875 to 1 times the outer radius, is twice that in its inner half. The six cone quadrature directions have impact parameters below half the outer radius and cross the central hole without depositing energy there. In the other two problems the coefficients are uniform. A diameter of the full sphere and the width of the slab each span 1/3.3 of the chord length to the energy floor.</p>
+      <figure id="fig-setup">
+        <img src="../../../assets/hote1d-standard-problems-setup-en.png" width="880" height="325" style="max-width:100%;height:auto" alt="Six straight chords through a shell, four passes on a sphere diameter, and four passes in a slab. Open circles mark the three boundary arrivals and squares mark where the electrons reach the energy floor.">
+        <figcaption>Figure A. Problem geometry. Left, the six blue shell chords are rotated into a common plane. The solid segments lie in the shell and the dashed segments cross the hole. Darker shading marks the outer half of the shell. The inner radius is 0.75 times the outer radius, and the darker band begins at 0.875 times the outer radius. Center and right, vermilion and green arrows show successive passes in the full sphere and slab, separated vertically for clarity. Black dots mark injection, numbered open circles mark arrivals, and squares mark the energy floor. Dotted connectors join successive paths at a reflection. The short outward arrows in the slab panel mark the half of the electrons that escape at each end-face arrival. The outer radius of the shell or sphere is \(R\) and the slab width is \(L\). Mesh faces inside the domains are omitted.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="analytic">
+      <h2 id="analytic">Analytic solutions</h2>
+      <p>The transport equation relates the collisional mass column to the mass column along the chord.</p>
+      $$\begin{aligned}
+        \mathrm{d}\Sigma &= -\frac{\mathrm{d}E}{S}, & \mathrm{d}l &= -\kappa_1\,\mathrm{d}\Sigma,\\
+        \mathrm{d}\Psi &= e^l\,\mathrm{d}\Sigma = \rho\,\mathrm{d}s, &
+        \mathrm{d}t &= \frac{\mathrm{d}\Sigma}{\rho v}.
+      \end{aligned}$$
+      <p>Here \(E\) is kinetic energy, \(S\) is the positive mass stopping power, \(\Sigma\) is the collisional mass column, and \(\kappa_1\) is the scattering coefficient per unit mass column. The quantity \(l=\ln\langle\cos\theta\rangle\) is the natural logarithm of the mean direction cosine, with \(\theta\) the scattering angle relative to the chord direction. The chord mass column is \(\Psi\), the traveled distance on the chord is \(s\), the material density is \(\rho\), the flight time is \(t\), and the electron speed is \(v\). Here \(e\) is the base of the natural logarithm.</p>
+      <p>The numerical march advances with the stopping power, scattering coefficient, and speed evaluated at the start of each step. The tests supply tables through the test-only <code>transport_1d::set_coefficient_table</code> entry point. The table spacing in the natural logarithm of energy is 1/64, and interpolation is linear in that logarithm. The steps end at cell faces on these meshes. The time budget or thermalization can end the advance inside a cell. When a step reaches the energy floor, the code recomputes the time to reach it by Simpson's rule.</p>
+
+      <h3 id="solution-a">(A) Energy-dependent stopping without scattering</h3>
+      <p>Atzeni et al. [1, Sec. 3.2, Eq. (25)] express the continuous-slowing-down range as an integral of inverse mass stopping power over energy. For the stopping law prescribed by the shell test, the same integral has a closed form in the exponential integral. The argument of that solution is the chord column weighted by the cell's stopping multiplier.</p>
+      $$\begin{aligned}
+        S &= s_c S_r[1-b\ln(E/E_0)], & \kappa_1 &= 0,\quad l=0,\\
+        \widehat\Psi &= \int s_c\,\mathrm{d}\Psi, & w &= 1-b\ln(E/E_0),\\
+        \Psi_A(E) &= \frac{E_0 e^{1/b}}{b S_r}
+        \left[E_1(1/b)-E_1(w/b)\right], & \widehat\Psi &= \Psi_A(E).
+      \end{aligned}$$
+      <p>Here \(S\) is the mass stopping power, \(s_c\) is the cell's stopping multiplier (2 in the outer radial half and 1 in the inner half), \(S_r\) is the reference stopping power (1 MeV cm²/g), and \(b\) is the dimensionless coefficient 1/2. The kinetic energy is \(E\) and its initial value \(E_0\) is the representative energy of the source group. The scattering coefficient \(\kappa_1\) and the logarithm \(l\) of the mean direction cosine are zero. The geometric and weighted chord columns are \(\Psi\) and \(\widehat\Psi\), respectively. The auxiliary variable \(w\) is dimensionless, \(e\) is the base of the natural logarithm, \(E_1\) is the exponential integral, and \(\Psi_A(E)\) gives the weighted column at energy \(E\). Along a chord with unit multiplier the two columns coincide.</p>
+      <p>The shell radius satisfies the relation below. Even the largest weighted chord column is at most 0.91 times the radial column from the center to the outer face at the specified density. The electrons therefore emerge with more than half their initial energy. The reference inverts the range by bisection to an energy bracket of 10<sup>−12</sup> times the initial energy.</p>
+      $$\rho R = 0.4\,\Psi_A(E_0/2).$$
+      <p>Here \(\rho\) is the mass density, \(R\) the outer radius, \(\Psi_A\) the weighted range function, and \(E_0\) the initial energy.</p>
+
+      <p>The chord's direction cosine relative to the local radius has magnitude at least 0.745 in the shell. At cell count \(N\), the unweighted column across a cell along a chord is at most \(0.067 E_0/(S_r N)\). This is below the face-limiting threshold of \(1.86\times10^{-3} E_0/S_r\) even on the coarsest mesh. The stopping power stays below \(2.70 S_r\).</p>
+
+      <h3 id="solution-b">(B) Constant stopping and scattering</h3>
+      <p>Solodov and Betti [2, Eq. (15)] express the mean direction cosine as the exponential of the negative integral of the scattering rate. Their Eq. (23) gives the projected range by integrating the slowing-down distance weighted by that cosine. The test adopts their endpoint at which the cosine falls to the inverse of the base of natural logarithms. With constant mass stopping power and scattering coefficient, the energy and mean direction cosine are explicit functions of the chord column.</p>
+      $$\begin{aligned}
+        E_B(\Psi) &= E_0 + \frac{S_r}{K}\ln(1-K\Psi), &
+        \langle\cos\theta\rangle &= 1-K\Psi,\\
+        E_{\rm floor} &= \max(2T_e,10^{-3}T_h), &
+        K &= \frac{S_r}{E_0-E_{\rm floor}},\qquad
+        \Psi_f = \frac{1-e^{-1}}{K}.
+      \end{aligned}$$
+      <p>Here \(E_B(\Psi)\) is the kinetic energy at chord mass column \(\Psi\), \(E_0\) is the initial energy, and \(S_r\) is the constant mass stopping power (1 MeV cm²/g). The constant \(K\) is the value of the mass-column scattering coefficient \(\kappa_1\), and \(\langle\cos\theta\rangle\) is the mean direction cosine for scattering angle \(\theta\). The electron temperature \(T_e\) and hot-electron temperature \(T_h\) are in energy units. The energy floor \(E_{\rm floor}\) is 25 keV in both time-dependent problems. The floor column \(\Psi_f\) is where the mean cosine reaches \(e^{-1}\), with \(e\) the base of the natural logarithm. The cell that contains the floor receives the remaining energy.</p>
+      <figure id="fig-solutions">
+        <img src="../../../assets/hote1d-standard-problems-solutions-en.png" width="880" height="310" style="max-width:100%;height:auto" alt="Analytic energy curves for the two stopping laws and the linear decrease of the mean direction cosine in solution B.">
+        <figcaption>Figure B. Analytic curves versus normalized chord column \(\Psi S_r/E_0\). Left, the solid blue curve is solution (A) at unit cell multiplier \(s_c\), shown down to half the initial energy. The dashed vermilion curve is solution (B). Right, the dashed vermilion line is the mean direction cosine in solution (B). The squares mark the energy floor and its direction cosine.</figcaption>
+      </figure>
+
+      <p>With uniform density and constant stopping power, integrating inverse speed gives the flight time. The same relation can be inverted at the end of each call by first solving for dimensionless momentum.</p>
+      $$\begin{aligned}
+        t_B(E) &= \frac{m_e c}{\rho S_r}[q(E_0)-q(E)],\\
+        q(E) &= \sqrt{\gamma^2-1},\qquad \gamma=1+\frac{E}{m_e c^2}.
+      \end{aligned}$$
+      <p>Here \(t_B(E)\) is the time since emission at energy \(E\), \(E_0\) the initial energy, \(m_e\) the electron rest mass, \(c\) the speed of light, \(\rho\) the mass density, and \(S_r\) the constant mass stopping power. The momentum \(q(E)\) is in units of \(m_e c\), and \(\gamma\) is the Lorentz factor.</p>
+      <p>The reference unfolds reflections into one straight path along which the column increases. The full sphere has a traversal length of twice its radius, and the slab has a traversal length equal to its width. The first traversal is shorter by the source offset. The following relations place the boundary arrivals and set the duration of one call.</p>
+      $$\rho D = \Psi_f/3.3,\qquad \Psi_k=\rho(kD-\delta),\qquad
+        \Delta t = t_B(E_{\rm floor})/7.5.$$
+      <p>Here \(\rho\) is the mass density, \(D\) the full traversal length, \(\Psi_f\) the floor column, \(\Psi_k\) the chord column at arrival number \(k\) (1–3), and \(\delta\) the inward source offset. The call duration is \(\Delta t\) (about 0.31035 ps), and \(t_B(E_{\rm floor})\) is the flight time to the energy floor \(E_{\rm floor}\). The corresponding analytic ages are about 1.419, 3.337, and 6.248 call durations. The energy floor occurs at age 7.5 on the fourth pass, near 0.4 times the sphere radius or at 0.3 times the slab width plus the source offset from the inner face. The comparison uses energy observables at the ends of calls. The arrival ages describe the analytic setup. Each arrival precedes the end of its call by at least 0.24 call durations.</p>
+      <p>At cell count \(N\), the largest chord column across a cell is at most \(0.2\Psi_f/N\) in the shifted sphere and \(\Psi_f/(3.3N)\) in the slab. The floor occurs at least 0.0999 cell widths from a face in the sphere and 0.1999 cell widths in the slab, in units of the initial cell width.</p>
+    </section>
+
+    <section aria-labelledby="comparison">
+      <h2 id="comparison">Quantities compared and acceptance criteria</h2>
+      <p>In the shell, the analytic deposit on a chord segment is the drop in kinetic energy multiplied by the electron count assigned to that chord. The analytic escaping energy is the sum of the remaining energies weighted by the chord electron counts. Those counts use the test's angular quadrature weights.</p>
+      <p>For each emitting call in the full sphere and slab, the reference advances the emitted electrons to their exact age at the end of every subsequent call, including the emitting call. A population emitted in call \(m\) has age \((n-m+1)\Delta t\) at the end of call \(n\), where \(\Delta t\) is the call duration. Deposits are energy losses over the portion of the unfolded path traversed during the call. The number of electrons is unchanged at reflection in the sphere and halves at each boundary arrival in the slab. Each slab arrival adds the energy carried by the escaping half to the cumulative escape. The surviving population times its kinetic energy gives the contribution to the energy in flight.</p>
+      <p>At every face of the coarsest mesh, the test compares the sum of the call's deposits in all cells outside the corresponding face with the analytic sum. Finer meshes use every second or fourth face, and the reference uses the current face positions, including their shifts in the full sphere. The shell also compares total escape. The full sphere and slab compare end-of-call energy in flight, and the slab also compares cumulative escape. The error for a mesh is the maximum absolute discrepancy over these quantities, faces, and calls, divided by the energy injected in one emitting call.</p>
+      <p>The test requires the observed order for each adjacent pair of meshes to be at least 0.9. Each call must also satisfy the <a href="#energy">energy ledger</a> and the applicable exact-zero checks.</p>
+    </section>
+
+    <section aria-labelledby="results">
+      <h2 id="results">Results</h2>
+      <p>The three cases passed on 24 November 2026 on one NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition GPU. The recorded run and its output are described in <code>tools/site_figures/<wbr>data/<wbr>hote1d_standard_problems/<wbr>README.md</code> in the repository.</p>
+      <table class="quick-facts">
+        <caption>Table 2. Normalized maximum error by mesh and observed order for each refinement pair. The two coarser errors are reconstructed from the printed finest error and orders.</caption>
+        <thead><tr><th>Problem</th><th>Coarse</th><th>Middle</th><th>Fine</th><th>Coarse → middle</th><th>Middle → fine</th></tr></thead>
+        <tbody>
+          <tr><th>Spherical shell</th><td>5.22937 × 10<sup>−5</sup></td><td>2.61570 × 10<sup>−5</sup></td><td>1.30811 × 10<sup>−5</sup></td><td>0.999437</td><td>0.999718</td></tr>
+          <tr><th>Full sphere</th><td>3.50505 × 10<sup>−5</sup></td><td>1.75265 × 10<sup>−5</sup></td><td>8.76353 × 10<sup>−6</sup></td><td>0.999899</td><td>0.999950</td></tr>
+          <tr><th>Slab</th><td>1.86394 × 10<sup>−5</sup></td><td>9.32351 × 10<sup>−6</sup></td><td>4.66236 × 10<sup>−6</sup></td><td>0.999412</td><td>0.999813</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="convergence">
+      <h2 id="convergence">Convergence</h2>
+      <p>The test estimates the observed order from three meshes whose cell count doubles at each refinement, using the analytic solution to compute the errors [3, Eq. (5.23)].</p>
+      $$p_{01}=\log_2(e_0/e_1),\qquad p_{12}=\log_2(e_1/e_2),\qquad
+        e_1=e_2\,2^{p_{12}},\quad e_0=e_1\,2^{p_{01}}.$$
+      <p>Here \(e_0,e_1,e_2\) are the normalized maximum errors on the coarse, middle, and fine meshes. The observed orders \(p_{01}\) and \(p_{12}\) refer to the first and second refinement pairs, and \(\log_2\) is the base-two logarithm. The last two relations give the coarser errors from the reported finest error and orders.</p>
+      <p>The cell size bounds the step length on these meshes, as described in <a href="#analytic">Analytic solutions</a>. Evaluating the variable stopping power at the start of each step predicts first-order convergence in the shell. In solution (B) the frozen stopping and scattering coefficients are constant, so the steps before thermalization integrate the energy and mean direction cosine exactly as functions of chord column. Holding speed fixed at its start value gives first-order flight-time error, which affects the state sampled at the ends of calls. All six measured orders in Table 2 exceed the lower bound.</p>
+      <figure id="fig-convergence">
+        <img src="../../../assets/hote1d-standard-problems-convergence-en.png" width="880" height="365" style="max-width:100%;height:auto" alt="On log axes, all three series decrease by nearly a factor of two at each doubling of cell count.">
+        <figcaption>Figure C. Normalized maximum error versus cell count on logarithmic axes. Blue circles show the spherical shell, vermilion squares the full sphere, and green triangles the slab. Both gray dashed lines have slope −1.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="energy">
+      <h2 id="energy">Energy conservation</h2>
+      <p>The energy ledger compares the injected and previously stored energies with energy deposited, escaped, unresolved, and still in flight after each call.</p>
+      $$\epsilon_{\rm ledger} =
+        \frac{\left| E_{\rm inj}+U_{\rm before}
+        -(E_{\rm dep}+E_{\rm esc}+E_{\rm unres}+U_{\rm after})\right|}{E_*}.$$
+      <p>Here \(\epsilon_{\rm ledger}\) is the normalized ledger residual. The call injects \(E_{\rm inj}\), zero when emission is off. The energies in flight before and after the call are \(U_{\rm before}\) and \(U_{\rm after}\). The call records deposited, escaped, and unresolved energies \(E_{\rm dep}\), \(E_{\rm esc}\), and \(E_{\rm unres}\), respectively. The normalizer \(E_*\) is the energy injected in one emitting call.</p>
+      <table class="quick-facts">
+        <caption>Table 3. Largest ledger residual over meshes and calls, its upper bound, and quantities required to equal zero exactly.</caption>
+        <thead><tr><th>Problem</th><th>Largest residual</th><th>Upper bound</th><th>Exact zeros</th></tr></thead>
+        <tbody>
+          <tr><th>Spherical shell</th><td>4.13590 × 10<sup>−16</sup></td><td>4 × 10<sup>−7</sup></td><td>Unresolved energy and number of hits on the substep cap.</td></tr>
+          <tr><th>Full sphere</th><td>1.30143 × 10<sup>−15</sup></td><td>4 × 10<sup>−8</sup></td><td>Escaped and unresolved energy in every call. Number of live history records and energy in flight at the ends of calls 19 and 20.</td></tr>
+          <tr><th>Slab</th><td>6.50717 × 10<sup>−16</sup></td><td>7 × 10<sup>−8</sup></td><td>Unresolved energy in every call. Number of live history records and energy in flight at the ends of calls 19 and 20.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="limitations">
+      <h2 id="limitations">Limitations</h2>
+      <p>The comparison covers transport with prescribed mass stopping and scattering coefficients. Separate tests check the plasma formulas that supply those coefficients. All three problems use a single energy group and either one chord or six. The mesh displacement in the full sphere is prescribed, and the tests have no hydrodynamic coupling.</p>
+    </section>
+
+    <section aria-labelledby="run-tests">
+      <h2 id="run-tests">Running the tests</h2>
+      <p>The test source is <code>tests/laser/<wbr>test_hot_electron_1d_transport_problems.cu</code>. Run the following from the build directory with a CUDA device available.</p>
+      <pre><code>./test_hot_electron_1d_transport_problems "HTA16*"
+./test_hot_electron_1d_transport_problems "HTA26*"
+./test_hot_electron_1d_transport_problems "HTA27*"</code></pre>
+      <p>The filters select the spherical shell, full sphere, and slab, respectively. The run passed 11, 202, and 134 assertions, respectively. Before the full-sphere transport comparison, the test also checks eight default settings: 50 energy groups, range shortening enabled, time-dependent tracking, 2<sup>24</sup> history records, reuse of the oldest record, 5° sheath deviation, zero sheath escape fraction, and an unresolved-energy limit of 10<sup>−3</sup>.</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>S. Atzeni, A. Schiavi, and J. R. Davies, “Stopping and scattering of relativistic electron beams in dense plasmas and requirements for fast ignition,” <i>Plasma Phys. Control. Fusion</i> 51, 015016 (2009). <a href="https://doi.org/10.1088/0741-3335/51/1/015016">doi:10.1088/0741-3335/51/1/015016</a></li>
+        <li>A. A. Solodov and R. Betti, “Stopping power and range of energetic electrons in dense plasmas of fast-ignition fusion targets,” <i>Phys. Plasmas</i> 15, 042707 (2008). <a href="https://doi.org/10.1063/1.2903890">doi:10.1063/1.2903890</a></li>
+        <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="hot-electrons-standard-problems" data-root="../../"></script>
+</body>
+</html>

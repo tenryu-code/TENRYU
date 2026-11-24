@@ -72,6 +72,7 @@
           { id: "cbet", title: "Cross-beam energy transfer (CBET)", href: "physics/lpi/cbet.html", parent: "lpi" },
           { id: "cbet-closed-forms", title: "CBET verification against analytic solutions", href: "physics/lpi/cbet-closed-forms.html", parent: "lpi" },
           { id: "hot-electrons", title: "Hot electrons", href: "physics/lpi/hot-electrons.html", parent: "lpi" },
+          { id: "hot-electrons-standard-problems", title: "Hot-electron transport verification against analytic solutions", href: "physics/lpi/hot-electrons-standard-problems.html", parent: "lpi" },
           { id: "eos-opacity", title: "EOS, opacity & ionization", href: "physics/eos-opacity/index.html" },
           { id: "eos", title: "Equation of state", href: "physics/eos-opacity/eos.html", parent: "eos-opacity" },
           { id: "ionization", title: "Ionization & effective charge", href: "physics/eos-opacity/ionization.html", parent: "eos-opacity" },
@@ -171,6 +172,7 @@
           { id: "cbet", title: "CBET (交差ビームエネルギー転送)", href: "physics/lpi/cbet.html", parent: "lpi" },
           { id: "cbet-closed-forms", title: "CBET の解析解による検証", href: "physics/lpi/cbet-closed-forms.html", parent: "lpi" },
           { id: "hot-electrons", title: "ホット電子", href: "physics/lpi/hot-electrons.html", parent: "lpi" },
+          { id: "hot-electrons-standard-problems", title: "ホット電子の輸送の解析解による検証", href: "physics/lpi/hot-electrons-standard-problems.html", parent: "lpi" },
           { id: "eos-opacity", title: "EOS・不透明度・電離", href: "physics/eos-opacity/index.html" },
           { id: "eos", title: "状態方程式", href: "physics/eos-opacity/eos.html", parent: "eos-opacity" },
           { id: "ionization", title: "電離と有効電荷", href: "physics/eos-opacity/ionization.html", parent: "eos-opacity" },
@@ -222,7 +224,7 @@
         breadcrumb: "パンくずリスト",
         previous: "前へ",
         next: "次へ",
-        footer: "TENRYU ドキュメント — 2026-11-19。",
+        footer: "TENRYU ドキュメント — 2026-11-24。",
         subtitle: "輻射流体コード"
       }
     : {
@@ -234,7 +236,7 @@
         breadcrumb: "Breadcrumb",
         previous: "Previous",
         next: "Next",
-        footer: "TENRYU documentation — 2026-11-19.",
+        footer: "TENRYU documentation — 2026-11-24.",
         subtitle: "Radiation Hydrodynamics Code"
       };
 

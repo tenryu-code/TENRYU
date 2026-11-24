@@ -152,7 +152,7 @@
           <tr><th>添字 \(i\), \(j\)</th><td>\(T_i,e_i,P_i\) ではイオン種／1D の離散化ではセル添字 \(i\)（\(V_i,\Delta M_i\)）と節点添字 \(j\)（\(r_j,u_j\)）。種別か格子かは文脈が選ぶ。</td></tr>
           <tr><th>\(M\), \(M_c\), \(\Delta M_i\)</th><td>いずれもラグランジュセル質量（1D は \(\Delta M_i\)、2D は \(M_c\)）。燃焼の \(M_{req}/M_{max}\) は部分サイクル数（要求値と <code>subcycle_max</code>）。</td></tr>
           <tr><th>\(\Delta l_c\)</th><td>dt 制限が使うセル代表長：1D はセル幅、2D は \(\sqrt{A_c}\)（\(A_c\) は子午面セル面積）。</td></tr>
-          <tr><th>\(T_h\)（= \(T_{hot}\)）</th><td>ホット電子指数スペクトル温度（<code>T_hot_eV</code>、内部で erg に変換）。</td></tr>
+          <tr><th>\(T_h\)（= \(T_{hot}\)）</th><td>3 次元マクスウェル分布と指数分布で使うホット電子のスペクトル温度（<code>T_hot_eV</code>、内部で erg に変換）。</td></tr>
           <tr><th>\(n_c\), \(n_{\rm crit}\)</th><td>同一量 — レーザー臨界密度 \(m_e\omega_0^2/(4\pi e^2)\)。ホット電子ページは \(n_c\)、レーザーページは \(n_{\rm crit}\) と表記。</td></tr>
           <tr><th>\(Z_{\rm eff}\), \(\bar Z_{\rm eff}\)</th><td>\(Z_{\rm eff}=\bar Z r_2\) は電荷状態モーメントによる衝突実効電荷（\(r_2=\langle Z^2\rangle/\bar Z^2\)）；\(\bar Z_{\rm eff}\)（と \(A_{\rm eff}\)）は混合セルの組成平均。試験のタグ R2（<a href="../verification/index.html#tag-legend">2D RZ の S<sub>N</sub> 輻射の試験群</a>）は \(r_2\) と無関係。</td></tr>
           <tr><th>L1 / L2</th><td>レーザーの検査の 2 つの水準（<a href="../verification/index.html#tag-legend">タグ凡例</a>）；\(L_2\)/\(L_\infty\)（\(\varepsilon_{L2}\), \(\varepsilon_{L\infty}\)）は相対誤差ノルム（場全体の RMS / 最大値）。</td></tr>
