@@ -100,6 +100,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">Verification</h2>
       <ul>
+        <li><a href="standard-problems.html">Laser ray-trace verification against analytic solutions</a> compares beam absorption in three spherical problems and radial deposition in the corona with analytic solutions.</li>
         <li>Several impact parameters check the analytic Bouguer radii (the radii of the turning points) and bound the drift of the invariant.</li>
         <li><code>test_ray_trace_characteristic</code> compares characteristic integration with closed forms for chords in a uniform medium and for radial rays through piecewise-linear profiles, and with an independent reference (a host Dormand–Prince integration of the ray equations) for the optical depth, exit point, and per-cell deposition of turning rays. It also checks agreement with a converged fine marching run, the 16/15 law, the round-trip absorption of reflection at the critical radius, closed forms in the cylinder and the slab, agreement across 32 to 256 lanes, and bitwise-identical repeated runs.</li>
         <li>Interior \(\hat n\) and \(d\hat n/dr\) checks on a linear \(\hat n(r)\) profile independently verify the fidelity of the field and the force.</li>

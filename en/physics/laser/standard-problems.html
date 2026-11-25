@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Laser ray-trace verification against analytic solutions — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <link rel="icon" href="../../../favicon.ico" sizes="32x32">
+  <link rel="icon" href="../../../favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="../../../apple-touch-icon.png">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>Laser ray-trace verification against analytic solutions <span class="badge">reference</span></h1>
+
+    <section aria-labelledby="abstract">
+      <h2 id="abstract">Abstract</h2>
+      <p class="abstract">Three spherical problems verify one-dimensional laser ray tracing with inverse-bremsstrahlung absorption. The tests compare the fraction of beam energy absorbed with analytic solutions for an exponential density profile, an inverse-square corona, and a uniform sub-critical sphere. The corona test also compares the radial distribution of deposited energy. All four convergence comparisons pass. The observed orders are about 1.5 for the exponential profile, 2 for the corona, and 1 for the sphere.</p>
+    </section>
+
+    <section aria-labelledby="introduction">
+      <h2 id="introduction">Introduction</h2>
+      <p>The <a href='raytrace.html'>characteristic ray integrator</a> follows rays through a spherical plasma and accumulates <a href='absorption.html'>collisional absorption</a> along their paths. The exponential profile isolates absorption near a critical turning point. The corona samples turning points at different radii. In the sphere, refraction at a density step changes the length of the absorbing chord.</p>
+      <p>The analytic comparisons draw on the absorption integral for an exponential profile [2, p. 129, Eqs. (4.84)–(4.88)], rays in an inverse-square corona [3, p. 12, Eqs. (19)–(21)], and attenuation in a uniform sub-critical plasma [4, p. 4]. The profiles and the convergence criteria below define the TENRYU tests.</p>
+    </section>
+
+    <section aria-labelledby="setup">
+      <h2 id="setup">Setup</h2>
+      <p>The radial coordinate is \(r\). The density ratio \(\hat n\) is the electron density divided by the critical density at the laser frequency. The symbol \(T_e\) denotes electron temperature. The critical radius \(r_1\) is where the density ratio reaches one. The impact parameter \(b\) is the distance from the target center to the incident ray's straight line in vacuum. The turning radius is the smallest radius reached by a ray. The total optical depth \(\tau\) covers both passes through the plasma. The corresponding ray absorption \(A(b)\) is a fraction of incident ray energy.</p>
+      <table class="quick-facts">
+        <caption>Table 1. Common settings for the convergence tests.</caption>
+        <thead><tr><th scope="col">Setting</th><th scope="col">Value</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Geometry and mesh</th><td><code>1D_SPH</code>, uniform radial cells from the center to the outer face</td></tr>
+          <tr><th scope="row">Laser</th><td>One 351 nm beam directed along −z, at constant power 10<sup>7</sup> erg/s</td></tr>
+          <tr><th scope="row">Trace</th><td><code>raytrace_2d</code> mode with characteristic integration and critical-surface absorption termination disabled</td></tr>
+          <tr><th scope="row">Plasma and duration</th><td>Hydrogen with fixed charge one and equal electron and ion temperatures. One laser call spans 10<sup>−13</sup> s with hydrodynamics, conduction, and radiation disabled.</td></tr>
+          <tr><th scope="row">Absorption closure</th><td>Maxwellian absorption. The exponential profile and corona fix the Coulomb logarithm at 7. The sphere uses the default logarithm.</td></tr>
+        </tbody>
+      </table>
+      <table class="quick-facts">
+        <caption>Table 2. Profiles, beam geometry, and mesh sequence. \(f_{\rm ref}\) is the analytic beam absorption fraction. Values are given in order of increasing resolution.</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Density and domain</th><th scope="col">\(T_e\)</th><th scope="col">Beam</th><th scope="col">Center-ray \(\tau\) / absorption</th><th scope="col">Beam \(f_{\rm ref}\)</th><th scope="col">Cells / rays</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Exponential profile at normal incidence</th><td>Outer radius 0.10 cm. Exponential scale length 0.005 cm, critical radius 0.04 cm, and interior density capped at twice critical.</td><td>1 keV</td><td>Gaussian beam with a narrow cone, approximating normal incidence</td><td>2.589101 / 0.924912</td><td>0.92491245592</td><td>2,000 / 16<br>4,000 / 16<br>8,000 / 16</td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>Outer radius 0.15 cm and critical radius 0.05 cm. Offset inverse-square density, held constant inside 0.025 cm.</td><td>4 keV at the critical radius</td><td>Parallel beam with intensity decreasing linearly to zero at 0.12 cm</td><td>2.115665 / 0.879447</td><td>0.51240892085<br>0.51240892098<br>0.51240892101</td><td>768 / 12,288<br>1,536 / 24,576<br>3,072 / 49,152</td></tr>
+          <tr><th scope="row">Uniform sub-critical sphere with a density step</th><td>Outer radius 0.15 cm. Density is 0.15 times critical through 0.12 cm and 10<sup>−12</sup> times critical outside.</td><td>1 keV</td><td>Parallel beam with intensity decreasing linearly to zero at 0.08 cm</td><td>1.000929 / 0.632462</td><td>0.59915946355<br>0.59917164268<br>0.59917469630</td><td>160 / 32<br>320 / 64<br>640 / 128</td></tr>
+        </tbody>
+      </table>
+      <figure id="fig-profiles">
+        <img src="../../../assets/laser1d-standard-problems-profiles-en.png" width="880" height="445" style="max-width:100%;height:auto" alt="Density and temperature against radius for each problem, with critical, sphere, and turning radii marked.">
+        <figcaption>Figure A. Prescribed radial profiles. The blue curves show density relative to critical and the green curves show electron temperature. Orange dashes mark the critical radii. Gray dashes mark the sphere's density step. In the middle and right columns, the dark blue dash-dotted lines mark the smallest radii reached by the outermost rays on the coarsest mesh. The dark blue dotted line in the right column marks the corresponding radius for the innermost ray. In the middle column, that radius coincides with the orange line to plotting precision. In the left column, the orange line marks the turning radius of the normal-incidence reference ray.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="analytic">
+      <h2 id="analytic">Analytic solutions</h2>
+      <p>The inverse-bremsstrahlung coefficient follows Johnston and Dawson [1, p. 722, Eq. (1a)]. The convergence problems use hydrogen.</p>
+      $$ \begin{aligned}
+        n_c &= \frac{m_e\omega^2}{4\pi e^2},\qquad \omega=\frac{2\pi c}{\lambda},\\
+        K(T_e,\ell) &= \frac{4\sqrt{2\pi}}{3}\,
+          \frac{e^4 n_c\ell}{c\sqrt{m_e}\,\theta_e^{3/2}},\qquad
+        \kappa(r)=K(T_e(r),\ell)\frac{\hat n(r)^2}{\sqrt{1-\hat n(r)}} .
+      \end{aligned} $$
+      <p>Here \(n_c\) is the critical electron density, \(\omega\) the angular frequency, \(\lambda\) the vacuum wavelength, \(e\) the elementary charge in electrostatic units, \(m_e\) the electron mass, and \(c\) the speed of light. \(\ell\) is the Coulomb logarithm, \(\theta_e\) is the electron temperature converted from eV to erg, \(K\) is the temperature- and logarithm-dependent coefficient, and \(\kappa\) is the absorption coefficient in cm<sup>−1</sup> along the ray in the underdense region.</p>
+      $$ \begin{aligned}
+        b&=r\sqrt{1-\hat n(r)}\sin\psi,\qquad Q(r;b)=r^2[1-\hat n(r)]-b^2,\\
+        \tau(b)&=2\int_{r_t}^{R}\frac{K(T_e(r),\ell)\hat n(r)^2r}{\sqrt{Q(r;b)}}\,\mathrm dr,
+        \qquad A(b)=1-e^{-\tau(b)} .
+      \end{aligned} $$
+      <p>Bouguer's invariant is the first expression. \(\psi\) is the angle between the ray and the radial direction, and \(\sqrt{1-\hat n}\) is the refractive index. \(Q\) is the radial factor that vanishes at the turning radius \(r_t\) for a smooth profile. \(R\) is the outer radius. The radial form follows from \(\mathrm ds=r\sqrt{1-\hat n}\,\mathrm dr/\sqrt{Q}\) on the outward leg, where the path-length increment is measured along the ray. The two legs have equal depth. The exponential in the attenuation law gives the fraction of energy transmitted on the full path.</p>
+      <h3 id="exponential">Exponential profile at normal incidence</h3>
+      $$ \begin{aligned}
+        E(r)&=e^{-(r-r_1)/L},\qquad x=(R-r_1)/L,\qquad \epsilon=e^{-x},\\
+        \hat n(r)&=\min\!\left(2,\frac{E(r)-\epsilon}{1-\epsilon}\right),
+        \qquad u=\sqrt{1-\epsilon},\\
+        \Phi&=-\tfrac23u(2+\epsilon)+4\epsilon u+
+          \epsilon^2[-x-2\ln(1+u)],\\
+        \tau(0)&=-\frac{2K(1000\,\mathrm{eV},7)L\Phi}{(1-\epsilon)^{3/2}} .
+      \end{aligned} $$
+      <p>The exponential \(E(r)\) has scale length \(L\). The offset \(\epsilon\) makes the density vanish at the outer radius. \(x\) is the distance from the critical radius to the outer radius in units of \(L\), and \(u\) is \(\sqrt{1-E(r)}\) evaluated at the outer face. \(\Phi\) is the outer-face value of the primitive, which vanishes at the critical radius. At normal incidence the path runs radially to the critical radius and back. The expression tends to Michel's unshifted exponential law as \(\epsilon\) tends to zero [2, Eq. (4.88)].</p>
+      <h3 id="corona">Inverse-square corona under a parallel beam</h3>
+      $$ \begin{aligned}
+        \hat n(r)&=s[(R/r)^2-1],\qquad T_e(r)=T_c(r_1/r)^{4/3},\\
+        r_t^2&=\frac{sR^2+b^2}{1+s},\qquad
+        C_0=\frac{K(T_c,7)s^2}{\sqrt{1+s}\,r_1^2},\qquad
+        w=\frac{\sqrt{(R-r_t)(R+r_t)}}{R},\\
+        \tau(b)&=2C_0 R^3\!\left[\frac{\arcsin w}{\sqrt{(1-w)(1+w)}}-w-\tfrac23w^3\right].
+      \end{aligned} $$
+      <p>The shape parameter \(s\) is 1/8 and the critical temperature \(T_c\) is 4 keV. At radii below 0.025 cm, both profiles are held at their values at 0.025 cm. All turning radii lie outside it. The factor \(C_0\) is constant along a ray, and \(w\) is the outer-face radial root divided by \(R\). The offset density and temperature law give the closed form above for these tests.</p>
+      <h3 id="sphere">Uniform sub-critical sphere with a density step</h3>
+      $$  a=\frac b{\sqrt{1-n_0}},\qquad
+        \kappa_0=K(1000\,\mathrm{eV},\ell)\frac{n_0^2}{\sqrt{1-n_0}},\qquad
+        \tau(b)=2\kappa_0\sqrt{(R_u-a)(R_u+a)} . $$
+      <p>The outer layer's absorption is neglected in the reference. Refraction according to Snell's law at sphere radius \(R_u\) preserves Bouguer's invariant, so the ray follows a straight chord with closest approach \(a\) inside the sphere. The density ratio \(n_0\) is 0.15, and \(\kappa_0\) is the constant interior absorption coefficient. All rays intersect the sphere.</p>
+      $$ \begin{aligned}
+        x_s&=(2n_0)^{-1},\qquad
+        g(y)=e^y\left[-\gamma-\ln y-\sum_{m=1}^{60}\frac{(-y)^m}{m\,m!}\right],\\
+        B&=\ln\frac{4\theta_e}{\hbar\omega}-\gamma+\tfrac12 g(x_s)-g(x_s/2),
+        \qquad \ell=B+\tfrac12\ln(1+e^{-2B}) .
+      \end{aligned} $$
+      <p>The test computes the sphere's Coulomb logarithm from the Born term \(B\) at the sphere temperature, where the classical correction vanishes. \(\hbar\) is the reduced Planck constant and \(\gamma\) is Euler's constant. The variable \(x_s\) depends on the interior density. The test evaluates the exponential integral multiplied by \(e^y\) as \(g\), with argument \(y\) and summation index \(m\). The recorded logarithm is 6.160313448090.</p>
+      <figure id="fig-paths">
+        <img src="../../../assets/laser1d-standard-problems-paths-en.png" width="880" height="345" style="max-width:100%;height:auto" alt="A radial ray reflecting at the critical radius, three curved corona rays, and three refracted chords through the sphere.">
+        <figcaption>Figure B. Analytic paths in a plane through the target center, with incidence from above. The outer gray circles mark the domain boundary. Orange dashes mark the critical surfaces and gray dashes mark the sphere surface. The two radial legs on the left overlap. In the corona and sphere panels, blue solid, vermilion dashed, and green dash-dotted paths show an inner, a middle, and the outermost ray of the coarse beam. Dots mark the turning point or the closest point to the center on a chord.</figcaption>
+      </figure>
+      <h3 id="beam-reference">Beam absorption and deposition</h3>
+      $$  b_k=(k+\tfrac12)\frac{b_{\max}}{N},\quad
+        p_k=\frac{(1-b_k/b_{\max})b_k}{\sum_j(1-b_j/b_{\max})b_j},\quad
+        f_{\rm ref}=\sum_{k=0}^{N-1}p_k A(b_k) . $$
+      <p>For a parallel beam, \(N\) is the ray count, \(k\) and \(j\) index the launch annuli from 0 to \(N-1\), and \(b_k\) and \(b_j\) are their midpoint impact parameters. The radial intensity vanishes at beam radius \(b_{\max}\). The weight \(p_k\) is the ray's fraction of incident energy and includes the annular area factor. Examples of weighted ray sums appear in [5, p. 231, Eqs. (51)–(52)] and [6, p. 10, Eqs. (A1)–(A2)]. Using the same rays in the reference \(f_{\rm ref}\) removes the error of representing a continuous beam by finitely many rays in the corona and sphere comparisons. For the exponential profile, the reference is the normal-incidence result \(1-e^{-2T(r_1)}\), with \(T(r_1)\) the one-way depth to the critical radius. The tested beam's departure from that result, including its cone and tenuous exterior, has a model-error allowance of 9.7 × 10<sup>−12</sup>.</p>
+      $$ \begin{aligned}
+        u_r&=\sqrt{(r-r_t)(r+r_t)},\\
+        D(r)&=C_0\left[\frac{R^4}{r_t}\arcsin\frac{u_r}{r}
+               -2R^2u_r+\frac{(r^2+2r_t^2)u_r}{3}\right] && (r>r_t),\\
+        T_t&=\tau(b)/2,\qquad
+        W_k(r)=A(b_k)-2e^{-T_t}\sinh D(r),\qquad
+        W_{\rm ref}(r)=\sum_k p_k W_k(r) .
+      \end{aligned} $$
+      <p>In the corona, \(u_r\) is the square root defined above for the ray under consideration and \(D(r)\) is the one-way optical depth from the turning point to a face at radius \(r\). \(D(r)\) is zero at and below the turning point. \(T_t\) is the one-way depth from the outer boundary to the turning point for the same ray. In the expression for the deposited fraction of ray k, all depths are evaluated for that ray. \(W_k(r)\) is the fraction of ray \(k\)'s incident energy deposited outside the face during both passes. The weighted sum \(W_{\rm ref}(r)\) is the corresponding beam fraction.</p>
+      <figure id="fig-absorption">
+        <img src="../../../assets/laser1d-standard-problems-absorption-en.png" width="880" height="355" style="max-width:100%;height:auto" alt="Ray absorption and ray weights versus impact parameter in the corona and sphere, and cumulative corona deposition versus radius.">
+        <figcaption>Figure C. Coarsest-mesh references. In the left and middle panels, solid blue curves show the absorbed fraction of each ray and dashed vermilion curves show ray weights on the right-hand axes. The green curve at right gives the reference fraction of incident energy deposited outside each interior face of the corona mesh.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="comparison">
+      <h2 id="comparison">Quantities compared and acceptance criteria</h2>
+      $$  \begin{aligned}
+        E_A&=\left|\frac{\sum_i D_i}{E_{\rm in}}-f_{\rm ref}\right|,\\
+        E_W&=\frac{1}{768}\sum_{J=1}^{767}
+          \left|\frac{\sum_{i\ \mathrm{outside}\ r_J} D_i}{E_{\rm in}}-W_{\rm ref}(r_J)\right|,
+          \qquad r_J=\frac{JR}{768}.
+      \end{aligned} $$
+      <p>The deposited energy in cell \(i\) is \(D_i\) and the commanded incident energy is \(E_{\rm in}\). The test uses \(E_A\) for all three problems. For the corona, \(E_W\) compares cumulative deposition outside the 767 interior faces of the coarsest mesh. The face index \(J\) identifies the same radius \(r_J\) on every mesh.</p>
+      $$  p_1=\log_2(E_1/E_2),\qquad p_2=\log_2(E_2/E_3),
+        \qquad p_{\min}=0.9\,p_{\rm claim} . $$
+      <p>The errors in order of mesh refinement are \(E_1\), \(E_2\), and \(E_3\). The observed orders \(p_1,p_2\) use adjacent meshes with cell widths differing by a factor of two. The claimed order \(p_{\rm claim}\) is 3/2 for the exponential profile and both corona measures. The optical depth has a square-root branch at the turning point, so errors in the reconstructed slope and turning radius contribute at order 3/2. The expected order for the sphere is 1. The density reconstruction is linear in radius between adjacent cell centers and uses their average at the shared face on a uniform grid. The reconstruction spreads the sphere's density step over one cell width. The minimum accepted order \(p_{\min}\) is 1.35 or 0.9, respectively.</p>
+      <p>The rounding floor \(F\) is 10<sup>−10</sup>. The quadrature estimate \(\sigma\) is the maximum over rays of their accumulated optical-depth error estimates. The verdict applies the model-error allowance of the exponential profile on each mesh and uses zero for the other two problems. The checks proceed in the order shown below. The two adjacent-mesh orders face a one-sided lower bound [7, PDF pp. 34–35]. Reduced order at singularities and a 10% band in grid-convergence analysis are discussed in [8, p. 182 and p. 326, Table 8.1].</p>
+      <table class="quick-facts">
+        <caption>Table 3. Verdict in evaluation order. The first applicable condition determines the verdict.</caption>
+        <thead><tr><th scope="col">Step</th><th scope="col">Condition</th><th scope="col">Verdict</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">1</th><td>All three errors are at or below the rounding floor.</td><td><code>PASS floor</code></td></tr>
+          <tr><th scope="row">2</th><td>Any error is below 100 times the rounding floor.</td><td><code>BLOCKED rounding_<wbr>error_<wbr>above_<wbr>level</code></td></tr>
+          <tr><th scope="row">3</th><td>Visit the meshes from coarsest to finest. On each mesh, check the quadrature estimate first and then the model error. Use the corresponding verdict when the first of these quantities exceeds 1% of the measured error or when the quadrature estimate is NaN.</td><td><code>BLOCKED iterative_<wbr>error_<wbr>above_<wbr>level</code><br><code>BLOCKED model_<wbr>error_<wbr>above_<wbr>level</code></td></tr>
+          <tr><th scope="row">4</th><td>Either order is zero or negative.</td><td><code>FAIL order_<wbr>not_<wbr>convergent</code></td></tr>
+          <tr><th scope="row">5</th><td>Both orders reach or exceed the acceptance threshold.</td><td><code>PASS</code></td></tr>
+          <tr><th scope="row">6</th><td>Both orders fall below the acceptance threshold.</td><td><code>FAIL order_<wbr>below_<wbr>claim</code></td></tr>
+          <tr><th scope="row">7</th><td>One order meets the threshold and one falls below it.</td><td><code>BLOCKED order_<wbr>not_<wbr>asymptotic</code></td></tr>
+        </tbody>
+      </table>
+      <p>Both <code>FAIL</code> and <code>BLOCKED</code> cause an assertion failure. Each run also checks the ledger and the three error flags described under <a href='#energy'>energy conservation</a>.</p>
+    </section>
+
+    <section aria-labelledby="results">
+      <h2 id="results">Results</h2>
+      <p>The recorded run used one NVIDIA RTX PRO 6000 Blackwell Max-Q GPU on November 25, 2026 at 10:50 JST. The run conditions and printed output are stored in the repository under <code>tools/site_figures/<wbr>data/<wbr>laser1d_standard_problems/</code>.</p>
+      <p>The <code>unresolved_quadrature</code> count records ray pieces whose quadrature was accepted at the panel depth or count cap. Their estimated errors enter \(\sigma\). The count itself has no zero requirement.</p>
+      <table class="quick-facts">
+        <caption>Table 4. Measured errors, ledger residual, and capped quadrature pieces on each mesh. A dash marks an unmeasured quantity.</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Cells</th><th scope="col">\(E_A\)</th><th scope="col">\(E_W\)</th><th scope="col">\(\sigma\)</th><th scope="col">Ledger</th><th scope="col">Capped pieces</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Exponential profile at normal incidence</th><td>2,000</td><td>1.77621 × 10<sup>−5</sup></td><td>—</td><td>1.66850 × 10<sup>−13</sup></td><td>2.06734 × 10<sup>−15</sup></td><td>0</td></tr>
+          <tr><th scope="row">Exponential profile at normal incidence</th><td>4,000</td><td>6.27867 × 10<sup>−6</sup></td><td>—</td><td>1.31722 × 10<sup>−13</sup></td><td>5.13199 × 10<sup>−15</sup></td><td>0</td></tr>
+          <tr><th scope="row">Exponential profile at normal incidence</th><td>8,000</td><td>2.21966 × 10<sup>−6</sup></td><td>—</td><td>9.77181 × 10<sup>−14</sup></td><td>7.24630 × 10<sup>−15</sup></td><td>0</td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>768</td><td>1.56782 × 10<sup>−6</sup></td><td>1.42371 × 10<sup>−6</sup></td><td>5.46515 × 10<sup>−9</sup></td><td>9.81186 × 10<sup>−15</sup></td><td>52</td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>1,536</td><td>3.88042 × 10<sup>−7</sup></td><td>3.53648 × 10<sup>−7</sup></td><td>7.38890 × 10<sup>−10</sup></td><td>1.00621 × 10<sup>−13</sup></td><td>42</td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>3,072</td><td>9.77084 × 10<sup>−8</sup></td><td>8.87076 × 10<sup>−8</sup></td><td>9.45680 × 10<sup>−11</sup></td><td>8.93012 × 10<sup>−14</sup></td><td>42</td></tr>
+          <tr><th scope="row">Uniform sub-critical sphere with a density step</th><td>160</td><td>6.01148 × 10<sup>−4</sup></td><td>—</td><td>9.53623 × 10<sup>−14</sup></td><td>8.45017 × 10<sup>−17</sup></td><td>0</td></tr>
+          <tr><th scope="row">Uniform sub-critical sphere with a density step</th><td>320</td><td>3.00357 × 10<sup>−4</sup></td><td>—</td><td>4.76115 × 10<sup>−14</sup></td><td>9.84603 × 10<sup>−17</sup></td><td>0</td></tr>
+          <tr><th scope="row">Uniform sub-critical sphere with a density step</th><td>640</td><td>1.50128 × 10<sup>−4</sup></td><td>—</td><td>3.01618 × 10<sup>−14</sup></td><td>1.11928 × 10<sup>−17</sup></td><td>0</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="convergence">
+      <h2 id="convergence">Convergence</h2>
+      <table class="quick-facts">
+        <caption>Table 5. Observed orders and verdicts.</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Measure</th><th scope="col">Coarse to middle</th><th scope="col">Middle to fine</th><th scope="col">Lower bound</th><th scope="col">Verdict</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Exponential profile at normal incidence</th><td>\(E_A\)</td><td>1.500269</td><td>1.500119</td><td>1.35</td><td><code>PASS</code></td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>\(E_A\)</td><td>2.014475</td><td>1.989656</td><td>1.35</td><td><code>PASS</code></td></tr>
+          <tr><th scope="row">Inverse-square corona under a parallel beam</th><td>\(E_W\)</td><td>2.009271</td><td>1.995185</td><td>1.35</td><td><code>PASS</code></td></tr>
+          <tr><th scope="row">Uniform sub-critical sphere with a density step</th><td>\(E_A\)</td><td>1.001042</td><td>1.000486</td><td>0.90</td><td><code>PASS</code></td></tr>
+        </tbody>
+      </table>
+      <p>The two corona measures converge at about order 2 and exceed the one-sided lower bound of 1.35. Every cell lying wholly between the critical radius and the outermost ray's turning radius has at least 16 turning rays. Neighboring turning radii differ by at most \(\Delta b/\sqrt{1+s}\), with \(\Delta b=0.8h/16\), where \(h\) is the radial cell width. The tests did not investigate the cause of the higher order.</p>
+      <figure id="fig-convergence">
+        <img src="../../../assets/laser1d-standard-problems-convergence-en.png" width="880" height="365" style="max-width:100%;height:auto" alt="Log–log plot of absorption errors for all problems and face deposition error for the corona, with slope guides.">
+        <figcaption>Figure D. Errors versus cell count on logarithmic axes. Blue circles and green triangles show the absorption errors in the exponential profile and sphere, respectively. Vermilion squares show the corona absorption error. Vermilion diamonds and the dashed line show its deposition error. Gray dotted lines have slopes −3/2 and −1.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="energy">
+      <h2 id="energy">Energy conservation and repeatability</h2>
+      $$  \epsilon_{\rm ledger}=\frac{|E_{\rm in}-\sum_i D_i-\Delta t P_{\rm unabs}|}{E_{\rm in}} . $$
+      <p>The normalized energy ledger residual \(\epsilon_{\rm ledger}\) compares the commanded incident energy with the deposited energy and the energy that leaves unabsorbed. \(\Delta t\) is the duration of the laser call and \(P_{\rm unabs}\) is its unabsorbed power. The residual must be at most 10<sup>−10</sup>. The counts of rays that hit the step cap, produced a NaN (not-a-number), or encountered an invalid cell must be zero. The recorded runs met all four conditions.</p>
+      <p>The test repeats the coarsest mesh of each convergence problem in the same process and compares the byte representation of the cell deposition array. All three repeated arrays matched their first runs bit for bit.</p>
+    </section>
+
+    <section aria-labelledby="closures">
+      <h2 id="closures">Absorption closure checks</h2>
+      <p>The Langdon check uses the coarsest corona mesh and a temperature profile scaled by 36. The reference sums the two-way residence times of the analytic rays in each shell, weighted by each ray's incident power. Dividing that sum by the shell volume gives the reference laser energy density. The reference divides it by the electron temperature at the shell midpoint and applies a conversion factor to obtain the Langdon parameter. The chosen beam power sets the peak parameter to 0.5. The reference applies the resulting Langdon factors to the analytic optical-depth increments in each shell. The numerical laser call uses <code>cell_energy_density</code> and is compared with the reference for total absorption and cumulative deposition.</p>
+      $$  L(\alpha)=1-\frac{0.553}{1+(0.27/\alpha)^{0.75}},
+        \qquad L(0)=1 . $$
+      <p>\(\alpha\) is the shell's Langdon parameter and \(L(\alpha)\) is its absorption multiplier. The measured absorption and deposition errors, each divided by the Langdon reference beam absorption fraction \(f_{\rm ref}\), must be at most 0.01. They are 2.97804 × 10<sup>−4</sup> and 1.42876 × 10<sup>−4</sup>, respectively.</p>
+      <p>The carbon–hydrogen check uses the finest exponential mesh, equal number fractions, and fixed charges of 6 and 1. The effective charge \(Z_{\rm eff}\) is the ratio of the number-fraction-weighted second and first charge moments, giving 37/7. The test enables the species-dependent calculation and raises the temperature by (37/7)<sup>2/3</sup>, which leaves the factor proportional to \(Z_{\rm eff}\) divided by temperature to the power 3/2 equal to its value in the hydrogen reference. It compares the absorbed fraction with the original exponential reference. The absolute error is 2.21966 × 10<sup>−6</sup> against a tolerance of 0.01. Both closure checks pass.</p>
+    </section>
+
+    <section aria-labelledby="limitations">
+      <h2 id="limitations">Limitations</h2>
+      <p>The convergence tests cover characteristic tracing in <code>1D_SPH</code> with a prescribed plasma and Maxwellian absorption. The separate Langdon and \(Z_{\rm eff}\) checks each cover one mesh. The tests omit cross-beam energy transfer (CBET), opt-in fast tracing, hydrodynamic coupling, and time dependence.</p>
+    </section>
+
+    <section aria-labelledby="run-tests">
+      <h2 id="run-tests">Running the tests</h2>
+      <p>Run the CUDA test executable from the build directory with a CUDA device available. The source is <code>tests/laser/<wbr>test_laser1d_standard_problems.cu</code>.</p>
+      <pre><code>./test_laser1d_standard_problems "laser1d*"</code></pre>
+      <p>The filter selects the five test cases below. The recorded run passed 206 assertions across those cases.</p>
+      <table class="quick-facts">
+        <caption>Table 6. Test names and their scope.</caption>
+        <thead><tr><th scope="col">Test name</th><th scope="col">Comparison</th></tr></thead>
+        <tbody>
+          <tr><th scope="row"><code>laser1d PA exponential profile</code></th><td>Exponential profile at normal incidence</td></tr>
+          <tr><th scope="row"><code>laser1d PB inverse-square corona</code></th><td>Inverse-square corona under a parallel beam</td></tr>
+          <tr><th scope="row"><code>laser1d PC uniform sub-critical sphere</code></th><td>Uniform sub-critical sphere with a density step</td></tr>
+          <tr><th scope="row"><code>laser1d T1 Langdon cell energy density and fixed point</code></th><td>Langdon absorption and deposition</td></tr>
+          <tr><th scope="row"><code>laser1d T2 carbon-hydrogen species view</code></th><td>Carbon–hydrogen absorbed fraction</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>T. W. Johnston and J. M. Dawson, “Correct values for high-frequency power absorption by inverse bremsstrahlung in plasmas,” <i>Phys. Fluids</i> 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
+        <li>P. Michel, <i>Introduction to Laser-Plasma Interactions</i> (Springer, 2023). <a href="https://doi.org/10.1007/978-3-031-23424-8">doi:10.1007/978-3-031-23424-8</a></li>
+        <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, “Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion,” <i>J. Comput. Phys.</i> 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
+        <li>A. Hyder, W. Fox, K. V. Lezhnin, and S. R. Totorica, “Ray-tracing laser-deposition model for plasma particle-in-cell simulation,” <i>Comput. Phys. Commun.</i> 318, 109847 (2026). <a href="https://doi.org/10.1016/j.cpc.2025.109847">doi:10.1016/j.cpc.2025.109847</a></li>
+        <li>R. Ramis and J. Meyer-ter-Vehn, “MULTI-IFE—A one-dimensional computer code for Inertial Fusion Energy (IFE) target simulations,” <i>Comput. Phys. Commun.</i> 203, 226 (2016). <a href="https://doi.org/10.1016/j.cpc.2016.02.014">doi:10.1016/j.cpc.2016.02.014</a></li>
+        <li>R. K. Follett, I. V. Igumenshchev, A. Colaïtis, J. P. Palastro, D. H. Froula, and D. Turnbull, “Modeling cross-beam energy transfer with sector ray tracing,” <i>Phys. Plasmas</i> 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
+        <li>K. Salari and P. Knupp, <i>Code Verification by the Method of Manufactured Solutions</i>, SAND2000-1444 (2000). <a href="https://doi.org/10.2172/759450">doi:10.2172/759450</a></li>
+        <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="laser-standard-problems" data-root="../../"></script>
+</body>
+</html>
