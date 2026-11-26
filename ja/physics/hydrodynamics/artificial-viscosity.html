@@ -30,7 +30,7 @@
       &-(\delta p_{c,k}+\delta p_{c,k-1})\,\mathbf S^{med}_{k-1}\Bigr].
       \end{aligned}
       $$
-      <p>丸め誤差で残るセル平均の力を引いて、\(\sum_k\delta\mathbf f^{sub}_{c,k}=0\) にする。\(M_f\) は、サブゾーンの密度のずれ \(x_c=(\max_k\rho^{sub}_{c,k}-\rho_c)/\rho_c\) が 0 のとき 0 で、\(x_c\) とともに増える重み（merit factor）である。既定（<code>subzonal_merit_mode="caramana_auto"</code>）では、\(x_c\le2\alpha_2\) で \(M_f=\bigl[\tfrac{\alpha_1}{2}\bigl(1-\cos\tfrac{\pi x_c}{2\alpha_2}\bigr)\bigr]^n\)、\(x_c>2\alpha_2\) で \(M_f=\alpha_1^n\) とする。\(\alpha_1=\sqrt2\)、\(\alpha_2=0.1\)、\(n=2\) が既定で、キーは <code>subzonal_alpha1</code>、<code>subzonal_alpha2</code>、<code>subzonal_merit_power</code> である。この力は、セルの形が歪んでサブゾーンの体積の比が変わるときにだけ働き、一様な膨張・収縮では 0 である。</p>
+      <p>丸め誤差で残るセル平均の力を引いて、\(\sum_k\delta\mathbf f^{sub}_{c,k}=0\) にする。\(M_f\) は、歪みが小さいあいだは力を抑えて滑らかな流れへの影響を避け、歪みが大きくなると復元力を強く働かせるための重み（merit factor）であり、サブゾーンの密度のずれ \(x_c=(\max_k\rho^{sub}_{c,k}-\rho_c)/\rho_c\) が 0 のとき 0 で、\(x_c\) とともに増える。既定（<code>subzonal_merit_mode="caramana_auto"</code>）では、\(x_c\le2\alpha_2\) で \(M_f=\bigl[\tfrac{\alpha_1}{2}\bigl(1-\cos\tfrac{\pi x_c}{2\alpha_2}\bigr)\bigr]^n\)、\(x_c>2\alpha_2\) で \(M_f=\alpha_1^n\) とする。\(\alpha_1=\sqrt2\)、\(\alpha_2=0.1\)、\(n=2\) が既定で、キーは <code>subzonal_alpha1</code>、<code>subzonal_alpha2</code>、<code>subzonal_merit_power</code> である。この力は、セルの形が歪んでサブゾーンの体積の比が変わるときにだけ働き、一様な膨張・収縮では 0 である。</p>
       <p>サブゾーン圧力の力の剛性（stiffness）は、時間刻みの上限 \(\Delta t_c\le s\,\theta_*/\omega_c\) を与える。\(\omega_c\) は、サブゾーン圧力の力が作る振動の振動数の上界（<code>subzonal_dt_length_mode="corner_bound"</code>、既定）、\(s\) は <code>subzonal_dt_spectral_safety</code>（既定 0.5）、\(\theta_*\) は <code>subzonal_dt_omega_dt_limit</code>（既定 2）である。この上限は <code>subzonal_dt_limiter_enabled=False</code> で外せる。サブゾーン圧力を有効にすると、この上限が計算の時間刻みにも効く。</p>
       <p>ここに書いたサブゾーン圧力の力は、省略したときの既定のモデル（<code>subzonal_force_model="legacy_median"</code>）のものである。このキーは、ほかに <code>hourglass_potential</code> と <code>merit_potential_v1</code> を受け付ける。<code>hourglass_potential</code> は、サブゾーンの密度のずれではなく、四辺形の砂時計モードの大きさに対する剛性ポテンシャル（stiffness potential）から力を作るモデルで、<code>aw_compatible_force_work=True</code> を要する（剛性の係数は <code>hourglass_potential_kappa</code>、既定 0.1）。<code>merit_potential_v1</code> は、サブゾーンのエネルギーの厳密な勾配を力とするモデルで、面積重み付きの運動量式とは組めず、入力検証が拒否する。<code>work_conjugate_v1</code> は名前だけが認識され、実装されておらず、入力検証が拒否する。</p>
 
@@ -70,7 +70,7 @@
       $$
       <p>比 \(r_l\)・\(r_r\) は、内側・外側の隣接セルの速度勾配を、セル \(i\) の速度勾配 \(g_i\) で割った値である。セル幅 \(\Delta r_i\) は外側の節点の位置から内側の節点の位置を引いた差である。隣接セルがない場合、非活性の場合、または幅が正でない場合、対応する比には 1 を使う。制限関数による減衰係数 \(1-\psi_i\) に下限はない。圧縮中のセルでは、制限後の圧縮速度 \(\chi_i\Delta r_i\) は \((1-\psi_i)|\Delta u_i|\) に等しい。</p>
       <p>1D の人工粘性は CSW98 形式のみである。従来のスカラー形式 <code>vnr</code>、リーマン（Riemann）形式 <code>riemann</code>・<code>riemann_compatible</code>、旧形式 <code>csw</code> を含め、<code>av_type</code> は値にかかわらず入力検証で拒否される。<code>ConfigError</code> はキーの削除を指示する。廃止された <code>csw_C1</code>・<code>csw_C2</code> を指定すると、エラーはそれぞれ <code>csw98_C1</code>・<code>csw98_C2</code> への変更を指示する。1D では <code>av_C1</code>（別名 <code>av_linear</code>）と <code>av_C2</code>（別名 <code>av_quadratic</code>）にも同じ変更先を使う。</p>
-      <p><code>csw_edge_csw98</code> は、旧実装 <code>csw_edge</code> の欠陥 — 辺ベクトルに、原典のメディアンメッシュのベクトルではなく辺自身の面積ベクトルを使っていたため、格子に整列した圧縮では力が構造的にゼロになる — を正した、2D RZ の既定のエネルギー整合な辺人工粘性である。<a href="#terms-edge-av">メディアンメッシュ上の辺ベクトル</a>に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせて、辺の力を作る。連続辺（同じ論理線上で隣り合う辺）の制限関数は速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸（artificial dissipation）を抑える。2D の CSW 辺モデル（<code>csw_edge</code>、<code>csw_edge_csw98</code>）で <code>av_C1</code>・<code>av_C2</code> を省略した場合は、原論文と同じ \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、過去の検証結果を引き継げるように、ビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
+      <p>2D RZ の既定である <code>csw_edge_csw98</code> は、旧実装 <code>csw_edge</code> の欠陥 — 辺ベクトルに、原典のメディアンメッシュのベクトルではなく辺自身の面積ベクトルを使っていたため、格子に整列した圧縮では力が構造的にゼロになる — を正したエネルギー整合な辺人工粘性である。<a href="#terms-edge-av">メディアンメッシュ上の辺ベクトル</a>に、厳密な圧縮側スイッチ、Kuropatenko の波速、符号付きのエネルギー整合な仕事を組み合わせて、辺の力を作る。連続辺（同じ論理線上で隣り合う辺）の制限関数は速度勾配を比較し、自己相似圧縮・剛体回転・線形な格子ずりでは制限比が 1 となって人工散逸（artificial dissipation）を抑える。2D の CSW 辺モデル（<code>csw_edge</code>、<code>csw_edge_csw98</code>）で <code>av_C1</code>・<code>av_C2</code> を省略した場合は、原論文と同じ \(C_1=C_2=1\) を使う。旧来の <code>csw_edge</code> は、過去の検証結果を引き継げるように、ビット単位で同一のまま保持している。名前だけ用意されている namelist 値 <code>csw_edge_plus_tensor_limited</code> は未実装で、入力検証が拒否する。</p>
     </section>
 
     <section aria-labelledby="subzonal-hourglass">
@@ -98,7 +98,7 @@
       <h2 id="verification">検証</h2>
       <ul>
         <li>Noh・Sod 系の解析解による検査は、強衝撃波の位置と密度のプラトー、平面の厳密リーマン解における三波構造、質量と力積の収支、1D のエネルギー保存を確認する。2D RZ の検証デッキ <code>2d_rz_h1_sod_planar</code> と <code>2d_rz_h2_noh_cyl</code> は、平面 Sod と円筒 Noh の配置を実行する。</li>
-        <li><a href="standard-problems.html">標準問題による検証</a> 平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存。</li>
+        <li><a href="standard-problems.html">標準問題による検証</a>では、平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存を検査する。</li>
       </ul>
     </section>
 

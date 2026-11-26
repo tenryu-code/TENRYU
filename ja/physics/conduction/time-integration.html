@@ -32,17 +32,17 @@
 
     <section aria-labelledby="sts">
       <h2 id="sts">スーパータイムステッピング</h2>
-      <p>Spitzer 伝導率は \(T_e^{5/2}\) に比例するため、大域ステップ \(\Delta t\) を陽的な安定限界 \(\Delta t_{exp}\) ごとの部分ステップで進めると、\(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) 回の CUDA カーネルの起動が必要になる。典型的な GXII のコロナ — 機構節と同じ \(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m の条件 — では \(N_{sub}\) は 130–340 に達する。STS は、長さの異なる段を組み合わせて安定区間を広げ、同じ区間を 17–27 段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で進める。これらの語は<a href="#terms-sts">用語の節</a>で定義する。手順は次のとおりである。</p>
+      <p>Spitzer 伝導率は \(T_e^{5/2}\) に比例するため、大域ステップ \(\Delta t\) を陽的な安定限界 \(\Delta t_{exp}\) ごとの部分ステップで進めると、\(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) 回の CUDA カーネルの起動が必要になる。典型的な GXII のコロナ — <a href="index.html#mechanism">概要の頁の物理機構</a>と同じ \(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m の条件 — では \(N_{sub}\) は 130–340 に達する。STS は、長さの異なる段を組み合わせて安定区間を広げ、同じ区間を 17–27 段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で進める。これらの語は<a href="#terms-sts">用語の節</a>で定義する。手順は次のとおりである。</p>
       <h3>1 回の熱伝導ステップの手順</h3>
       <ol>
         <li><p><strong>すべての面の κ を作る。</strong>1D では、適用できる範囲で、同一材料の滑らかな Spitzer 面に <code>kirchhoff_same_material</code> を、物質界面・ボイド・テーブル値の大きな跳びには調和平均を使って、面の κ を評価する。2D RZ には面の κ がなく、セルの κ<sub>eff</sub> から節点局所の演算子を組む。演算子に入れる各セルの伝導率は、割線を使うときは入口の温度による κ<sub>eff</sub>/T<sub>e</sub><sup>5/2</sup>、使わないときは κ<sub>eff</sub> である。</p></li>
-        <li><p><strong>すべての面に流束制限を掛ける。</strong>1D では、同じ作り方の面の κ で面の SH 推定値を作り、\(q_{max}\) を評価して \(\theta=1/(1+|q_{raw}|/q_{max})\) を固定する。θ と面の κ の積が、そのステップで用いる制限済みの κ<sub>eff</sub> になる。2D RZ では、セルごとに \(\kappa_{eff}=\theta\kappa_{SH}\)（前節）とし、これが制限済みの伝導率である。</p></li>
+        <li><p><strong>すべての面に流束制限を掛ける。</strong>1D では、同じ作り方の面の κ で面の SH 推定値を作り、\(q_{max}\) を評価して \(\theta=1/(1+|q_{raw}|/q_{max})\) を固定する。θ と面の κ の積が、そのステップで用いる制限済みの κ<sub>eff</sub> になる。2D RZ では、セルごとに \(\kappa_{eff}=\theta\kappa_{SH}\)（<a href="local.html#local-model">局所モデルの頁</a>）とし、これが制限済みの伝導率である。</p></li>
         <li>
           <p><strong>陽的な安定限界を求める。</strong>1D では、\(D_{eff}=\kappa_{eff}/(\rho c_v)\) を作り、最も厳しいセルの値を取る（\(\Delta l_c\) はセル幅）。</p>
           $$
           \Delta t_{exp}=C_{cond}\min_c\frac{(\Delta l_c)^2}{D_{eff,c}},\qquad C_{cond}=0.25\ \text{（既定）}.
           $$
-          <p>1D で既定の Kirchhoff 割線を使う面の κ（<code>face_kappa_policy</code>）では、セルごとにもうひとつの値 \(2(\rho c_vV)_c/\sum_fG_f\) も作り（\(G_f=A_f\kappa_f/\Delta r_f\) はセルの 2 つの面のコンダクタンス、\(\kappa_f\) は流束制限の前の面の κ、\(\Delta r_f\) はセル中心の間隔）、小さいほうを最小値に入れる。</p>
+          <p>1D で既定の Kirchhoff 割線を使う面の κ（<code>face_kappa_policy</code>）では、セルごとにもう 1 つの値 \(2(\rho c_vV)_c/\sum_fG_f\) も作り（\(G_f=A_f\kappa_f/\Delta r_f\) はセルの 2 つの面のコンダクタンス、\(\kappa_f\) は流束制限の前の面の κ、\(\Delta r_f\) はセル中心の間隔）、小さい方を最小値に入れる。</p>
           <p>2D RZ では、段が適用する演算子の Gershgorin の上界 \(\lambda_G\) から \(\Delta t_{exp}=4C_{cond}/\lambda_G\) とする。</p>
           $$
           \lambda_G=\max_c\frac{w_c\left|\sum_dG_{cd}+b_c\right|+\sum_dw_d\left|G_{cd}\right|}{(\rho c_vV)_c}.
@@ -57,7 +57,7 @@
           <p>ここで \(s_{max}\) は段数の上限（<code>sts_max_stages</code>、既定 40）である。\(\Delta t\) が \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\) を超えるときは、\(\Delta t\) を \(n_{sup}=\lceil\Delta t/(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2)\rceil\) 個の等しい大ステップに分け、\(\Delta t_{sup}=\Delta t/n_{sup}\) とする。\(\eta\) は <code>sts_subcycle_eta</code>（既定 0.9）である。超えないときは \(n_{sup}=1\)、\(\Delta t_{sup}=\Delta t\) である。2D RZ で <code>sts_scheme</code> が RKL2 を選ぶときの段数と分割は、<a href="#controls">キーの表</a>の <code>sts_scheme</code> の行に記す。</p>
         </li>
         <li>
-          <p><strong>段の時間刻みを作る。</strong>既定の減衰 ν=0.01（チェビシェフの減衰パラメータ <code>sts_damping</code> — 機構節の衝突周波数 \(\nu_{ei}\) や CBET ページのイオン音波の減衰率 \(\nu_a\) とは別物）として次を作る。</p>
+          <p><strong>段の時間刻みを作る。</strong>既定の減衰 ν=0.01（チェビシェフの減衰パラメータ <code>sts_damping</code> — <a href="index.html#mechanism">概要の頁</a>の衝突周波数 \(\nu_{ei}\) や <a href="../lpi/cbet.html">CBET の頁</a>のイオン音波の減衰率 \(\nu_a\) とは別物）として次を作る。</p>
           $$
           \tau_j=\frac{\Delta t_{exp}}
           {\nu^2+(1-\nu^2)\cos^2\!\left(\frac{\pi(2j-1)}{4s+2}\right)},
@@ -90,7 +90,8 @@
       $$
       <p>ここで j はセル、ρc<sub>v,e</sub>V<sub>j</sub> はセルの電子の熱容量、Δt は大域ステップ、A<sub>j+1/2</sub> は面の面積、κ<sub>j+1/2</sub> は面の伝導率、φ<sub>j+1/2</sub> は流束制限の係数である。解いた温度は、面の熱流 w<sub>j+1/2</sub>(T<sub>e,j+1</sub>−T<sub>e,j</sub>) を隣り合う 2 つのセルに符号だけ反転して渡す形で記帳する。そのため、記帳したエネルギーの総和は、三重対角系の解の残差によらず丸め誤差まで 0 になる。</p>
       <p><code>solver="implicit"</code> を 2D の単一ブロックのメッシュに指定すると、警告を出して STS で解く。マルチブロックのメッシュでは入力検査が拒否する。<code>"hypre"</code> は 2D では入力検査が拒否し、1D では hypre を有効にしたビルドでだけ受理されるが、陰解法は実行されず、警告を出して STS で解く。1D の SNB は <code>"implicit"</code> を要求する。</p>
-      <p><code>solver="dmp_implicit"</code> は、2D RZ の電子熱伝導を、離散最大値原理を満たす非線形の 2 点流束（two-point flux）の後退オイラー法で 1 回解く。入力は<a href="discretization.html#terms-node-local">節点局所の演算子</a>の準備（κ、ρc<sub>v,e</sub>、ボイドのセル、保持した境界）と同じである。非線形の方程式はピカール反復で解く。1 回の反復の線形系は、各セルの行が非負の係数と温度差の積の和になるので、狭義対角優位の M 行列になり、離散最大値原理が成り立つ。線形系は GPU 上の GMRES で解き、ピカール反復は深さ <code>dmp_anderson_depth</code>（既定 5）のアンダーソン加速（Anderson acceleration）で速める。停止の条件は、面の流束の変化の最大値が、流束の最大値の <code>dmp_picard_rel_tol</code>（既定 10<sup>−10</sup>）倍以下になることである。<code>dmp_picard_max_iterations</code>（既定 50）回までに収束しないステップと、受け入れ検査（記帳した温度が有限であること、範囲に入ること、反復の解と一致すること）を通らないステップは、状態を変えずに、小さい時間刻みでやり直す。電子の伝導は大域ステップを制限しない。SNB とは併用できない。イオン熱伝導を併用しても、イオンは常に STS（または RKL2）で解く。アルゴリズムの詳細はリポジトリの <code>docs/NUMERICS.md</code> §4.3.2 にある。</p>
+      <p><code>solver="dmp_implicit"</code> は、2D RZ の電子熱伝導を、離散最大値原理を満たす非線形の 2 点流束（two-point flux）の後退オイラー法で 1 回解く。入力は<a href="discretization.html#terms-node-local">節点局所の演算子</a>の準備（κ、ρc<sub>v,e</sub>、ボイドのセル、保持した境界）と同じである。非線形の方程式はピカール反復で解く。1 回の反復の線形系は、各セルの行が非負の係数と温度差の積の和になるので、狭義対角優位の M 行列になり、離散最大値原理が成り立つ。線形系は GPU 上の GMRES で解き、ピカール反復は深さ <code>dmp_anderson_depth</code>（既定 5）のアンダーソン加速（Anderson acceleration）で速める。</p>
+      <p>停止の条件は、面の流束の変化の最大値が、流束の最大値の <code>dmp_picard_rel_tol</code>（既定 10<sup>−10</sup>）倍以下になることである。<code>dmp_picard_max_iterations</code>（既定 50）回までに収束しないステップと、受け入れ検査（記帳した温度が有限であること、範囲に入ること、反復の解と一致すること）を通らないステップは、状態を変えずに、小さい時間刻みでやり直す。電子の伝導は大域ステップを制限しない。SNB とは併用できない。イオン熱伝導を併用しても、イオンは常に STS（または RKL2）で解く。アルゴリズムの詳細はリポジトリの <code>docs/NUMERICS.md</code> §4.3.2 にある。</p>
     </section>
 
     <section aria-labelledby="controls">

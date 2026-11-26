@@ -16,25 +16,25 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>namelist <span class="badge">reference</span></h1>
-    <p class="abstract">このページは、デッキ（deck。TENRYU の入力となる 1 個の Python ファイル）に書く namelist の全キーを列挙する仕様書ではなく、目的の設定へたどり着くための案内図である。最上位のブロック、主要な下位ブロック、代表的なキーの関係を示す。キーの完全な仕様 — 型、単位、許容値、組合せの制約、正典となる既定値の一覧 — は、ソースとともに配布される仕様書、すなわち TENRYU リポジトリ（コードと同様に公開されている）の <code>docs/SPECIFICATION.md</code> の §6.4（スキーマ）と §9.1（既定値）にある。デッキ、namelist、ブロック、下位ブロック、キーの定義は<a href="#terms">用語の節</a>にある。</p>
+    <p class="abstract">この頁は、デッキ（deck。TENRYU の入力となる 1 個の Python ファイル）に書く namelist の全キーを列挙する仕様書ではなく、目的の設定へたどり着くための案内図である。最上位のブロック、主要な下位ブロック、代表的なキーの関係を示す。キーの完全な仕様 — 型、単位、許容値、組合せの制約、正典となる既定値の一覧 — は、ソースとともに配布される仕様書、すなわち TENRYU リポジトリ（コードと同様に公開されている）の <code>docs/SPECIFICATION.md</code> の §6.4（スキーマ）と §9.1（既定値）にある。デッキ、namelist、ブロック、下位ブロック、キーの定義は<a href="#terms">用語の節</a>にある。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li><a href="#terms-block">ブロック</a>は 11 個あり、<code>Main</code> から <code>Parallel</code> までが、ケースの識別、メッシュ、物性、初期条件、物理、数値解法、出力を分担する。</li>
-        <li>キーの値が辞書（<code>dict</code>）のものは、独自のキーの集合をもつ<a href="#terms-block">下位ブロック</a>である。たとえば <code>Numerics.dt.max_s</code> と <code>Numerics.hydro.av_C2</code> は、別々の下位ブロック <code>dt</code> と <code>hydro</code> のキーで、受け付ける値の検査が別である。</li>
-        <li>未知のキー、型の違い、範囲外の値、対応していないブロックの組合せは、いずれも入力エラーである。打ち間違いが黙って既定値に戻ることはない。例外は、互換のために受理して WARNING を出し、何もしないキーが少数あることである（<a href="#validation-defaults">検証と既定値</a>）。</li>
-        <li>以下のキーは入口を示す例であり、完全な一覧ではない。このページの表は意図的に既定値を載せていない。各カーネルページには主要な既定値が載っており、それが SPECIFICATION §9.1 と食い違う場合は §9.1 が正である。</li>
+        <li><strong>11 個のブロック：</strong><a href="#terms-block">ブロック</a>は 11 個あり、<code>Main</code> から <code>Parallel</code> までが、ケースの識別、メッシュ、物性、初期条件、物理、数値解法、出力を分担する。</li>
+        <li><strong>下位ブロックの入れ子：</strong>キーの値が辞書（<code>dict</code>）のものは、独自のキーの集合をもつ<a href="#terms-block">下位ブロック</a>である。たとえば <code>Numerics.dt.max_s</code> と <code>Numerics.hydro.av_C2</code> は、別々の下位ブロック <code>dt</code> と <code>hydro</code> のキーで、受け付ける値の検査が別である。</li>
+        <li><strong>厳格な入力検査：</strong>未知のキー、型の違い、範囲外の値、対応していないブロックの組合せは、いずれも入力エラーである。打ち間違いが黙って既定値に戻ることはない。例外は、互換のために受理して WARNING を出し、何もしないキーが少数あることである（<a href="#validation-defaults">検証と既定値</a>）。</li>
+        <li><strong>案内図としての位置付け：</strong>以下のキーは入口を示す例であり、完全な一覧ではない。この頁の表は意図的に既定値を載せていない。各物理カーネルの頁には主要な既定値が載っており、それが SPECIFICATION §9.1 と食い違う場合は §9.1 が正である。</li>
       </ul>
     </aside>
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
-      <p>このページと、このページへリンクするページは、デッキ、namelist、ブロック、下位ブロック、キーの 5 つの語を、次の意味で使う。</p>
+      <p>この頁と、この頁へリンクする頁は、デッキ、namelist、ブロック、下位ブロック、キーの 5 つの語を、次の意味で使う。</p>
 
       <h3 id="terms-deck">デッキと namelist</h3>
       <p><strong>デッキ（deck）</strong>は、TENRYU に渡す入力の、1 個の Python ファイルである。<code>tenryu run deck.py</code> や <code>tenryu validate deck.py</code> の引数がデッキで、1 回の計算のすべての条件 — メッシュ、材料、初期条件、物理、数値解法、出力 — をこのファイル 1 つに書く。デッキは通常の Python のスクリプトとして実行されるので、関数や定数を自由に定義でき、環境変数も読める。TENRYU は、デッキを組み込みの Python インタプリタで 1 回だけ実行する。デッキが呼んだブロック関数は、その場でキーの名前と値を検査して登録し、実行が終わったあとに、TENRYU がブロックをまたぐ検査をして設定を確定する。リポジトリの <code>docs/SPECIFICATION.md</code> §6 は、このファイルを namelist と呼ぶ。</p>
-      <p><strong>namelist</strong>は、デッキの書式の名前である。書式は、<code>tenryu_namelist</code> モジュールが提供するブロック関数と、その関数が受け付けるキーの体系で定まる。このモジュールは TENRYU の実行ファイルに組み込まれていて、デッキは先頭で <code>from tenryu_namelist import *</code> と書いてブロック関数を使う。このサイトでは、ファイルをデッキ、書式を namelist と呼び分ける。このページは、namelist のキーの案内である。</p>
+      <p><strong>namelist</strong> は、デッキの書式の名前である。書式は、<code>tenryu_namelist</code> モジュールが提供するブロック関数と、その関数が受け付けるキーの体系で定まる。このモジュールは TENRYU の実行ファイルに組み込まれていて、デッキは先頭で <code>from tenryu_namelist import *</code> と書いてブロック関数を使う。このサイトでは、ファイルをデッキ、書式を namelist と呼び分ける。この頁は、namelist のキーの案内である。</p>
 
       <h3 id="terms-block">ブロックと下位ブロック</h3>
       <p><strong>ブロック（block）</strong>は、デッキの最上位の設定の単位で、同名の Python の関数（ブロック関数）として呼ぶ。<code>Main</code>、<code>Mesh</code>、<code>Materials</code>、<code>Geometry</code>、<code>Radiation</code>、<code>Laser</code>、<code>Numerics</code>、<code>Output</code>、<code>Diagnostics</code>、<code>Parallel</code>、<code>Burn</code> の 11 個がある。ブロック関数は、キーワード引数（キー = 値）で設定を受け取り、値を TENRYU に登録するだけで、戻り値を使わない。</p>
@@ -60,7 +60,7 @@
           <tr><th><code>Geometry</code></th><td>材料の体積分率（volume fraction）と、初期の密度、電子・イオン温度、速度、輻射場のメッシュ上への配置。</td><td><code>volfrac</code>, <code>rho</code>, <code>Te</code>, <code>Ti</code>, <code>velocity</code>, <code>radiation_field</code>, <code>enforce_sum_to_one</code></td></tr>
           <tr><th><code>Radiation</code></th><td>輻射の演算子、エネルギー群（energy group）、流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>）のソルバと境界条件。</td><td><code>enabled</code>, <code>mode</code>, <code>groups</code>, <code>group_bounds_eV</code>, <code>compute_T_range_eV</code>, <code>multigroup_diffusion</code>, <code>sn_transport</code>, <code>boundary</code></td></tr>
           <tr><th><code>Laser</code></th><td>波長、光線追跡（ray tracing）のモード、ビームの集合、<a href="../physics/lpi/cbet.html#terms">ポート（port）</a>の配置、吸収と屈折の設定。</td><td><code>enabled</code>, <code>wavelength_nm</code>, <code>mode</code>, <code>rays_per_beam</code>, <code>beams</code>, <code>port_configuration</code>, <code>absorption</code>, <code>raytrace</code></td></tr>
-          <tr><th><code>Laser.cbet</code></th><td>交差ビームエネルギー転送（cross-beam energy transfer、CBET）、ポートと区画（section）の離散化、イオン音波（ion-acoustic wave、IAW）の応答と反復。ポートの配置は、<code>Laser.cbet</code> の中ではなく、<code>Laser</code> 直下の <code>port_configuration</code> に書く。ポート、区画、衝突径数ビン（impact-parameter bin）の定義と、<code>n_impact_bins</code> の既定は、<a href="../physics/lpi/cbet.html#terms">CBET のページの用語の節</a>にある。</td><td><code>enable</code>, <code>geometry_mode</code>, <code>f_cbet</code>, <code>alpha_iaw</code>, <code>theta_cap</code>, <code>tol</code>, <code>inverse_estimate</code>, <code>max_iters</code>, <code>n_impact_bins</code>, <code>n_section_phi</code></td></tr>
+          <tr><th><code>Laser.cbet</code></th><td>交差ビームエネルギー転送（cross-beam energy transfer、CBET）、ポートと区画（section）の離散化、イオン音波（ion-acoustic wave、IAW）の応答と反復。ポートの配置は、<code>Laser.cbet</code> の中ではなく、<code>Laser</code> 直下の <code>port_configuration</code> に書く。ポート、区画、衝突径数ビン（impact-parameter bin）の定義と、<code>n_impact_bins</code> の既定は、<a href="../physics/lpi/cbet.html#terms">CBET の頁の用語の節</a>にある。</td><td><code>enable</code>, <code>geometry_mode</code>, <code>f_cbet</code>, <code>alpha_iaw</code>, <code>theta_cap</code>, <code>tol</code>, <code>inverse_estimate</code>, <code>max_iters</code>, <code>n_impact_bins</code>, <code>n_section_phi</code></td></tr>
           <tr><th><code>Laser.hot_electron</code></th><td>ホット電子（hot electron）の生成源、変換効率、スペクトル、角度分布、減速（slowing-down）と<a href="../overview/numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>。</td><td><code>enable</code>, <code>eta_hot</code>, <code>eta_hot_table</code>, <code>sources</code>, <code>T_hot_eV</code>, <code>spectrum</code>, <code>n_energy_groups</code>, <code>angular_model</code>, <code>stopping_model</code>, <code>subtract_from_laser</code></td></tr>
           <tr><th><code>Numerics.dt</code></th><td>初期の時間刻み、CFL 条件（Courant–Friedrichs–Lewy condition）、増加率、上下限。</td><td><code>initial_s</code>, <code>cfl_hydro</code>, <code>cfl_cond</code>, <code>growth_factor</code>, <code>max_s</code>, <code>min_s</code></td></tr>
           <tr><th><code>Numerics.hydro</code></th><td>流体、人工粘性（artificial viscosity）、時間積分、1D / 2D の境界と、全ステップの再試行（retry。<a href="../overview/timestep.html#global-rule">時間刻み制御</a>）。</td><td><code>enabled</code>, <code>boundary_1d</code>, <code>boundary_2d</code>, <code>av_type</code>, <code>av_model</code>, <code>av_C1</code>, <code>av_C2</code>, <code>time_integration</code></td></tr>
@@ -86,9 +86,9 @@
       <h2 id="validation-defaults">検証と既定値</h2>
       <p>パーサは各階層で、既知のキーかどうかを検証する。未知のキーを捨てて続行することはせず、誤った型、必須の値の欠落、範囲の違反、相互に排他的なモード、次元や MPI のランク数に対して対応していない設定があれば、入力の誤りとして停止する。誤りは、例外 <code>ConfigError</code> または <code>ValueError</code> として報告され、どちらも先頭が <code>TENRYU ERROR [namelist]:</code> の行で表示される。この検査は、設定の打ち間違いが、原因の分からない物理結果として後から現れるのを防ぐ。</p>
       <p>例外は、互換のために受理するだけで何もしないキーである。受理すると、そのキーが何もしないことを知らせる WARNING が出る。たとえば、<code>Numerics.dt.f_min_fleck</code> と <code>Numerics.safety.opacity_floor</code>・<code>opacity_cap</code> は、現在のビルドに含まれないモンテカルロ輻射のキーである。<code>Diagnostics.shell</code> も何もしない（殻の診断は <code>Numerics.diagnostics.icf</code> が行う）。</p>
-      <h3 id="hot-electron-transport">ホット電子の停止と 1D 輸送</h3>
+      <h3 id="hot-electron-transport">ホット電子の阻止能と 1D 輸送</h3>
       <p><code>Laser.hot_electron.stopping_model</code> の <code>1D_SPH</code> での既定値は <code>"free_and_bound_electrons"</code> である。 1D でホット電子を有効にし、束縛電子による減速または飛程短縮を使う場合は、ボイドでない全材料に <code>Z &gt; 0</code> が必要である。</p>
-      <p>束縛電子による減速には、有限かつ正の <code>Materials.materials[].mean_excitation_energy_eV</code>（単位 eV）を明示した場合はその値を使う。明示値が非有限または非正なら <code>ValueError</code> を返す。省略時は、単一元素なら元素表の値を使う。<code>composition_Z</code> と <code>composition_fraction</code> で複数の元素を指定した場合は、各原子数分率と原子核の電荷数の積で重み付けした幾何平均を使う。この平均には、化合物用の値として H に 19.2 eV、C に 81.0 eV、N に 82.0 eV、O に 106 eV、F に 112 eV、Cl に 180 eV を使う。他の元素には元素表の値の 1.13 倍を使う。組成がない場合は、<code>Z</code> が 1 から 100 までの整数に <code>1e-9</code> 以内で一致すれば元素表を使う。元素が表の範囲外にあるなど、値を決められないときは <code>ConfigError</code> を返す。式は<a href="../physics/lpi/hot-electrons.html#stopping-model">停止モデル</a>を参照。</p>
+      <p>束縛電子による減速には、有限かつ正の <code>Materials.materials[].mean_excitation_energy_eV</code>（単位 eV）を明示した場合はその値を使う。明示値が非有限または非正なら <code>ValueError</code> を返す。省略時は、単一元素なら元素表の値を使う。<code>composition_Z</code> と <code>composition_fraction</code> で複数の元素を指定した場合は、各原子数分率と原子核の電荷数の積で重み付けした幾何平均を使う。この平均には、化合物用の値として H に 19.2 eV、C に 81.0 eV、N に 82.0 eV、O に 106 eV、F に 112 eV、Cl に 180 eV を使う。他の元素には元素表の値の 1.13 倍を使う。組成がない場合は、<code>Z</code> が 1 から 100 までの整数に <code>1e-9</code> 以内で一致すれば元素表を使う。元素が表の範囲外にあるなど、値を決められないときは <code>ConfigError</code> を返す。式は<a href="../physics/lpi/hot-electrons.html#stopping-model">阻止能モデル</a>を参照。</p>
       <p>以下の <code>Laser.hot_electron</code> のキーは全チャネルに共通である。表にはパーサーの既定値を示す。 <code>angular_model="radial"</code> で <code>sheath_*</code> または <code>planar_inner_face</code> を指定すると <code>ConfigError</code> を返す。許容範囲外の値や、必須の <code>planar_inner_face</code> を省略した場合も同じエラーになる。</p>
       <table class="quick-facts">
         <thead>
@@ -108,7 +108,7 @@
       <p>デッキで省略した <code>Laser.cbet.tol</code> は、<code>1D_SPH</code> では <code>1e-6</code>、<code>2D_RZ</code> では <code>1e-3</code> である。<code>Laser.cbet.inverse_estimate</code> の既定は <code>False</code> で、<code>True</code> は 1D の受理した解に対する逆ノルムの推定診断を有効にする。この診断は物理解や受理判定を変えない。1D CBET を有効にすると、<code>Laser.raytrace_skip</code> の有効化、<code>Laser.cbet.theta_cap</code> の明示指定、<code>Laser.cbet.alpha_iaw &gt;= 2</code> はそれぞれ <code>ConfigError</code> になる。</p>
       <aside class="planned" aria-labelledby="authoritative-reference">
         <h3 id="authoritative-reference">正典となる完全なリファレンス</h3>
-        <p>このページは案内図である。完全なキーのリファレンスは TENRYU リポジトリ（ソースとともに配布される公開文書）の <code>docs/SPECIFICATION.md</code> §6.4、既定値の正典となる一覧は同 §9.1 である。本サイトの各カーネルページに載る既定値は、フッタに示すドキュメント日付の時点で正確である。サイトと §9.1 が食い違う場合は §9.1 が優先される。新しいデッキを作るとき、モードを変えるとき、既定値に依存した解釈をするとき、検証のエラーを解消するときは、この仕様書を確認すること。</p>
+        <p>この頁は案内図である。完全なキーのリファレンスは TENRYU リポジトリ（ソースとともに配布される公開文書）の <code>docs/SPECIFICATION.md</code> §6.4、既定値の正典となる一覧は同 §9.1 である。本サイトの各物理カーネルの頁に載る既定値は、フッタに示すドキュメント日付の時点で正確である。サイトと §9.1 が食い違う場合は §9.1 が優先される。新しいデッキを作るとき、モードを変えるとき、既定値に依存した解釈をするとき、検証のエラーを解消するときは、この仕様書を確認すること。</p>
       </aside>
     </section>
 

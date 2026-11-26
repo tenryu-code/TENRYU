@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>レーザー光線追跡の解析解による検証 — TENRYU Documentation</title>
+  <title>レーザー光線追跡の解析解による検証 — TENRYU ドキュメント</title>
   <link rel="stylesheet" href="../../../style.css">
   <link rel="icon" href="../../../favicon.ico" sizes="32x32">
   <link rel="icon" href="../../../favicon.svg" type="image/svg+xml">
@@ -24,7 +24,7 @@
 
     <section aria-labelledby="introduction">
       <h2 id="introduction">はじめに</h2>
-      <p><a href='raytrace.html'>特性曲線積分（characteristic integration）</a>は球対称プラズマ中の光線を追跡し、経路に沿って<a href='absorption.html'>衝突吸収</a>を積算する。指数分布の試験では、臨界面で反射する光線の吸収を調べる。コロナでは光線ごとに異なる半径で転回する。一様球では密度段差で屈折し、吸収の起こる弦の長さが変わる。</p>
+      <p><a href="raytrace.html">特性曲線積分（characteristic integration）</a>は球対称プラズマ中の光線を追跡し、経路に沿って<a href="absorption.html">衝突吸収</a>を積算する。指数分布の試験では、臨界面で反射する光線の吸収を調べる。コロナでは光線ごとに異なる半径で転回する。一様球では密度段差で屈折し、吸収の起こる弦の長さが変わる。</p>
       <p>指数分布の吸収積分 [2、p. 129、式 (4.84)–(4.88)]、逆二乗コロナ中の光線 [3、p. 12、式 (19)–(21)]、一様な亜臨界プラズマでの減衰 [4、p. 4] を出発点とする。以下に示す分布と収束判定は TENRYU の試験で用いるものである。</p>
     </section>
 
@@ -36,9 +36,9 @@
         <thead><tr><th scope="col">項目</th><th scope="col">値</th></tr></thead>
         <tbody>
           <tr><th scope="row">幾何と格子</th><td><code>1D_SPH</code>。中心から外端面まで半径方向に等間隔のセル</td></tr>
-          <tr><th scope="row">レーザー</th><td>波長 351 nm の 1 ビーム。−z 方向にパワー 10<sup>7</sup> erg/s で照射</td></tr>
+          <tr><th scope="row">レーザー</th><td>波長 351 nm の 1 ビーム。−z 方向にパワー 10<sup>7</sup> erg/s で照射（マクスウェル分布の吸収率はパワーによらない）</td></tr>
           <tr><th scope="row">追跡</th><td><code>raytrace_2d</code> モードの特性曲線積分。臨界面で吸収して追跡を打ち切る設定は無効</td></tr>
-          <tr><th scope="row">プラズマと時間</th><td>固定電離度 1 の水素。電子温度とイオン温度は等しい。流体・熱伝導・輻射を無効にし、10<sup>−13</sup> s のレーザー計算を 1 回行う。</td></tr>
+          <tr><th scope="row">プラズマと時間</th><td>固定電離度 1 の水素。電子温度とイオン温度は等しい。流体・熱伝導・輻射を無効にし、10<sup>−13</sup> s のレーザー計算を 1 回行う（吸収率は時間幅によらない）。</td></tr>
           <tr><th scope="row">吸収のクロージャ</th><td>マクスウェル分布の吸収。指数分布とコロナではクーロン対数を 7 に固定する。一様球では既定のクーロン対数を用いる。</td></tr>
         </tbody>
       </table>
@@ -53,7 +53,7 @@
       </table>
       <figure id="fig-profiles">
         <img src="../../../assets/laser1d-standard-problems-profiles-ja.png" width="880" height="445" style="max-width:100%;height:auto" alt="各問題の密度と温度の半径分布に、臨界半径、球の半径、転回半径を示す。">
-        <figcaption>図 A. 指定した半径方向分布。青線は臨界密度に対する密度比、緑線は電子温度である。橙の破線は臨界半径、灰色の破線は一様球の密度段差を示す。中央列と右列の濃い青の一点鎖線は、最粗格子で最外側の光線が達する最小半径を示す。右列の濃い青の点線は、最内側の光線が達する最小半径を示す。中央列では、最内側の光線の転回半径が図の分解能で橙の破線と重なる。左列の橙の破線は、垂直入射の参照光線が反射する半径でもある。</figcaption>
+        <figcaption>図A. 指定した半径方向分布。青線は臨界密度に対する密度比、緑線は電子温度である。橙の破線は臨界半径、灰色の破線は一様球の密度段差を示す。中央列と右列の濃い青の一点鎖線は、最粗格子で最外側の光線が達する最小半径を示す。右列の濃い青の点線は、最内側の光線が達する最小半径を示す。中央列では、最内側の光線の転回半径が図の分解能で橙の破線と重なる。左列の橙の破線は、垂直入射の参照光線が反射する半径でもある。</figcaption>
       </figure>
     </section>
 
@@ -106,7 +106,7 @@
       <p>試験は球の温度での Born 項 \(B\) からクーロン対数を求める。この温度では古典補正は 0 である。\(\hbar\) は換算 Planck 定数、\(\gamma\) は Euler 定数である。\(x_s\) は球内の密度で決まる。試験は引数 \(y\) の指数積分に \(e^y\) を掛けた \(g\) を、添字 \(m\) について 60 項の級数で評価する。記録されたクーロン対数は 6.160313448090 である。</p>
       <figure id="fig-paths">
         <img src="../../../assets/laser1d-standard-problems-paths-ja.png" width="880" height="345" style="max-width:100%;height:auto" alt="臨界半径で反射する半径方向の光線、コロナ内で曲がる 3 本の光線、一様球で屈折する 3 本の弦。">
-        <figcaption>図 B. 標的中心を含む面上の解析軌跡。光線は上から入射する。外側の灰色の円は領域の境界、橙の破線は臨界面、灰色の破線は一様球の表面である。左の半径方向の往路と復路は重なる。コロナと一様球では、最粗格子での内側、中ほど、最外側の光線をそれぞれ青の実線、朱の破線、緑の一点鎖線で示す。点は転回点または弦上の中心に最も近い点である。</figcaption>
+        <figcaption>図B. 標的中心を含む面上の解析軌跡。光線は上から入射する。外側の灰色の円は領域の境界、橙の破線は臨界面、灰色の破線は一様球の表面である。左の半径方向の往路と復路は重なる。コロナと一様球では、最粗格子での内側、中ほど、最外側の光線をそれぞれ青の実線、朱の破線、緑の一点鎖線で示す。点は転回点または弦上の中心に最も近い点である。</figcaption>
       </figure>
       <h3 id="beam-reference">ビームの吸収率と沈着分布</h3>
       $$  b_k=(k+\tfrac12)\frac{b_{\max}}{N},\quad
@@ -121,10 +121,10 @@
         W_k(r)=A(b_k)-2e^{-T_t}\sinh D(r),\qquad
         W_{\rm ref}(r)=\sum_k p_k W_k(r) .
       \end{aligned} $$
-      <p>コロナでは \(u_r\) は上式で定義した光線ごとの平方根、\(D(r)\) は転回点から半径 \(r\) の球面までの片道の光学的厚さである。転回点とその内側では \(D(r)\) を 0 とする。\(T_t\) はその光線の領域外端から転回点までの片道の光学的厚さである。光線 k の沈着率を求めるときは、同じ光線に対する光学的厚さを用いる。\(W_k(r)\) は光線 \(k\) の入射エネルギーのうち、往復で球面の外側に沈着する割合である。重み付き和 \(W_{\rm ref}(r)\) はビーム全体に対する割合である。</p>
+      <p>コロナでは \(u_r\) は上式で定義した光線ごとの平方根、\(D(r)\) は転回点から半径 \(r\) の球面までの片道の光学的厚さである。転回点とその内側では \(D(r)\) を 0 とする。\(T_t\) はその光線の領域外端から転回点までの片道の光学的厚さである。光線 \(k\) の沈着率を求めるときは、同じ光線に対する光学的厚さを用いる。\(W_k(r)\) は光線 \(k\) の入射エネルギーのうち、往復で球面の外側に沈着する割合である。重み付き和 \(W_{\rm ref}(r)\) はビーム全体に対する割合である。</p>
       <figure id="fig-absorption">
         <img src="../../../assets/laser1d-standard-problems-absorption-ja.png" width="880" height="355" style="max-width:100%;height:auto" alt="コロナと一様球の衝突径数に対する吸収率と光線の重み、およびコロナの半径に対する累積沈着。">
-        <figcaption>図 C. 最粗格子の参照値。左と中央の青の実線は光線ごとの吸収率、朱の破線は光線の重みで、重みは右軸で読む。右の緑線は、ビームの入射エネルギーのうち、コロナ格子の各内部セル面より外側に沈着する割合の解析値である。</figcaption>
+        <figcaption>図C. 最粗格子の参照値。左と中央の青の実線は光線ごとの吸収率、朱の破線は光線の重みで、重みは右軸で読む。右の緑線は、ビームの入射エネルギーのうち、コロナ格子の各内部セル面より外側に沈着する割合の解析値である。</figcaption>
       </figure>
     </section>
 
@@ -140,7 +140,7 @@
       $$  p_1=\log_2(E_1/E_2),\qquad p_2=\log_2(E_2/E_3),
         \qquad p_{\min}=0.9\,p_{\rm claim} . $$
       <p>粗・中間・細格子の誤差を \(E_1\)、\(E_2\)、\(E_3\) とする。観測収束次数 \(p_1,p_2\) は、セル幅が 2 倍異なる隣接した格子の組から求める。指数分布とコロナの 2 つの指標に対する想定次数 \(p_{\rm claim}\) は 3/2 である。光学的厚さは転回点に平方根分岐（square-root branch）をもつため、再構成した傾きと転回半径の誤差が 3/2 次で効く。一様球の想定次数は 1 である。再構成した密度は隣接するセルの中心間で半径について線形であり、等間隔格子のセル境界では両セルの平均値をとる。この再構成により、密度段差はセル 1 個分の幅に広がる。合格の下限 \(p_{\min}\) はそれぞれ 1.35 と 0.9 である。</p>
-      <p>丸め誤差に対する下限 \(F\) は 10<sup>−10</sup> である。数値積分の誤差推定値 \(\sigma\) は、光学的厚さの積分誤差の推定値を光線ごとに足し、その最大を取った値である。判定には指数分布のモデル誤差の上限を各格子で用い、他の 2 問題では 0 とする。下表の順で判定する。隣接格子から求めた 2 つの次数には片側の下限を課す [7、PDF pp. 34–35]。特異点による次数の低下と、格子収束性の評価における 10% の幅は文献 [8、p. 182 および p. 326、表 8.1] に記載されている。</p>
+      <p>丸め誤差に対する下限 \(F\) は 10<sup>−10</sup> である。数値積分の誤差推定値 \(\sigma\) は、光学的厚さの積分誤差の推定値を光線ごとに足し、その最大を取った値である。判定には指数分布のモデル誤差の上限を各格子で用い、他の 2 問題では 0 とする。離散化誤差が丸め誤差・数値積分誤差・モデル誤差に埋もれて収束次数を正しく測れない場合や、漸近領域に入っていない場合は <code>BLOCKED</code> とし、収束不良の <code>FAIL</code> と区別する。下表の順で判定する。隣接格子から求めた 2 つの次数には片側の下限を課す [7、PDF pp. 34–35]。特異点による次数の低下と、格子収束性の評価における 10% の幅は文献 [8、p. 182 および p. 326、表 8.1] に記載されている。</p>
       <table class="quick-facts">
         <caption>表 3. 判定の順序。最初に該当した条件で判定が決まる。</caption>
         <thead><tr><th scope="col">順序</th><th scope="col">条件</th><th scope="col">判定</th></tr></thead>
@@ -154,13 +154,13 @@
           <tr><th scope="row">7</th><td>一方の次数が合格の下限以上で、もう一方が下限未満。</td><td><code>BLOCKED order_<wbr>not_<wbr>asymptotic</code></td></tr>
         </tbody>
       </table>
-      <p><code>FAIL</code> と <code>BLOCKED</code> はどちらも検査の失敗となる。各実行では<a href='#energy'>エネルギー保存</a>の節に示す台帳と 3 種のエラーフラグも検査する。</p>
+      <p><code>FAIL</code> と <code>BLOCKED</code> はどちらも検査の失敗となる。各実行では<a href="#energy">エネルギー保存</a>の節に示す台帳と 3 種のエラーフラグも検査する。</p>
     </section>
 
     <section aria-labelledby="results">
       <h2 id="results">結果</h2>
       <p>記録した試験は 2026 年 11 月 25 日 10:50（日本標準時）に NVIDIA RTX PRO 6000 Blackwell Max-Q GPU 1 枚で実行した。実行条件と印字出力は、リポジトリの <code>tools/site_figures/<wbr>data/<wbr>laser1d_standard_problems/</code> にある。</p>
-      <p><code>unresolved_quadrature</code> は、積分区間の分割深さまたは分割数の上限で受理された光線区間の数である。これらの区間の誤差推定値も \(\sigma\) に含まれる。区間数そのものには 0 の条件を課さない。</p>
+      <p><code>unresolved_quadrature</code> は、適応求積が積分区間の分割深さまたは分割数の上限に達して受理された光線区間の数である。これらの区間の誤差推定値も \(\sigma\) に含まれており、表 4 の逆二乗コロナでも \(\sigma\) は測定誤差の 1% 未満（表 3 の手順 3 の基準内）にとどまるため、上限到達区間数そのものには 0 の条件を課さない。</p>
       <table class="quick-facts">
         <caption>表 4. 格子ごとの測定誤差、エネルギー台帳の残差、積分上限に達した区間数。横線は測定対象外を示す。</caption>
         <thead><tr><th scope="col">問題</th><th scope="col">セル数</th><th scope="col">\(E_A\)</th><th scope="col">\(E_W\)</th><th scope="col">\(\sigma\)</th><th scope="col">台帳</th><th scope="col">上限到達区間数</th></tr></thead>
@@ -193,7 +193,7 @@
       <p>コロナの 2 つの指標はいずれも約 2 次で収束し、片側の合格下限 1.35 を上回った。臨界半径から最外側の光線の転回半径までの範囲に全体が含まれる各セルで、少なくとも 16 本の光線が転回する。隣り合う光線の転回半径の差は、衝突径数の間隔を \(\Delta b=0.8h/16\)、セル幅を \(h\) として、最大 \(\Delta b/\sqrt{1+s}\) である。収束次数が想定より高くなった理由は、この試験では調べていない。</p>
       <figure id="fig-convergence">
         <img src="../../../assets/laser1d-standard-problems-convergence-ja.png" width="880" height="365" style="max-width:100%;height:auto" alt="全問題の吸収誤差とコロナの面沈着誤差を、傾きの補助線とともに両対数軸に示す。">
-        <figcaption>図 D. セル数に対する誤差。両軸とも対数である。青の丸と緑の三角はそれぞれ指数分布と一様球の吸収誤差、朱の四角はコロナの吸収誤差を示す。朱の菱形と破線はコロナの沈着誤差である。灰色の点線の傾きは −3/2 と −1 である。</figcaption>
+        <figcaption>図D. セル数に対する誤差。両軸とも対数である。青の丸と緑の三角はそれぞれ指数分布と一様球の吸収誤差、朱の四角はコロナの吸収誤差を示す。朱の菱形と破線はコロナの沈着誤差である。灰色の点線の傾きは −3/2 と −1 である。</figcaption>
       </figure>
     </section>
 
@@ -210,12 +210,12 @@
       $$  L(\alpha)=1-\frac{0.553}{1+(0.27/\alpha)^{0.75}},
         \qquad L(0)=1 . $$
       <p>\(\alpha\) は球殻の Langdon パラメータ、\(L(\alpha)\) は吸収に掛ける因子である。吸収誤差と沈着誤差をそれぞれ Langdon 因子を用いたビーム吸収率の参照値 \(f_{\rm ref}\) で割った値は 0.01 以下を要求する。測定値はそれぞれ 2.97804 × 10<sup>−4</sup> と 1.42876 × 10<sup>−4</sup> だった。</p>
-      <p>炭素・水素の検査では指数分布の最細格子を使い、炭素と水素を等しい個数分率で混ぜ、電離度をそれぞれ 6 と 1 に固定する。実効電離度（effective ion charge）\(Z_{\rm eff}\) は個数分率で重み付けした電離度の二次モーメントと一次モーメントの比で、37/7 となる。元素組成から実効電離度を求める設定を有効にし、温度を (37/7)<sup>2/3</sup> 倍にする。すると \(Z_{\rm eff}\) を温度の 3/2 乗で割った値が水素の場合と等しくなり、温度と実効電離度で決まる吸収係数の因子が一致する。吸収率を元の指数分布の参照値と比較した絶対誤差は 2.21966 × 10<sup>−6</sup> で、許容値は 0.01 である。クロージャの検査は 2 件とも合格した。</p>
+      <p>炭素・水素の検査では指数分布の最細格子を使い、炭素と水素を等しい個数分率で混ぜ、電離度をそれぞれ 6 と 1 に固定する。実効電離度（effective ion charge）\(Z_{\rm eff}\) は個数分率で重み付けした電離度の二次モーメントと一次モーメントの比で、37/7 となる。元素組成から実効電離度を求める設定を有効にし、温度を (37/7)<sup>2/3</sup> 倍にする。すると \(Z_{\rm eff}\) を温度の 3/2 乗で割った値が純水素の場合と一致し、吸収係数が同一となるため、元の指数分布の解析参照値をそのまま比較に使える。吸収率の絶対誤差は 2.21966 × 10<sup>−6</sup> で、許容値は 0.01 である。クロージャの検査は 2 件とも合格した。</p>
     </section>
 
     <section aria-labelledby="limitations">
       <h2 id="limitations">限界</h2>
-      <p>収束試験の範囲は、プラズマの分布を指定した <code>1D_SPH</code> の特性曲線積分とマクスウェル分布の吸収である。Langdon 因子と \(Z_{\rm eff}\) の検査はそれぞれ 1 つの格子で行う。ビーム間エネルギー移行（cross-beam energy transfer, CBET）、明示的に有効にする高速追跡、流体との連成、時間依存性は試験の範囲外である。</p>
+      <p>収束試験の範囲は、プラズマの分布を指定した <code>1D_SPH</code> の特性曲線積分とマクスウェル分布の吸収である。Langdon 因子と \(Z_{\rm eff}\) の検査はそれぞれ 1 つの格子で行う。交差ビームエネルギー転送（cross-beam energy transfer、CBET）、明示的に有効にする高速追跡、流体との連成、時間依存性は試験の範囲外である。</p>
     </section>
 
     <section aria-labelledby="run-tests">
@@ -239,12 +239,12 @@
     <section aria-labelledby="references">
       <h2 id="references">参考文献</h2>
       <ol class="references">
-        <li>T. W. Johnston and J. M. Dawson, “Correct values for high-frequency power absorption by inverse bremsstrahlung in plasmas,” <i>Phys. Fluids</i> 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
+        <li>T. W. Johnston and J. M. Dawson, "Correct values for high-frequency power absorption by inverse bremsstrahlung in plasmas," Phys. Fluids 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
         <li>P. Michel, <i>Introduction to Laser-Plasma Interactions</i> (Springer, 2023). <a href="https://doi.org/10.1007/978-3-031-23424-8">doi:10.1007/978-3-031-23424-8</a></li>
-        <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, “Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion,” <i>J. Comput. Phys.</i> 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
-        <li>A. Hyder, W. Fox, K. V. Lezhnin, and S. R. Totorica, “Ray-tracing laser-deposition model for plasma particle-in-cell simulation,” <i>Comput. Phys. Commun.</i> 318, 109847 (2026). <a href="https://doi.org/10.1016/j.cpc.2025.109847">doi:10.1016/j.cpc.2025.109847</a></li>
-        <li>R. Ramis and J. Meyer-ter-Vehn, “MULTI-IFE—A one-dimensional computer code for Inertial Fusion Energy (IFE) target simulations,” <i>Comput. Phys. Commun.</i> 203, 226 (2016). <a href="https://doi.org/10.1016/j.cpc.2016.02.014">doi:10.1016/j.cpc.2016.02.014</a></li>
-        <li>R. K. Follett, I. V. Igumenshchev, A. Colaïtis, J. P. Palastro, D. H. Froula, and D. Turnbull, “Modeling cross-beam energy transfer with sector ray tracing,” <i>Phys. Plasmas</i> 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
+        <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, "Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion," J. Comput. Phys. 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
+        <li>A. Hyder, W. Fox, K. V. Lezhnin, and S. R. Totorica, "Ray-tracing laser-deposition model for plasma particle-in-cell simulation," Comput. Phys. Commun. 318, 109847 (2026). <a href="https://doi.org/10.1016/j.cpc.2025.109847">doi:10.1016/j.cpc.2025.109847</a></li>
+        <li>R. Ramis and J. Meyer-ter-Vehn, "MULTI-IFE—A one-dimensional computer code for Inertial Fusion Energy (IFE) target simulations," Comput. Phys. Commun. 203, 226 (2016). <a href="https://doi.org/10.1016/j.cpc.2016.02.014">doi:10.1016/j.cpc.2016.02.014</a></li>
+        <li>R. K. Follett, I. V. Igumenshchev, A. Colaïtis, J. P. Palastro, D. H. Froula, and D. Turnbull, "Modeling cross-beam energy transfer with sector ray tracing," Phys. Plasmas 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
         <li>K. Salari and P. Knupp, <i>Code Verification by the Method of Manufactured Solutions</i>, SAND2000-1444 (2000). <a href="https://doi.org/10.2172/759450">doi:10.2172/759450</a></li>
         <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
       </ol>

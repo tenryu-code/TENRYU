@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>The 11 <a href="#terms-block">blocks</a>, from <code>Main</code> through <code>Parallel</code>, divide case identity, mesh, materials, initialization, physics, numerics, and output responsibilities.</li>
-        <li>A key whose value is a dict is a <a href="#terms-block">sub-block</a> with its own set of keys. For example, <code>Numerics.dt.max_s</code> and <code>Numerics.hydro.av_C2</code> are keys of different sub-blocks, <code>dt</code> and <code>hydro</code>, and the values they accept are checked separately.</li>
-        <li>Unknown keys, wrong types, out-of-range values, and unsupported block combinations are input errors. A typo does not silently fall back to a default. The exception is a small number of keys that are accepted for compatibility, draw a WARNING, and do nothing (<a href="#validation-defaults">Validation and defaults</a>).</li>
-        <li>The keys below are entry points, not complete lists. This page's tables deliberately omit defaults; the per-kernel pages list selected defaults, and where they disagree with SPECIFICATION §9.1, §9.1 is authoritative.</li>
+        <li><strong>11 blocks:</strong> The 11 <a href="#terms-block">blocks</a>, from <code>Main</code> through <code>Parallel</code>, divide case identity, mesh, materials, initialization, physics, numerics, and output responsibilities.</li>
+        <li><strong>Nested sub-blocks:</strong> A key whose value is a dict is a <a href="#terms-block">sub-block</a> with its own set of keys. For example, <code>Numerics.dt.max_s</code> and <code>Numerics.hydro.av_C2</code> are keys of different sub-blocks, <code>dt</code> and <code>hydro</code>, and the values they accept are checked separately.</li>
+        <li><strong>Strict input validation:</strong> Unknown keys, wrong types, out-of-range values, and unsupported block combinations are input errors. A typo does not silently fall back to a default. The exception is a small number of keys that are accepted for compatibility, draw a WARNING, and do nothing (<a href="#validation-defaults">Validation and defaults</a>).</li>
+        <li><strong>Orientation map:</strong> The keys below are entry points, not complete lists. This page's tables deliberately omit defaults; the per-kernel pages list selected defaults, and where they disagree with SPECIFICATION §9.1, §9.1 is authoritative.</li>
       </ul>
     </aside>
 
@@ -48,7 +48,7 @@
 
     <section aria-labelledby="block-map">
       <h2 id="block-map">Block map</h2>
-      <p>A deck normally imports <code>tenryu_namelist</code> and calls each <a href="#terms-block">block function</a> once. <code>Material(...)</code> returns a dict; collect these dicts and register them through <code>Materials(materials=[...])</code>. <code>LaserBeam(...)</code> also returns a dict; pass these through <code>Laser.beams</code>. The “representative keys” column is a search index. Detailed nested schemas and mode-specific exclusions remain in the specification.</p>
+      <p>A deck normally imports <code>tenryu_namelist</code> and calls each <a href="#terms-block">block function</a> once. <code>Material(...)</code> returns a dict; collect these dicts and register them through <code>Materials(materials=[...])</code>. <code>LaserBeam(...)</code> also returns a dict; pass these through <code>Laser.beams</code>. The "representative keys" column is a search index. Detailed nested schemas and mode-specific exclusions remain in the specification.</p>
       <table class="quick-facts">
         <thead>
           <tr><th>Block / sub-block</th><th>Purpose</th><th>Representative keys</th></tr>

@@ -20,7 +20,8 @@
 
     <section aria-labelledby="products">
       <h2 id="products">生成物の輸送と電子・イオン分配</h2>
-      <p>既定の <code>scheme="fraley"</code> は、Fraley による α 粒子の飛程の近似式と、点源球の核を使う [1]（<a href="#terms-fraley">点源球の核と保持率</a>）。燃料球の面密度と発生半径から局所の保持率を求め、保持された分を発生したセルへ、残りを荷電粒子の逸出台帳へ送る。<code>scheme="diffusion"</code> は Corman 1975 の多群方程式 [3] により、6 種類の生成物 — チャネル別の荷電生成物である DT の α、DD の陽子・三重陽子（triton）・ヘリオン（helion。³He の原子核）、D³He の陽子と α — について<a href="#terms-ledger">飛行中</a>の比スペクトルを追跡し、群間の減速で失うエネルギーを沈着させる。<code>scheme="mc"</code> は、Yuan らの Monte Carlo 追跡 [4] と同じ型の、直線的に進む連続減速近似の粒子をステップをまたいで保持し、生成物・セル・ステップあたり <code>mc_particles_per_cell</code> 個を標本化する。モンテカルロの集計は統計的だが、各粒子のカウンタ型乱数（counter-based random number generator）の Philox 列（Philox4x32-10）は大域 ID によって独立に決まる。<code>local</code> は 2D RZ 専用で（1D では拒否される）、生成物のエネルギーを輸送せず、発生セルへ全量沈着する（電子・イオンへの分配は他の方式と共通）。</p>
+      <p>既定の <code>scheme="fraley"</code> は、Fraley による α 粒子の飛程の近似式と、点源球の核を使う [1]（<a href="#terms-fraley">点源球の核と保持率</a>）。燃料球の面密度と発生半径から局所の保持率を求め、保持された分を発生したセルへ、残りを荷電粒子の逸出台帳へ送る。<code>scheme="diffusion"</code> は Corman 1975 の多群方程式 [3] により、6 種類の生成物 — チャネル別の荷電生成物である DT の α、DD の陽子・三重陽子（triton）・ヘリオン（helion。³He の原子核）、D³He の陽子と α — について<a href="#terms-ledger">飛行中</a>の比スペクトルを追跡し、群間の減速で失うエネルギーを沈着させる。</p>
+      <p><code>scheme="mc"</code> は、Yuan らの Monte Carlo 追跡 [4] と同じ型の、直線的に進む連続減速近似の粒子をステップをまたいで保持し、生成物・セル・ステップあたり <code>mc_particles_per_cell</code> 個を標本化する。モンテカルロの集計は統計的だが、各粒子のカウンタ型乱数（counter-based random number generator）の Philox 列（Philox4x32-10）は大域 ID によって独立に決まる。<code>local</code> は 2D RZ 専用で（1D では拒否される）、生成物のエネルギーを輸送せず、発生セルへ全量沈着する（電子・イオンへの分配は他の方式と共通）。</p>
       <p>局所沈着に対する既定の分配 <code>partition="li_petrasso"</code> は、初期化時に Li–Petrasso の阻止能を \(T_e,T_i,n_e\) の表にし、実行中は補間だけを行う。もう一方の <code>fraley</code> は \(f_i=1/(1+32/T_e[\mathrm{keV}])\) で DT の α 粒子に限られ、<code>scheme</code> が <code>fraley</code> か <code>local</code> のとき、DD や D³He との併用は拒否される。Fraley の式は DT の α 粒子に対する近似で、反跳した D と T のエネルギーを電子とイオンへ分配できないので、中性子加熱（<code>neutron_heating</code>）との併用も拒否される。多群拡散とモンテカルロは、それぞれ自身の阻止の計算に分配を含んでいるため、このキーを使わない。</p>
 
       <figure>
@@ -66,7 +67,7 @@
           <tr><th><code>scheme</code></th><td><code>"fraley"</code></td><td>荷電生成物の輸送方式。1D は <code>fraley</code>、<code>diffusion</code>、<code>mc</code>、2D RZ は <code>local</code>、<code>diffusion</code>。2D では既定の <code>fraley</code> が拒否されるので、省略できず、明示する。</td></tr>
           <tr><th><code>partition</code></th><td><code>"li_petrasso"</code></td><td>局所沈着の電子・イオン分配。もう一方の <code>fraley</code> は DT の α 粒子専用で、<code>neutron_heating</code> とも併用できない。</td></tr>
           <tr><th><code>vf_threshold</code></th><td><code>1e-3</code></td><td>燃料セルを見分けるしきい値（0 より大きく 1 より小さい値）。燃料材料の体積分率の和がこの値を超えるセルが燃料セルである。1D では、燃料セルの最内と最外のセルのあいだのセルだけが反応し、最外セルの外縁が燃料球（<a href="#terms-fraley">用語</a>）の半径になる。2D では、燃料セルだけが反応する。</td></tr>
-          <tr><th><code>diffusion_groups / diffusion_E_min_keV</code></th><td><code>30 / 20.0</code></td><td>荷電粒子拡散の群数と、群格子の下端：これを下回るまで減速した生成物は、残りのエネルギーをその場に付与する。既定の 20 keV は MeV 級の生成エネルギーよりはるかに低く、これより下で残る飛程は無視できる。</td></tr>
+          <tr><th><code>diffusion_groups / diffusion_E_min_keV</code></th><td><code>30 / 20.0</code></td><td>荷電粒子拡散の群数と、群格子の下端。これを下回るまで減速した生成物は、残りのエネルギーをその場に付与する。既定の 20 keV は MeV 級の生成エネルギーよりはるかに低く、これより下で残る飛程は無視できる。</td></tr>
           <tr><th><code>mc_particles_per_cell</code></th><td><code>16</code></td><td>モンテカルロの、生成物・セル・ステップあたりの標本数。</td></tr>
         </tbody>
       </table>

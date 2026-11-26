@@ -16,9 +16,10 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>LPI（レーザープラズマ相互作用）</h1>
-    <p class="abstract">レーザープラズマ相互作用（laser–plasma interaction、LPI）は、レーザー光とプラズマの波が結合して、逆制動輻射（inverse bremsstrahlung、IB）による吸収とは別の経路でエネルギーを移す過程の総称である。TENRYU が扱う LPI の効果は 2 つある。交差するビームのあいだでイオン音波（ion-acoustic wave）を介して光のパワーを移す交差ビームエネルギー転送（cross-beam energy transfer、CBET）と、四分の一臨界密度付近の不安定性が作るホット電子（hot electron）の生成、輸送、物質へのエネルギー付与である。どちらも<a href="../laser/index.html">レーザー演算子</a>の内部の処理である。CBET は光線のパワーを変える。ホット電子輸送はレーザーの捕獲記録にあるパワーを使って物質へエネルギーを付与する。波の成長や飽和、後方散乱（backscatter）の反射光は解かない。この頁は 2 つの効果の位置づけ、光線追跡との受け渡し、演算子の列の中での位置、1D と 2D RZ の対応、入口となるキーを説明する。各効果の式とアルゴリズムは子の頁で説明する。</p>
+    <p class="abstract">レーザープラズマ相互作用（laser–plasma interaction、LPI）は、レーザー光とプラズマの波が結合し、逆制動輻射（inverse bremsstrahlung、IB）による吸収とは別の経路でエネルギーを移す過程の総称である。TENRYU は 2 つの LPI 効果を扱う。交差するビーム間でイオン音波（ion-acoustic wave）を介して光のパワーを再配分する交差ビームエネルギー転送（cross-beam energy transfer、CBET）と、四分の一臨界密度（quarter-critical density）付近の不安定性から生じるホット電子（hot electron）の生成・輸送・物質へのエネルギー付与である。いずれも<a href="../laser/index.html">レーザー演算子</a>の内部の段であり、CBET が光線のパワーを書き換え、ホット電子輸送が光線からの捕獲記録にもとづいて物質へエネルギーを付与する。プラズマ波の成長と飽和、および後方散乱（backscatter）による反射光は解かない。この頁では、2 つの効果の位置づけ、光線追跡との受け渡し、演算子の列の中での位置、1D の対応、および入口となる主なキーを述べる。各効果の式とアルゴリズムは子の頁で説明する。</p>
     <div class="card-grid">
-      <a class="card" href="cbet.html"><h3>CBET</h3><p>交差するビームのあいだで、イオン音波を介して光のパワーを移す保存型の交換。ポートの配置と波長離調を扱う。</p></a>
+      <a class="card" href="cbet.html"><h3>CBET</h3><p>交差するビーム間でイオン音波を介して光のパワーを再配分する交換。ポート配置と波長離調を扱う。</p></a>
+      <a class="card" href="cbet-closed-forms.html"><h3>CBET の解析解による検証</h3><p>屈折のない一様プラズマでの 3 つの問題で、出射パワーとビン・区画の分布を解析解と比べる。</p></a>
       <a class="card" href="hot-electrons.html"><h3>ホット電子</h3><p>較正した変換効率とスペクトルによる、ホット電子の生成、輸送、物質の予熱。</p></a>
       <a class="card" href="hot-electrons-standard-problems.html"><h3>ホット電子の輸送の解析解による検証</h3><p>3 つの一次元問題でエネルギーの付与、逸出、飛行中の残量を解析解と比べる。</p></a>
     </div>
@@ -27,50 +28,52 @@
       <h2 id="scope">扱う効果と扱わない効果</h2>
       <p><strong>扱う効果。</strong>CBET とホット電子の 2 つである。</p>
       <ul>
-        <li><strong>CBET：</strong>2 本のビームのビートがポンデロモーティブ力（ponderomotive force）でイオン音波を駆動し、その音波を介して一方のビームから他方へパワーが移る。TENRYU は、線形・定常・強減衰（strongly damped）の局所平面波の利得 [1] でこの交換を評価し、1 回の交換でパワーの総和を保つ。波長離調（wavelength detuning）があるときは、イオン音波へ渡したパワーを符号付きの台帳 <code>E_cbet_iaw</code> に記録する。</li>
-        <li><strong>ホット電子：</strong>2 プラズモン崩壊（two-plasmon decay、TPD）と誘導ラマン散乱（stimulated Raman scattering、SRS）が作る高エネルギー電子を、較正した変換効率と温度で与える [2]。1D の<a href="hot-electrons.html#transport-deposition">輸送</a>では、電子の運動を直線の弦に射影する。衝突で電子が減速し、射影した飛程が短くなる。外面のシースは電子を標的内に戻すことができる。TPD と SRS は、生成源の機構（捕獲する密度、温度、角度帯の既定値）の違いとして現れる。</li>
+        <li><strong>CBET：</strong>2 本のビームのビートがポンデロモーティブ力（ponderomotive force）でイオン音波を駆動し、その音波を介して一方のビームから他方へパワーが移る。TENRYU は、線形・定常・強減衰（strongly damped）の局所平面波の利得 [1] でこの交換を評価する。従来の縮約（<code>geometry_mode="legacy"</code>）では対ごとの交換が反対称であり、波長離調（wavelength detuning）があるときは波作用（wave action）の不足分に相当するイオン音波への移行パワーを符号付き台帳 <code>E_cbet_iaw</code> に記録する。実際のポート配置を使う <code>port_section</code> では各状態の標本点で利得を個別に評価するため交換に保存残差が生じ、コースティック（caustic）付近の寄与がある場合はポンプ乗数で残差を抑え、残った残差を数値損失として台帳に記帳する。<code>port_section</code> では離調は共鳴位置の移動にのみ働き、<code>E_cbet_iaw</code> は 0 のままである。</li>
+        <li><strong>ホット電子：</strong>2 プラズモン崩壊（two-plasmon decay、TPD）と誘導ラマン散乱（stimulated Raman scattering、SRS）が作る高エネルギー電子を、較正した変換効率と温度で与える [2]。TPD と SRS の違いは、捕獲密度、温度、角度帯の既定値として生成源モデルに現れる。1D の<a href="hot-electrons.html#transport-deposition">輸送</a>では電子の運動を直線の弦に射影し、衝突による減速と散乱で射影飛程が短くなる。標的の外面に達した電子は、外面のシース（sheath）によって標的内へ反射され得る。</li>
       </ul>
-      <p><strong>扱わない効果。</strong>実装で確かめた範囲で、次のものは含まない。</p>
+      <p><strong>扱わない効果。</strong>次の過程は含まない。</p>
       <ul>
-        <li>TPD・SRS の波の成長と飽和。ホット電子の変換効率 η(t) は較正した入力で、<code>eta_mode="model"</code> を選んでも、局所のプラズマ量で駆動する縮約した緩和の式であり、波の方程式は解かない。</li>
-        <li>SRS・SBS（誘導ブリルアン散乱、stimulated Brillouin scattering）の後方散乱で失われる反射光。散乱光の反射率を与えるキーも、反射した光線を追跡する処理もない。CBET が SBS と同じ三波結合に基づくのは、相手のビームが種（seed）になる前方の交換に限る。</li>
-        <li>フィラメンテーション（filamentation）、自己集束（self-focusing）、スペックル（speckle）と波動光学（干渉、回折）。レーザーの経路は幾何光学の光線であり、コード内にこれらを扱う処理はない。</li>
-        <li>既定の従来の縮約（<code>geometry_mode="legacy"</code>。ポート配置を使わず、二つの光線のあいだの方位角について平均する扱い）での、コースティック（caustic。光線の族の包絡線で、幾何光学の強度が発散する所 [3]）の近くの強度の補正。<code>port_section</code>（実際のポート配置を使う再構成）は、コースティックの近くの強度の上限と、コースティックの近くの寄与がある場合に保存の残差を減らす<a href="cbet.html#multiplier">ポンプ乗数</a>を含む。どちらのモードも、コースティックの近くの波の場そのものは解かない。</li>
-        <li>スペックル統計、偏光のダイナミクス、広帯域の照射（<a href="cbet.html#mechanism">CBET の頁</a>に理由を書いている）。</li>
+        <li>TPD・SRS の波の成長と飽和。ホット電子の変換効率 η(t) は較正した入力であり、<code>eta_mode="model"</code> を選んでも局所のプラズマ量で駆動する縮約緩和式にとどまり、波の方程式は解かない。</li>
+        <li>SRS・SBS（誘導ブリルアン散乱、stimulated Brillouin scattering）の後方散乱で失われる反射光。散乱光の反射率を与えるキーはなく、雑音から生じる反射光線も追跡しない。CBET が SBS と同じ三波結合を使うのは、一方のビームが相手の種（seed）となる、追跡済みの交差ビーム間のパワー交換に限られる。</li>
+        <li>フィラメンテーション（filamentation）、自己集束（self-focusing）、スペックル（speckle）、および波動光学（干渉、回折）。レーザーの伝播は幾何光学の光線で扱い、これらを含めない。</li>
+        <li>既定の <code>legacy</code> でのコースティック付近の強度補正。コースティックは光線の族の包絡線であり、幾何光学の強度はそこで発散する [3]。<code>legacy</code> はポート配置を使わず、2 本の光線のあいだの方位角について平均する。<code>port_section</code> はコースティック付近の強度に上限を設け、その付近の寄与がある場合は<a href="cbet.html#multiplier">ポンプ乗数</a>で保存残差を減らす。どちらのモードも、コースティック付近の波の場そのものは解かない。</li>
+        <li>スペックル統計、偏光のダイナミクス、広帯域の照射（理由は<a href="cbet.html#mechanism">CBET の頁</a>を参照）。</li>
       </ul>
-      <p>結果は、指定した CBET 係数とホット電子の生成クロージャ（変換効率と温度）に対するプラズマの応答として読むこと。LPI の第一原理的な予測にはならない。</p>
+      <p>計算結果は、指定した CBET 係数とホット電子の生成クロージャ（変換効率と温度）に対するプラズマの応答として解釈すること。LPI の第一原理的な予測にはならない。</p>
     </section>
 
     <section aria-labelledby="laser-relation">
       <h2 id="laser-relation">光線追跡との関係</h2>
       <p>CBET は<a href="../laser/index.html">レーザー駆動と吸収</a>の光線追跡記録を使う。ホット電子は、動径吸収を含め、選択したレーザーの経路が作る捕獲記録を使う。</p>
       <ul>
-        <li><strong>受け取るもの（CBET）：</strong>光線が通ったセルごとの経路長と方向余弦、光線の初期パワー、ビームのグループ。これに加えて、流体の状態から、イオン温度、流速、平均質量数を読む。電子密度、電子温度、平均電離度は光線追跡が元から使う場である。</li>
-        <li><strong>受け取るもの（ホット電子）</strong> 生成源の位置と<a href="hot-electrons.html#scope-source">捕獲の規則</a>が定めるパワーを受け取る。捕獲の密度は既定で臨界密度の 1/4 であり、SRS ではモデルモードで 0.20、従来モードで 0.18 である。通常の 1D 光線追跡の区間では捕獲までの IB 吸収を先に適用する。臨界密度に達する区間では入口のパワーを使う。<code>radial_absorption_1d</code> ではセル中点の密度を調べ、条件を満たす最初のセルの外面と、そのセルに入るパワーを使う。</li>
-        <li><strong>返すもの（CBET）：</strong>交換後の光線のパワー。その後の IB 沈着は、交換を済ませたパワーで計算する。離調があるときは、イオン音波へ渡したパワーの台帳 <code>E_cbet_iaw</code> も返す。</li>
-        <li><strong>返すもの（ホット電子）</strong> 既定の <code>subtract_from_laser=True</code> では捕獲したパワーを光線から差し引く。セルごとの付与をレーザーの沈着に加える。1D の輸送台帳は逸出・未解決・飛行中のエネルギーも記録する。</li>
+        <li><strong>受け取るもの（CBET）：</strong>光線が通ったセルごとの経路長と方向余弦、光線の初期パワー、ビームのグループ。流体の状態からはイオン温度、流速、平均質量数を読む。電子密度、電子温度、平均電離度は光線追跡が元から使う場である。</li>
+        <li><strong>受け取るもの（ホット電子）：</strong>生成源の位置と<a href="hot-electrons.html#scope-source">捕獲の規則</a>が定めるパワー。捕獲密度の臨界密度に対する比は既定で 1/4 であり、SRS チャネルではモデルモードで 0.20、従来モードで 0.18 である。通常の 1D 光線追跡では区間入口から捕獲位置までの IB 吸収を先に適用し、臨界密度に達する区間では入口のパワーを使う。<code>radial_absorption_1d</code> ではセル中点の密度を調べ、条件を満たす最初のセルの外面と、そのセルに入るパワーを使う。</li>
+        <li><strong>返すもの（CBET）：</strong>交換後の光線パワー。その後の IB による沈着はこのパワーから計算する。<code>legacy</code> で波長離調があるときは、イオン音波へ渡したパワーの台帳 <code>E_cbet_iaw</code> も返す。</li>
+        <li><strong>返すもの（ホット電子）：</strong>既定の <code>subtract_from_laser=True</code> では捕獲したパワーを光線から差し引き、セルごとのホット電子の付与パワーを光による沈着パワーに加える。1D の輸送台帳は逸出・未解決・飛行中のエネルギーも記録する。</li>
       </ul>
-      <p>CBET とホット電子は、ふつう同じ実行で併用できない。併用できるのは、<code>Laser.cbet.geometry_mode="port_section"</code> と <code>Laser.hot_electron.eta_mode="model"</code> を同時に指定したときだけである。この組合せでは、ホット電子の捕獲が CBET の適用後の光線のパワーを使う。それ以外で両方を有効にすると、入力の検証がエラーで止める。この組合せを指定し、その時間刻みに捕獲チャネルがある場合に限り、光学側の検査は、光による付与パワー、未吸収光のパワー、捕獲したホット電子のパワー、イオン音波に渡したパワー、および CBET の交換残差の合計を入力レーザーパワーと比較する。これらの条件を満たさない 1D の時間刻みでは、CBET を使用していても通常のレーザー台帳を使う。この検査は、入力レーザーパワーから、付与パワー、未吸収光のパワー、ホット電子の逸出パワー、転送できなかったパワー、イオン音波に渡したパワー、および CBET の交換残差を差し引く。</p>
+      <p>CBET とホット電子は、<code>Laser.cbet.geometry_mode="port_section"</code> と <code>Laser.hot_electron.eta_mode="model"</code> を同時に指定した場合に限り併用できる。この設定では、ホット電子の捕獲に CBET 適用後の光線パワーを使う。別の組合せで両方を有効にすると、入力検証で停止する。</p>
+      <p>1D のレーザーパワー台帳には、構成に応じた 2 通りの閉じ方がある。<code>port_section</code> と <code>eta_mode="model"</code> を併用し、その時間刻みに有効な捕獲チャネルがある場合は、CBET の再伝播が終わった時点の捕獲パワーで光学側の収支を先に閉じ、ホット電子の付与・逸出・飛行中エネルギーの収支は輸送側の台帳で別途検査する。このとき光学側の台帳は、入力レーザーパワーを、光による沈着パワー、未吸収光パワー、ホット電子として捕獲されたパワー、イオン音波へ渡したパワー、および CBET の交換残差の合計と比較する。</p>
+      <p>それ以外の 1D の時間刻み（CBET のみが有効な場合を含む）では、光とホット電子の最終収支を通常のレーザー台帳 1 本でまとめて検査する。この台帳は入力レーザーパワーを、総沈着・付与パワー（光による沈着パワーとホット電子の付与パワーの和）、未吸収光パワー、ホット電子の逸出エネルギー・未解決エネルギー・飛行中エネルギーの符号付き変化の和を時間刻み幅で割ったパワー、受け取り先のセルがないパワー（転写先の流体セルがボイドまたは超臨界のため流体へ渡せなかったパワー）、イオン音波へ渡したパワー、および CBET の交換残差の合計と比較する。</p>
     </section>
 
     <section aria-labelledby="operator-order">
       <h2 id="operator-order">演算子の列の中での位置</h2>
-      <p>CBET もホット電子も、独立した演算子ではなく、レーザーの演算子の内部の段である。外側の 1 ステップの既定の列（Strang 型）では、レーザー、核燃焼、流体の前半、熱伝導、輻射、流体の後半の順に進む。レーザーの演算子は、光線の追跡、CBET の交換、ホット電子の捕獲・輸送・付与、そして IB の沈着とホット電子の付与パワーの電子エネルギーへの加算を含む。CBET とホット電子を併用するときは、初回の追跡も捕獲事象の位置で減耗を適用する。臨界密度に達する区間では事象までの光学的厚さを入口から 0 とする。CBET を解いた後の最終再計算で捕獲記録を輸送に渡す。列全体の分割の規律は<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>にある。</p>
-      <p>陽的な源項の制限 <code>"hot_electron"</code> は、セルの電子エネルギーを付与パワーで割った値から次の時間刻み幅を制限する。1D では付与パワー、体積、密度、電子エネルギーが正のセルで最小値をとる。CBET とホット電子はいずれも単一の MPI ランクで実行する。</p>
+      <p>CBET とホット電子はいずれも独立した演算子ではなく、レーザー演算子の内部の段である。外側の 1 ステップの既定の列（Strang 型）では、レーザー、核燃焼、流体の前半、熱伝導、輻射、流体の後半の順に進む。レーザー演算子は光線追跡、CBET の交換、ホット電子の捕獲・輸送・付与を担い、IB による沈着パワーとホット電子の付与パワーを電子エネルギーの源項に加える。CBET とホット電子を併用するときは、初回の光線追跡と CBET 求解後の再伝播のいずれでも捕獲位置で光線パワーを減らし（臨界密度に達する区間では区間入口から捕獲位置までの光学的厚さを 0 とする）、CBET 求解後の最終再伝播で作った捕獲記録をホット電子輸送へ渡す。列全体の分割は<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割と再クロージャの規律</a>を参照。</p>
+      <p>陽的な源項の制限 <code>"hot_electron"</code> は、セルの電子エネルギーをホット電子の付与パワーで割った値から次の時間刻み幅を制限する。1D では、付与パワー、体積、密度、電子エネルギーがすべて正のセルについてこの比の最小値をとる。CBET とホット電子はいずれも単一の MPI ランクで実行する。</p>
     </section>
 
     <section aria-labelledby="dimensions">
-      <h2 id="dimensions">1D と 2D RZ の対応</h2>
+      <h2 id="dimensions">1D の対応</h2>
       <table class="quick-facts">
         <thead>
-          <tr><th>効果</th><th>1D（<code>Main.dimension="1D_SPH"</code>）</th><th>2D RZ（<code>"2D_RZ"</code>）</th></tr>
+          <tr><th>効果</th><th>1D（<code>Main.dimension="1D_SPH"</code>）</th></tr>
         </thead>
         <tbody>
-          <tr><th>CBET</th><td><code>Mesh.geometry_1d="spherical"</code> と <code>Laser.mode="raytrace_2d"</code> が前提。<code>geometry_mode="port_section"</code>（単一の参照トレースを実際のポートの方向へ回転する再構成）か、従来形式の <code>"legacy"</code>（ビーム対の光線による交換。既定）を選べる。<code>port_section</code> は 1D 専用である。</td><td><code>Laser.mode="raytrace_3d"</code> が前提。<code>"legacy"</code> だけが使える。固定点反復の加速（<code>anderson_depth</code>）とワークスペースの上限（<code>workspace_limit_gib</code>）のキーは 2D 専用である。</td></tr>
-          <tr><th>ホット電子</th><td><code>Laser.mode</code> は <code>"radial_absorption_1d"</code> か <code>"raytrace_2d"</code>。角度分布は <code>"cone"</code>（既定）か <code>"radial"</code>。円筒幾何（<code>Mesh.geometry_1d="cylindrical"</code>）では <code>"cone"</code> を使えない。 平面円錐では <code>planar_inner_face</code> の明示が必要である。</td><td><code>Laser.mode="raytrace_3d"</code> が前提。角度分布は <code>"cone"</code> だけで、<code>"radial"</code> と <code>inner_bc</code> の変更は 1D 専用である。</td></tr>
+          <tr><th>CBET</th><td><code>Mesh.geometry_1d="spherical"</code> と <code>Laser.mode="raytrace_2d"</code> が前提。<code>geometry_mode="port_section"</code>（単一の参照トレースを実際のポートの方向へ回転する再構成）か、従来形式の <code>"legacy"</code>（ビーム対の光線による交換。既定）を選べる。<code>port_section</code> は 1D 専用である。</td></tr>
+          <tr><th>ホット電子</th><td><code>Laser.mode</code> は <code>"radial_absorption_1d"</code> か <code>"raytrace_2d"</code>。角度分布は <code>"cone"</code>（既定）か <code>"radial"</code>。円筒幾何（<code>Mesh.geometry_1d="cylindrical"</code>）では <code>"cone"</code> を使えない。平面円錐では <code>planar_inner_face</code> の明示が必要である。</td></tr>
         </tbody>
       </table>
-      <p>詳細な式とアルゴリズムを子の頁が説明するのは、CBET では 1D の <code>port_section</code>、ホット電子では 1D と 2D RZ の両方である。2D RZ の CBET の従来形式は、子の頁には載せていない。</p>
+      <p>子の頁は、1D の CBET の <code>port_section</code> とホット電子について、式とアルゴリズムを説明する。</p>
     </section>
 
     <section aria-labelledby="controls">
@@ -83,7 +86,7 @@
         <tbody>
           <tr><th><code>Laser.enabled</code></th><td>—</td><td>レーザーの演算子を有効にする。CBET とホット電子は、これが真のときだけ動く。</td></tr>
           <tr><th><code>Laser.cbet.enable</code></th><td><code>False</code></td><td>CBET を有効にする（<a href="cbet.html#controls">CBET の頁の表</a>）。</td></tr>
-          <tr><th><code>Laser.cbet.geometry_mode</code></th><td><code>"legacy"</code></td><td><code>"legacy"</code> か <code>"port_section"</code>。後者は <code>Laser.port_configuration.ports</code> とビームの原型 1 つが必要である。</td></tr>
+          <tr><th><code>Laser.cbet.geometry_mode</code></th><td><code>"legacy"</code></td><td><code>"legacy"</code> か <code>"port_section"</code>。後者は <code>Laser.port_configuration.ports</code> と <code>Laser.beams</code> のビーム 1 つが必要である。</td></tr>
           <tr><th><code>Laser.port_configuration</code></th><td>—</td><td>ポートの配置（<code>port_section</code> の入力）。</td></tr>
           <tr><th><code>Laser.hot_electron.enable</code></th><td><code>False</code></td><td>ホット電子を有効にする（<a href="hot-electrons.html#controls">ホット電子の頁の表</a>）。</td></tr>
           <tr><th><code>Laser.hot_electron.eta_hot</code>、<code>eta_hot_table</code>、<code>sources</code></th><td><code>0.0</code>、なし、なし</td><td>変換効率 η(t) の与え方。<code>sources</code> は最大 4 チャネルの機構別の指定である。</td></tr>

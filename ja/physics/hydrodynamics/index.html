@@ -16,15 +16,15 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>ラグランジュ流体 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU は、1D（<code>Mesh.geometry_1d</code> で選ぶ球・円筒・平面の各測度（measure））と 2D 軸対称（axisymmetric）RZ（円筒座標の R, Z）の幾何で、スタッガード配置（staggered grid）のラグランジュ法（Lagrangian method）により物質の運動を更新する。熱力学状態をセルに、運動学量（kinematic quantities）を節点（node）に置き、2D のエネルギー整合（compatible）な経路では、節点に働く力と内部エネルギーの更新に使う仕事を同一の離散力から構成して、全エネルギーを構成上保存する。この頁は流体の物理機構を述べ、空間離散化、時間積分、人工粘性と砂時計モードの制御、RZ 運動量スキーム、プラズマ粘性は下の 5 頁に分けて書く。</p>
+    <p class="abstract">TENRYU は、1D（<code>Mesh.geometry_1d</code> で選ぶ球・円筒・平面の各測度（measure））と 2D 軸対称（axisymmetric）RZ（円筒座標の R, Z）の幾何で、スタッガード配置（staggered grid）のラグランジュ法（Lagrangian method）により物質の運動を更新する。熱力学状態をセルに、運動学量（kinematic quantities）を節点（node）に置き、2D のエネルギー整合（compatible）な経路では、節点に働く力と内部エネルギーの更新に使う仕事を同一の離散力から構成して、全エネルギーを構成上保存する。この頁は流体の物理機構を述べ、空間離散化、時間積分、人工粘性と砂時計モードの制御、RZ 運動量スキーム、プラズマ粘性、標準問題による検証は下の 6 頁に分けて書く。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>スタッガードかつエネルギー整合な配置：セル中心に密度 ρ、比内部エネルギー e、圧力 P、温度 T を、節点に位置 x と速度 u を置く。</li>
-        <li><a href="discretization.html#terms-corner">コーナー質量とコーナー力</a>により、運動エネルギーと内部エネルギーの交換を構成上保存する。</li>
-        <li><code>midpoint_v1</code> は 2 次精度の中点法（midpoint method）で、修正を必ず 1 回だけ行う。<code>pc_v0</code> は従来の予測子–修正子法（predictor–corrector method）である。<code>time_integration</code> を省略したときの既定は、単一ブロック（single-block）メッシュで <code>midpoint_v1</code>、マルチブロック（multiblock）メッシュで <code>pc_v0</code> である（<a href="time-integration.html">時間積分</a>）。</li>
-        <li>1D の流体ステップは<a href="artificial-viscosity.html#csw98-1d">CSW98（Caramana–Shashkov–Whalen 1998）の人工粘性（artificial viscosity）</a>で衝撃波を捕捉する。 </li>
+        <li><strong>配置：</strong>スタッガードかつエネルギー整合な配置を採用し、セル中心に密度 ρ、比内部エネルギー e、圧力 P、温度 T を、節点に位置 x と速度 u を置く。</li>
+        <li><strong>保存：</strong><a href="discretization.html#terms-corner">コーナー質量とコーナー力</a>により、運動エネルギーと内部エネルギーの交換を構成上保存する。</li>
+        <li><strong>時間積分：</strong><code>midpoint_v1</code> は 2 次精度の中点法（midpoint method）で、修正を必ず 1 回だけ行う。<code>pc_v0</code> は従来の予測子–修正子法（predictor–corrector method）である。<code>time_integration</code> を省略したときの既定は、単一ブロック（single-block）メッシュで <code>midpoint_v1</code>、マルチブロック（multiblock）メッシュで <code>pc_v0</code> である（<a href="time-integration.html">時間積分</a>）。</li>
+        <li><strong>人工粘性：</strong>1D の流体ステップは<a href="artificial-viscosity.html#csw98-1d">CSW98（Caramana–Shashkov–Whalen 1998）の人工粘性（artificial viscosity）</a>で衝撃波を捕捉する。</li>
       </ul>
     </aside>
 
@@ -39,8 +39,8 @@
 
     <section aria-labelledby="mechanism">
       <h2 id="mechanism">物理機構</h2>
-      <p>ラグランジュ・メッシュ（Lagrangian mesh）は物質とともに動くため、物質界面と接触不連続（contact discontinuity）はセル間へ拡散せず、セルの境界上に留まる。収束する球殻は解像度を保ち、体積が 1000 倍圧縮されても物質とともにセルが圧縮されるだけで、離散化すべき移流項（advection term）も現れない。その代償が 2D でのメッシュ歪みである。ずり流れ（shear flow）と渦度（vorticity）は移動メッシュを絡ませることがあるが、その扱いは本ページではなく、対になる <a href="../ale/index.html">ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のページ</a>で述べる。</p>
-      <p>熱力学状態をセルに、運動学量を節点に置くのは、古典的な von Neumann のスタッガード配置である。Caramana–Burton–Shashkov–Whalen のエネルギー整合流体 [2] では、節点へ働くコーナー力とセルの \(p\,dV\) 仕事を、同じコーナーベクトル \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\)（\(c\) はセル、\(k\) はそのコーナーの番号）から構成する。こうすると「力 × 節点速度」で運動エネルギーが得る量と「圧力 × 体積変化率」で内部エネルギーが失う量が、同じ離散量の二通りの読み方になり（運動量式と内部エネルギー式が互いに転置 — 随伴（adjoint）— の関係）、運動エネルギーの変化と内部エネルギーの変化は恒等的に相殺する。その結果、全エネルギーは事後の補正によってではなく、構成上、丸め誤差（round-off error）の範囲まで保存される。RZ でも、回転体（solid of revolution）の体積の厳密な勾配を用いることで同じ考え方が成り立つ。</p>
+      <p>ラグランジュ・メッシュ（Lagrangian mesh）は物質とともに動くため、物質界面と接触不連続（contact discontinuity）はセル間へ拡散せず、セルの境界上に留まる。収束する球殻は解像度を保ち、体積が 1000 倍圧縮されても物質とともにセルが圧縮されるだけで、離散化すべき移流項（advection term）も現れない。その代償が 2D でのメッシュ歪みである。ずり流れ（shear flow）と渦度（vorticity）は移動メッシュを絡ませることがあるが、その扱いは本頁ではなく、対になる <a href="../ale/index.html">ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）の頁</a>で述べる。</p>
+      <p>熱力学状態をセルに、運動学量を節点に置くのは、古典的な von Neumann のスタッガード配置である。Caramana–Burton–Shashkov–Whalen のエネルギー整合流体 [2] では、節点へ働くコーナー力とセルの \(p\,dV\) 仕事を、同じコーナーベクトル \(\mathbf S_{c,k}=\partial V_c/\partial\mathbf x_{c,k}\)（\(c\) はセル、\(k\) はそのコーナーの番号）から構成する。こうすると「力 × 節点速度」で運動エネルギーが得る量と「圧力 × 体積変化率」で内部エネルギーが失う量が、同じ離散量の 2 通りの読み方になり（運動量式と内部エネルギー式が互いに転置 — 随伴（adjoint）— の関係）、運動エネルギーの変化と内部エネルギーの変化は恒等的に相殺する。その結果、全エネルギーは事後の補正によってではなく、構成上、丸め誤差（round-off error）の範囲まで保存される。RZ でも、回転体（solid of revolution）の体積の厳密な勾配を用いることで同じ考え方が成り立つ。</p>
       <p>粘性のないスタッガード法には、衝撃波が必要とするエントロピーを生成する機構がない。人工粘性は圧縮時にだけ散逸的な圧力を加え、強い衝撃波には 2 次項、弱い衝撃波の裾には線形項を働かせることで、数セルにわたって捕捉された衝撃波が跳躍条件（Rankine–Hugoniot jump conditions）を満たすようにする。スカラー vNR 粘性 [1] は方向を区別しないため、収束流やずり流れを過剰に減衰させる。CSW98 の<a href="artificial-viscosity.html#terms-edge-av">辺人工粘性</a>は、<a href="discretization.html#terms-median">メディアンメッシュ</a>（median mesh） — セル中心と各辺の中点を結ぶ線分が作る補助メッシュ — 上で辺ごとに圧縮を測り、制限関数（limiter）が自己相似圧縮（self-similar compression）・剛体回転・線形ずりでは散逸を無効にする。双一次四辺形にはさらに、セル平均の発散からは見えないゼロエネルギーの市松模様（checkerboard）、すなわち砂時計モードも生じる。<a href="artificial-viscosity.html#terms-subzonal-pressure">サブゾーン圧力</a>は、セル内で正味 0 となるコーナー力によってこれに抵抗する安定化機構であり、衝撃波捕捉用の人工粘性の代用ではない。</p>
       <p>2D RZ の単一ブロックメッシュの既定の積分器は、修正（corrector）を厳密に 1 回だけ行う中点法である。演算回数が固定されているため、許容誤差まで反復する修正子と違って、実行はビット単位（bitwise）で再現する。滑らかな流れでの精度次数（order of accuracy）の測定値（2026-07-27、検証デッキ <code>2d_rz_v3_smooth_temporal</code>）は、密度で \(p_\rho=2.0000\)、エネルギーで \(p_e=1.9999\) であり、従来の予測子–修正子法の約 1.0007 に対して 2 次である。従来法は圧縮の途中で古い圧力クロージャ（closure。密度と内部エネルギーから EOS で圧力などを求めること）を使うため、次数を 1 失う。ドライバ（driver）のレベルでは、<a href="../../overview/numerics-foundations.html#operator-splitting">演算子分割（operator splitting）</a>の中で、場に作用する演算子群を挟む 2 回の流体半ステップ（hydro half-step。ラグランジュ流体を、外側の 1 ステップの半分 \(\Delta t/2\) だけ進める演算子）として実行し、状態を読む各演算子の前に、EOS（equation of state、状態方程式）から温度・圧力・比熱を求め直す<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ（re-closure）</a>を行う。</p>
     </section>
@@ -49,7 +49,7 @@
       <h2 id="verification">検証</h2>
       <ul>
         <li><code>verify_gxii_1d_fld_regression</code> は現行の <a href="../../verification/index.html#gxii">GXII（激光 XII 号、GEKKO XII）</a>基準回帰試験で、吸収エネルギーと、履歴から得られる最大圧縮時刻、ピーク密度、面密度、中心温度を判定する。</li>
-        <li><a href="standard-problems.html">標準問題による検証</a> 平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存。</li>
+        <li><a href="standard-problems.html">標準問題による検証</a>では、平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存を検査する。</li>
       </ul>
     </section>
 

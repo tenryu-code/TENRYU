@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Three HDF5 kinds: snapshots <code>&lt;name&gt;_NNNN.h5</code>, the history <code>&lt;name&gt;_history.h5</code> (append-only), and checkpoints <code>&lt;name&gt;_ckpt_NNNN.h5</code>. Cadence fires on step-based (<code>plot_every</code> …) OR seconds-based (<code>plot_every_s</code> …) triggers.</li>
-        <li>Every numeric dataset carries a <code>units</code> attribute. <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to the internal State field names.</li>
-        <li>Stagnation peaks are short — about 15 ps in a <a href="../../verification/index.html#gxii">GXII (GEKKO XII)</a>-class laser implosion run of 2026-07-31 — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
-        <li>Re-running into the same output directory does not overwrite: results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
+        <li><strong>Three HDF5 kinds and cadence:</strong> Snapshots <code>&lt;name&gt;_NNNN.h5</code>, the history <code>&lt;name&gt;_history.h5</code> (append-only), and checkpoints <code>&lt;name&gt;_ckpt_NNNN.h5</code>. Cadence fires on step-based (<code>plot_every</code> …) OR seconds-based (<code>plot_every_s</code> …) triggers.</li>
+        <li><strong>Units and State mapping:</strong> Every numeric dataset carries a <code>units</code> attribute. <code>mesh/</code> and <code>hydro/</code> dataset names map 1:1 to the internal State field names.</li>
+        <li><strong>Reading stagnation peaks:</strong> Stagnation peaks are short — about 15 ps in a <a href="../../verification/index.html#gxii">GXII (GEKKO XII)</a>-class laser implosion run of 2026-07-31 — so peak values are read from the per-step history (<code>implosion/*</code>), not from snapshots.</li>
+        <li><strong>Automatic output numbering:</strong> Re-running into the same output directory does not overwrite: results go to a numbered sibling like <code>_001</code>. If "nothing changed", check the output location first.</li>
       </ul>
     </aside>
 
@@ -65,7 +65,7 @@
 
     <section aria-labelledby="terms">
       <h2 id="terms">Terms used in this page</h2>
-<p>The terms of provenance used on this page are defined below: provenance and the frozen configuration. The artificial terms of the energy ledger, the shell radius, thickness, IFAR, and convergence ratio, and the hotspot gas are defined in the <a href="history.html#terms">terms section of the History page</a>.</p>
+      <p>The terms of provenance used on this page are defined below: provenance and the frozen configuration. The artificial terms of the energy ledger, the shell radius, thickness, IFAR, and convergence ratio, and the hotspot gas are defined in the <a href="history.html#terms">terms section of the History page</a>.</p>
 
       <h3 id="terms-provenance">Provenance and the frozen configuration</h3>
       <p><strong>Provenance</strong> is the record that lets you check later which input and which execution environment produced an output. TENRYU keeps as provenance the copy of the deck <code>config/&lt;name&gt;_namelist.py</code> (<code>Output.save_namelist_copy</code>, default True), the frozen-configuration JSON <code>config/&lt;name&gt;_frozen.json</code> (<code>Output.save_frozen_config</code>, default True), the run summary <code>run_info.json</code>, the run log <code>log/tenryu.log</code>, and the <code>metadata/</code> group of each HDF5 file (the full deck text <code>namelist_source</code>, the frozen configuration <code>frozen_config</code>, the radiation group edges <code>group_bounds_eV</code>, and so on). It is the primary audit of what the run actually received, not of what you think you typed. The <a href="#provenance">provenance section</a> describes each file. When a restart is not an exact continuation of the original run, the root attribute <code>restart_provenance</code> records the mark so that the output of the restarted run can be told from that of a continued run. The group <code>diagnostics/ale_provenance/v1/</code>, whose name also contains "provenance", is a different record: it states whether the ALE settings followed the standard profile (see the tables on the <a href="history.html">History page</a>).</p>

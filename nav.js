@@ -130,7 +130,7 @@
           { id: "building", title: "ビルド", href: "use/building.html" },
           { id: "running", title: "シミュレーションの実行", href: "use/running.html" },
           { id: "namelist", title: "namelist リファレンス", href: "use/namelist.html" },
-          { id: "gui", title: "TENRYU Studio (GUI)", href: "use/gui.html" },
+          { id: "gui", title: "TENRYU Studio（GUI）", href: "use/gui.html" },
           { id: "examples", title: "例題とプリセット", href: "use/examples.html" },
           { id: "outputs", title: "出力と解析", href: "use/outputs/index.html" },
           { id: "outputs-snapshots", title: "スナップショット", href: "use/outputs/snapshots.html", parent: "outputs" },
@@ -171,7 +171,7 @@
           { id: "laser-absorption", title: "吸収と沈着", href: "physics/laser/absorption.html", parent: "laser" },
           { id: "laser-standard-problems", title: "レーザー光線追跡の解析解による検証", href: "physics/laser/standard-problems.html", parent: "laser" },
           { id: "lpi", title: "LPI（レーザープラズマ相互作用）", href: "physics/lpi/index.html" },
-          { id: "cbet", title: "CBET (交差ビームエネルギー転送)", href: "physics/lpi/cbet.html", parent: "lpi" },
+          { id: "cbet", title: "CBET（交差ビームエネルギー転送）", href: "physics/lpi/cbet.html", parent: "lpi" },
           { id: "cbet-closed-forms", title: "CBET の解析解による検証", href: "physics/lpi/cbet-closed-forms.html", parent: "lpi" },
           { id: "hot-electrons", title: "ホット電子", href: "physics/lpi/hot-electrons.html", parent: "lpi" },
           { id: "hot-electrons-standard-problems", title: "ホット電子の輸送の解析解による検証", href: "physics/lpi/hot-electrons-standard-problems.html", parent: "lpi" },
@@ -238,7 +238,7 @@
         breadcrumb: "Breadcrumb",
         previous: "Previous",
         next: "Next",
-        footer: "TENRYU documentation — 2026-11-24.",
+        footer: "TENRYU Documentation — 2026-11-24.",
         subtitle: "Radiation Hydrodynamics Code"
       };
 

@@ -35,7 +35,7 @@
           <tr><th><code>particles/</code>・<code>rng/</code></th><td>schema 1 のチェックポイントだけが持つ。<code>particles/</code> は退役したモンテカルロ輻射の粒子プールで、空なら読み、粒子があれば再開を拒否する。<code>rng/</code> は乱数状態で、再開では読まない。schema 2（2026-09-29）ではどちらも書かない。</td></tr>
         </tbody>
       </table>
-      <p>再開の互換規約: <code>schema_version</code>（現行は 2026-09-29 からの 2）が現行と同じなら通常読込、古い（または欠落）なら不足項目を既定値で補う後方互換読込、新しいなら読込拒否。チェックポイントの凍結設定（デッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定）が再開に使うデッキと一致しなければ、再開は拒否される。再開の指定方法は<a href="../running.html#restart">実行ページ</a>を参照のこと。</p>
+      <p>再開の互換規約は次のとおりである。<code>schema_version</code>（現行は 2026-09-29 からの 2）が現行と同じなら通常読込、古い（または欠落）なら不足項目を既定値で補う後方互換読込、新しいなら読込拒否である。チェックポイントの凍結設定（デッキ本文のハッシュと、<code>Main.restart_from</code> を除くすべての設定）が再開に使うデッキと一致しなければ、再開は拒否される。再開の指定方法は<a href="../running.html#restart">実行の頁</a>を参照のこと。</p>
     </section>
 
     <div id="page-footer"></div>

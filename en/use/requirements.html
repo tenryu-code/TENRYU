@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Required: an NVIDIA GPU plus CUDA Toolkit 12.x (12.0+), a C++20 compiler (GCC 12+ / Clang 15+), CMake 3.27+, Ninja, Python 3.10+ (with development headers), and the Boost headers.</li>
-        <li>By default the build targets the compute capabilities of the local GPUs that <code>nvidia-smi</code> reports at configure time; a host without a visible GPU falls back to <code>70;80;89;90</code> (a fatbin: one binary that carries the machine code for the four generations Volta, Ampere, Ada, and Hopper). Continuously exercised hardware: A100 (40/80 GB), RTX 4090, RTX 3090.</li>
-        <li>MPI (Message Passing Interface) and Hypre (a linear-solver library) are optional (default OFF); HDF5 and Python are default ON. The current version has no computation path that uses Hypre, so Hypre is normally not needed. The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically at configure time if missing — offline machines need them preinstalled. The Boost headers are never fetched automatically and must always be preinstalled.</li>
-        <li>All development and validation experience is on Linux x86_64; other operating systems are untested.</li>
+        <li><strong>Required:</strong> an NVIDIA GPU plus CUDA Toolkit 12.x (12.0+), a C++20 compiler (GCC 12+ / Clang 15+), CMake 3.27+, Ninja, Python 3.10+ (with development headers), and the Boost headers.</li>
+        <li><strong>Default CUDA architectures and exercised hardware:</strong> By default the build targets the compute capabilities of the local GPUs that <code>nvidia-smi</code> reports at configure time; a host without a visible GPU falls back to <code>70;80;89;90</code> (a fatbin: one binary that carries the machine code for the four generations Volta, Ampere, Ada, and Hopper). Continuously exercised hardware: A100 (40/80 GB), RTX 4090, RTX 3090.</li>
+        <li><strong>Optional dependencies and auto-fetch:</strong> MPI (Message Passing Interface) and Hypre (a linear-solver library) are optional (default OFF); HDF5 and Python are default ON. The current version has no computation path that uses Hypre, so Hypre is normally not needed. The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically at configure time if missing — offline machines need them preinstalled. The Boost headers are never fetched automatically and must always be preinstalled.</li>
+        <li><strong>Supported OS:</strong> All development and validation experience is on Linux x86_64; other operating systems are untested.</li>
       </ul>
     </aside>
 
@@ -65,7 +65,8 @@
           <tr><th>CLI11</th><td>2.4+</td><td>internal</td><td>The <code>run/verify/validate/freeze</code> subcommand CLI. Auto-fetched if missing.</td></tr>
         </tbody>
       </table>
-      <p><strong>About networking.</strong> Catch2, spdlog, CLI11, and pybind11 are downloaded by CMake's FetchContent at configure time when not found on the system, so the first <code>cmake</code> is easiest with internet access. On offline machines (e.g. compute nodes of a computing center), preinstall them or run the first configure where the network is available. CUDA, the Boost headers, HDF5, Python, MPI, and Hypre are never auto-fetched and must always be preinstalled.</p>
+      <h3>About networking</h3>
+      <p>Catch2, spdlog, CLI11, and pybind11 are downloaded by CMake's FetchContent at configure time when not found on the system, so the first <code>cmake</code> is easiest with internet access. On offline machines (e.g. compute nodes of a computing center), preinstall them or run the first configure where the network is available. CUDA, the Boost headers, HDF5, Python, MPI, and Hypre are never auto-fetched and must always be preinstalled.</p>
     </section>
 
     <section aria-labelledby="cmake-options">

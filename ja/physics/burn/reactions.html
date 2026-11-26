@@ -24,13 +24,13 @@
       <p><code>fuel_materials</code> は、在庫をもつ、ボイド（void。<a href="../eos-opacity/index.html#void-materials">定義</a>）でない材料の名前を選ぶ。<code>x_D</code>、<code>x_T</code>、<code>x_He3</code> はその初期の数分率（number fraction）で、3 つの値は非負かつ総和が 1 でなければならない。D、T、³He、⁴He、p の在庫を \(Y_s=n_s/\rho\) として保持し、反応率を評価するときだけ \(n_s=\rho Y_s\) を再構成する。これにより、純ラグランジュ運動のもとで在庫が保存され、膨張するセルで生成時の数密度を持ち越してしまう誤りを避けられる。</p>
       <p><code>screening="none"</code> は係数を 1 とする（遮蔽なし）。<code>salpeter</code> は電子を含む 2 温度のデバイ長（Debye length）による弱い遮蔽（weak screening）、<code>chugunov_dewitt</code> は剛体の電子背景（rigid electron background）を仮定した Chugunov–DeWitt 2009 の補間式（interpolation formula。文献 [3] の式 (A4)）を使う。前者の 2 温度化は TENRYU による拡張で（<a href="#terms-screening">用語</a>）、入力が正でない場合や有限でない場合は係数 1 へ戻り、弱結合（weak coupling）モデルからの逸脱を抑えるために、指数 \(h\)（遮蔽による反応率の増強は \(e^h\)）を \(h\le2\) に制限する。</p>
       <ul>
-        <li>\(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\) — 単位体積あたりのチャネル反応率で、反応物が同種の場合は \(\delta_{ij}=1\) が DD の 1/2 の因子を与える。</li>
-        <li>\(Y_s=n_s/\rho\) — ラグランジュ的な比在庫である。流体的な圧縮・膨張は、\(Y_s\) 自体ではなく \(n_s=\rho Y_s\) を変化させる。</li>
-        <li>温度の単位 — Bosch–Hale の近似式を評価する前に、TENRYU 内部のイオン温度を eV から keV へ一度だけ変換する。</li>
-        <li>近似式の適用範囲 — 下限（DT/DD は 0.2 keV、D³He は 0.5 keV）を下回ると反応率は 0、Bosch–Hale 近似式の適用上限 [1]（DT と DD 両分岐は 100 keV、D³He は 190 keV）を超えると頭打ちにする。<code>T_floor_keV</code> の既定値は 0.2 である。</li>
-        <li>遮蔽 — 選択した係数を、反応する対ごとの反応率係数へ掛ける。Salpeter は不正な入力に対して 1 へ戻り、弱結合モデルの指数 \(h\)（遮蔽による増幅は \(e^h\)）を \(h\le2\) に制限する。</li>
-        <li>Fraley の保持率 — 点源球の核が、燃料球の面密度と生成物の発生半径から局所の保持率を求める（<a href="products.html#terms-fraley">用語</a>）。</li>
-        <li>\(f_i=1/(1+32/T_e[\mathrm{keV}])\) — 任意選択の Fraley による電子・イオン分配で、設定検証により DT の α 粒子に限定される。</li>
+        <li><strong>\(r=n_i n_j\langle\sigma v\rangle/(1+\delta_{ij})\)：</strong>単位体積あたりのチャネル反応率で、反応物が同種の場合は \(\delta_{ij}=1\) が DD の 1/2 の因子を与える。</li>
+        <li><strong>\(Y_s=n_s/\rho\)：</strong>ラグランジュ的な比在庫である。流体的な圧縮・膨張は、\(Y_s\) 自体ではなく \(n_s=\rho Y_s\) を変化させる。</li>
+        <li><strong>温度の単位：</strong>Bosch–Hale の近似式を評価する前に、TENRYU 内部のイオン温度を eV から keV へ一度だけ変換する。</li>
+        <li><strong>近似式の適用範囲：</strong>下限（DT/DD は 0.2 keV、D³He は 0.5 keV）を下回ると反応率は 0、Bosch–Hale 近似式の適用上限 [1]（DT と DD 両分岐は 100 keV、D³He は 190 keV）を超えると頭打ちにする。<code>T_floor_keV</code> の既定値は 0.2 である。</li>
+        <li><strong>遮蔽：</strong>選択した係数を、反応する対ごとの反応率係数へ掛ける。Salpeter は不正な入力に対して 1 へ戻り、弱結合モデルの指数 \(h\)（遮蔽による増幅は \(e^h\)）を \(h\le2\) に制限する。</li>
+        <li><strong>Fraley の保持率：</strong>点源球の核が、燃料球の面密度と生成物の発生半径から局所の保持率を求める（<a href="products.html#terms-fraley">用語</a>）。</li>
+        <li><strong>\(f_i=1/(1+32/T_e[\mathrm{keV}])\)：</strong>任意選択の Fraley による電子・イオン分配で、設定検証により DT の α 粒子に限定される（<a href="products.html#products">荷電生成物の輸送と付与</a>）。</li>
       </ul>
     </section>
 

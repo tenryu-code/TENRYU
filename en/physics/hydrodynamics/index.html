@@ -16,15 +16,15 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>Lagrangian hydrodynamics <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU advances material motion with a staggered Lagrangian scheme in 1D — spherical, cylindrical, or planar measures via <code>Mesh.geometry_1d</code> — and 2D axisymmetric RZ geometry. Thermodynamic state lives in cells and kinematics lives at nodes; on the 2D compatible path, the force on a node and the work used by the internal-energy update are built from the same discrete force, so the total energy is conserved by construction. This page describes the physical mechanism of the hydrodynamics; spatial discretization, time integration, artificial viscosity and hourglass control, the RZ momentum schemes, and plasma viscosity are covered on the five pages below.</p>
+    <p class="abstract">TENRYU advances material motion with a staggered Lagrangian scheme in 1D — spherical, cylindrical, or planar measures via <code>Mesh.geometry_1d</code> — and 2D axisymmetric RZ geometry. Thermodynamic state lives in cells and kinematics lives at nodes; on the 2D compatible path, the force on a node and the work used by the internal-energy update are built from the same discrete force, so the total energy is conserved by construction. This page describes the physical mechanism of the hydrodynamics; spatial discretization, time integration, artificial viscosity and hourglass control, the RZ momentum schemes, plasma viscosity, and standard-problem verification are covered on the six pages below.</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Staggered compatible layout: cell-centered density ρ, specific internal energy e, pressure P, and temperature T, and node-centered position x and velocity u.</li>
-        <li><a href="discretization.html#terms-corner">Corner masses and corner forces</a> make the kinetic–internal energy exchange conservative by construction.</li>
-        <li><code>midpoint_v1</code> is a second-order midpoint scheme with exactly one corrector pass; <code>pc_v0</code> is the legacy predictor–corrector. When <code>time_integration</code> is omitted, the default is <code>midpoint_v1</code> on a single-block mesh and <code>pc_v0</code> on a multiblock mesh (<a href="time-integration.html">time integration</a>).</li>
-        <li>The 1D hydrodynamic step captures shocks with the <a href="artificial-viscosity.html#csw98-1d">CSW98 (Caramana–Shashkov–Whalen 1998) artificial viscosity</a>. </li>
+        <li><strong>Layout:</strong> Staggered compatible layout with cell-centered density ρ, specific internal energy e, pressure P, and temperature T, and node-centered position x and velocity u.</li>
+        <li><strong>Conservation:</strong> <a href="discretization.html#terms-corner">Corner masses and corner forces</a> make the kinetic–internal energy exchange conservative by construction.</li>
+        <li><strong>Time integration:</strong> <code>midpoint_v1</code> is a second-order midpoint scheme with exactly one corrector pass; <code>pc_v0</code> is the legacy predictor–corrector. When <code>time_integration</code> is omitted, the default is <code>midpoint_v1</code> on a single-block mesh and <code>pc_v0</code> on a multiblock mesh (<a href="time-integration.html">time integration</a>).</li>
+        <li><strong>Artificial viscosity:</strong> The 1D hydrodynamic step captures shocks with the <a href="artificial-viscosity.html#csw98-1d">CSW98 (Caramana–Shashkov–Whalen 1998) artificial viscosity</a>. </li>
       </ul>
     </aside>
 
@@ -49,7 +49,7 @@
       <h2 id="verification">Verification</h2>
       <ul>
         <li><code>verify_gxii_1d_fld_regression</code> is the active <a href="../../verification/index.html#gxii">GXII (GEKKO XII)</a> golden regression, gating absorbed energy and four history-based metrics: bang time (the time of maximum compression), peak density, areal density, and central temperature.</li>
-        <li><a href="standard-problems.html">Standard problems</a> — Comparisons with exact solutions for planar Sod, spherical Noh, and Kidder, with mesh convergence and mass and energy conservation.</li>
+        <li><a href="standard-problems.html">Standard problems</a> compares planar Sod, spherical Noh, and Kidder with exact solutions and checks mesh convergence as well as mass and energy conservation.</li>
       </ul>
     </section>
 

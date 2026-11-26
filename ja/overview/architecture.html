@@ -21,17 +21,17 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>主要な計算は GPU を第一とし、公式に対応するバックエンドは NVIDIA CUDA のみである。モジュールの依存は一方向とし、循環を作らない。</li>
-        <li>Python は入力を構築するときだけ実行し、関数は表または状態の配列へ<a href="../use/running.html#terms-freeze">凍結</a>する。時間ループから Python を呼ぶことはない（<a href="#fig-architecture-flow">図A</a>）。</li>
-        <li><code>Config</code> は、デッキから作る、実行中に変更しない設定である。<code>State</code> は、時間発展する場と<a href="numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>を所有する。連成ドライバは、1 ステップの試行が各演算子の判定をすべて通ったときだけ、状態と出力を確定する（受理（accept）。通らなかった試行は棄却（reject）して再試行する。<a href="numerics-foundations.html#terms-retry">全ステップの再試行（full-step retry）</a>参照）。</li>
-        <li>Studio はデッキを作って実行するアプリ、Scope は HDF5 の場と履歴を観察して比較する姉妹アプリである。</li>
+        <li><strong>GPU 第一と一方向の依存：</strong>主要な計算は GPU を第一とし、公式に対応するバックエンドは NVIDIA CUDA のみである。モジュールの依存は一方向とし、循環を作らない。</li>
+        <li><strong>初期化時のみの Python 実行：</strong>Python は入力を構築するときだけ実行し、関数は表または状態の配列へ<a href="../use/running.html#terms-freeze">凍結</a>する。時間ループから Python を呼ぶことはない（<a href="#fig-architecture-flow">図A</a>）。</li>
+        <li><strong>Config・State・連成ドライバの分離：</strong><code>Config</code> は、デッキから作る、実行中に変更しない設定である。<code>State</code> は、時間発展する場と<a href="numerics-foundations.html#energy-ledger">エネルギー台帳（energy ledger）</a>を所有する。連成ドライバは、1 ステップの試行が各演算子の判定をすべて通ったときだけ、状態と出力を確定する（受理（accept）。通らなかった試行は棄却（reject）して再試行する。<a href="numerics-foundations.html#terms-retry">全ステップの再試行（full-step retry）</a>参照）。</li>
+        <li><strong>2 つのデスクトップアプリ：</strong>Studio はデッキを作って実行するアプリ、Scope は HDF5 の場と履歴を観察して比較する姉妹アプリである。</li>
       </ul>
     </aside>
 
     <section aria-labelledby="principles-build">
       <h2 id="principles-build">設計原則とビルドの境界</h2>
-      <p>設計の第一原則は、GPU を第一に考えることである。流体、流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>）による輻射、レーザーの光線追跡（ray tracing）といった主要な計算を NVIDIA の GPU 上で実行し、CUDA 以外のバックエンドは公式の対象としない。大域的な MPI（Message Passing Interface）通信を抑えるための局所性（locality）、流体・輻射・レーザー・材料・メッシュ・連成・診断・入出力・ドライバのあいだの固定された依存の向き、そして同じ GPU・同じ構成に対する再現性（reproducibility）を、性能と同じ重みの要求として設計に課す。将来の 3D や追加の物理が、既存の境界を崩さずに入れられることも原則のひとつである。</p>
-      <p>計算のコアは C++20 と CUDA C++ で実装し、CMake (3.27 以上) と Ninja で構成する。基盤となる依存には、CUDA Toolkit 12.x (12.0 以上)、MPI 3.1 以上、HDF5 1.12 以上、Python 3.10 以上と pybind11 2.11 以上が含まれる — <a href="../use/building.html">ビルド</a>のページが表にしているものと同じ要件一式である。Python は、Smilei 形式の namelist で書かれたデッキを読み取るために埋め込んでいる環境であり、設定の生成が終わると関連するリソースを解放する。MPI は分散実行を担い、HDF5 の出力はランク（rank）0 が書く。物理モジュールは、モジュールのあいだで取り決めた入力と出力（引数のデータ構造と、呼び出しの前後で成り立つ条件）だけを介してやり取りし、互いの内部表現に直接依存することはない。</p>
+      <p>設計の第一原則は、GPU を第一に考えることである。流体、流束制限拡散（flux-limited diffusion、FLD）と離散座標法（discrete ordinates、S<sub>N</sub>）による輻射、レーザーの光線追跡（ray tracing）といった主要な計算を NVIDIA の GPU 上で実行し、CUDA 以外のバックエンドは公式の対象としない。大域的な MPI（Message Passing Interface）通信を抑えるための局所性（locality）、流体・輻射・レーザー・材料・メッシュ・連成・診断・入出力・ドライバのあいだの固定された依存の向き、そして同じ GPU・同じ構成に対する再現性（reproducibility）を、性能と同じ重みの要求として設計に課す。将来の 3D や追加の物理が、既存の境界を崩さずに入れられることも原則の 1 つである。</p>
+      <p>計算のコアは C++20 と CUDA C++ で実装し、CMake（3.27 以上）と Ninja で構成する。基盤となる依存には、CUDA Toolkit 12.x（12.0 以上）、MPI 3.1 以上、HDF5 1.12 以上、Python 3.10 以上と pybind11 2.11 以上が含まれる。これらは<a href="../use/building.html">ビルド</a>の頁が表にしている要件一式と同じである。Python は、Smilei 形式の namelist で書かれたデッキを読み取るために埋め込んでいる環境であり、設定の生成が終わると関連するリソースを解放する。MPI は分散実行を担い、HDF5 の出力はランク（rank）0 が書く。物理モジュールは、モジュールのあいだで取り決めた入力と出力（引数のデータ構造と、呼び出しの前後で成り立つ条件）だけを介してやり取りし、互いの内部表現に直接依存することはない。</p>
 
       <figure id="fig-architecture-flow">
         <img src="../../assets/overview-architecture-flow-ja.png" width="1040" height="670" style="max-width:100%;height:auto" alt="上段は初期化。TENRYU Studio が作るデッキ（Python ファイル）を凍結して Config と凍結した表にし、State を作る。下段は時間ループ。Δt の候補の最小と成長率の制限で Δt を選び、入口の状態を保存して、レーザー、核燃焼、流体（前半の半ステップ）、電子熱伝導、輻射、流体（後半の半ステップ）を順に実行する。受理なら HDF5 のスナップショット・履歴・チェックポイントを書き、棄却なら入口の状態へ戻して Δt を縮め、演算子の列全体をやり直す">
@@ -68,7 +68,8 @@
       <h2 id="config-state-driver">Config、State、連成ドライバ</h2>
       <p>デッキ（<code>.py</code>）は、CPython と pybind11 を介してビルダ（Builder）へ渡される。ビルダは型、必須の値、単位、範囲、場のあいだの不変条件を検証し、既定値を適用する。幾何を与える関数はメッシュ座標上の状態配列へ、レーザーの波形や時間に依存する境界温度は <code>FrozenTable1D</code> へ、それぞれ一括して評価される。実行した元のスクリプトと、純粋なデータに変換した凍結後の JSON は HDF5 に保存できるため、結果がどの入力から作られたのかを後から追跡できる。</p>
       <p><code>Config</code> は、この解析結果を保持するホスト側の中心的な構造体で、各モジュールの <code>init()</code> へ <code>const</code> 参照として渡される。GPU へは必要な場だけをコピーする。これに対し <code>State</code> は、メッシュ座標、密度、速度、2 温度（two-temperature）の内部エネルギー、圧力、輻射場、沈着量、エネルギー台帳など、ステップとともに変化する量を所有する。この分離により、「何を実行するか」と「いまどこまで進んだか」を混同せずに済む。</p>
-      <p>連成ドライバは<a href="../physics/index.html">物理カーネル</a>の寄せ集めではなく、時間発展の所有者である。時間刻みは、流体の CFL（Courant–Friedrichs–Lewy）条件、熱伝導、Braginskii 粘性（Braginskii viscosity）、核燃焼（nuclear burn）、ホット電子（hot electron）、混合セル（mixed cell）の圧力緩和（pressure relaxation。2D）の各上限と、利用者が指定する上限、次の出力時刻と終端時刻による制限のうち最小の値とし、前のステップからの増加率も制限する（輻射とレーザーは上限を提案しない。詳しくは<a href="timestep.html">時間刻み制御と CFL</a>）。続いて、レーザーの全ステップ、核燃焼の全ステップ、流体の半ステップ、熱伝導の全ステップ、輻射の全ステップ、流体の半ステップを順に呼び、各演算子のあとに必要な EOS の同期とハロー交換を挿入する。<a href="numerics-foundations.html#terms-retry">全ステップの再試行</a>を有効にした構成では、ステップ入口の状態をスナップショットとして保存し、流体の修正段、核燃焼、輻射、熱伝導のいずれかがステップを受理しなければ復元して、時間刻みを縮めて演算子分割の列全体をやり直す（縮める幅と回数の上限は<a href="timestep.html#global-rule">時間刻み制御と CFL</a>に述べる）。履歴、スナップショット、チェックポイント、累積のエネルギー集計は、ステップが受理されたあとにだけ書くので、棄却された試行が正式な出力になることはない。</p>
+      <p>連成ドライバは<a href="../physics/index.html">物理カーネル</a>の寄せ集めではなく、時間発展の所有者である。時間刻みは、流体の CFL（Courant–Friedrichs–Lewy）条件、熱伝導、Braginskii 粘性（Braginskii viscosity）、核燃焼（nuclear burn）、ホット電子（hot electron）、混合セル（mixed cell）の圧力緩和（pressure relaxation。2D）の各上限と、利用者が指定する上限、次の出力時刻と終端時刻による制限のうち最小の値とし、前のステップからの増加率も制限する（輻射とレーザーは上限を提案しない。詳しくは<a href="timestep.html">時間刻み制御と CFL</a>）。続いて、レーザーの全ステップ、核燃焼の全ステップ、流体の半ステップ、熱伝導の全ステップ、輻射の全ステップ、流体の半ステップを順に呼び、各演算子のあとに必要な EOS の同期とハロー交換を挿入する。</p>
+      <p><a href="numerics-foundations.html#terms-retry">全ステップの再試行</a>を有効にした構成では、ステップ入口の状態をスナップショットとして保存し、流体の修正段、核燃焼、輻射、熱伝導のいずれかがステップを受理しなければ復元して、時間刻みを縮めて演算子分割の列全体をやり直す（縮める幅と回数の上限は<a href="timestep.html#global-rule">時間刻み制御と CFL</a>に述べる）。履歴、スナップショット、チェックポイント、累積のエネルギー集計は、ステップが受理されたあとにだけ書くので、棄却された試行が正式な出力になることはない。</p>
     </section>
 
     <section aria-labelledby="device-memory">
@@ -81,7 +82,7 @@
       <h3>TENRYU Studio — デッキを作り、実行する</h3>
       <p>TENRYU Studio は、Tauri 2 と React / TypeScript によるフォーム形式のデッキ用 GUI（graphical user interface）である。材料、メッシュ、レーザー、輻射、数値解法、出力を画面から構成し、編集の状態を埋め込んだ Python のデッキをその場で生成して、行き来しながら編集できる。生成したデッキの検証、ローカルのファイル管理、システムの <code>ssh</code> / <code>scp</code> を介した設定済みサーバへの投入と実行状況の確認までを扱う。Studio はソルバの内部状態を別の形式で持つのではなく、CLI が受け付けるのと同じ、単一のデッキを生成する。</p>
       <h3>TENRYU Scope — 結果を見て、調べて、比べる</h3>
-      <p>TENRYU Scope は、HDF5 のスナップショットと履歴を観察することに特化した姉妹アプリである。ローカルのファイル、または Studio と共有するサーバのプロファイルから実行結果を開き、1D の分布、時系列、2D のテンソル格子や CSR (compressed sparse row 接続) のマルチブロックメッシュ上の場を描画する。2D の場のカラーマップ、線形・対数のレンジ、拡大縮小と平行移動、時刻のスクラブとアニメーション、ラインアウト（lineout）、レーザー光線の重ね描き、PNG / CSV / 動画の書き出しを備える。Studio による軽量な結果確認を置き換えるのではなく、大きな場の探索と、実行どうしの比較へ責務を分けている。</p>
+      <p>TENRYU Scope は、HDF5 のスナップショットと履歴を観察することに特化した姉妹アプリである。ローカルのファイル、または Studio と共有するサーバのプロファイルから実行結果を開き、1D の分布、時系列、2D のテンソル格子や CSR（compressed sparse row 接続）のマルチブロックメッシュ上の場を描画する。2D の場のカラーマップ、線形・対数のレンジ、拡大縮小と平行移動、時刻のスクラブとアニメーション、ラインアウト（lineout）、レーザー光線の重ね描き、PNG / CSV / 動画の書き出しを備える。Studio による軽量な結果確認を置き換えるのではなく、大きな場の探索と、実行どうしの比較へ責務を分けている。</p>
     </section>
 
     <div id="page-footer"></div>

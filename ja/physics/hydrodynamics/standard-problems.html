@@ -15,7 +15,7 @@
   <div id="sidebar"></div>
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
-    <h1>1D 流体の標準問題による検証<span class="badge">reference</span></h1>
+    <h1>1D 流体の標準問題による検証 <span class="badge">reference</span></h1>
 
     <section aria-labelledby="abstract">
       <h2 id="abstract">要旨</h2>
@@ -30,7 +30,7 @@
 
     <section aria-labelledby="setup">
       <h2 id="setup">計算の設定</h2>
-      <p>初期格子はすべて等間隔である。<a href="#fig-setup">図 A</a> は初期状態と Kidder の境界圧力の時間変化を示す。</p>
+      <p>初期格子はすべて等間隔である。<a href="#fig-setup">図A</a>は初期状態と Kidder の境界圧力の時間変化を示す。</p>
       <table class="quick-facts">
         <caption>表 1. 初期状態、境界条件、終了時刻。</caption>
         <thead><tr><th>問題</th><th>領域・初期状態</th><th>境界・終了時刻</th></tr></thead>
@@ -51,8 +51,8 @@
       <p>Kidder 問題で \(r_0\) は初期半径、\(\rho_0\) と \(p_0\) は初期密度と初期圧力、\(\rho_c\) と \(p_c\) は中心での初期値（1 g/cm³、10<sup>12</sup> erg/cm³）である。係数 \(\beta\) は 0.34 cm<sup>−2</sup>、\(R_0\) は初期外半径 1 cm、\(t\) は時刻、\(p_b\) は境界圧力、\(h(t)\) は半径の縮尺である。終了時刻は収縮時間 \(t_0\) の 0.9 倍で、縮尺は 0.4359、密度は初期値の 12.07 倍になる。</p>
       <p>各セルの質量は、初期セル内で密度を 8 点の Gauss–Legendre 求積（Gauss–Legendre quadrature）で体積積分して得る。数値計算と参照密度の計算には同じ保存質量を使う。試験では、すべての時間刻みが上限 10<sup>−8</sup> s を厳密に下回ることを確かめる。セル数を倍にするたびに時間刻みの回数もほぼ倍になる（1,412、2,745、5,417 回）。格子幅とともに平均時間刻みが縮み、空間と時間を同時に細分化する。</p>
       <figure id="fig-setup">
-        <img src="../../../assets/hydro1d-standard-problems-setup-ja.png" width="900" height="620" style="max-width:100%;height:auto" alt="(a) Sod、(b) Noh、(c) Kidder の初期状態と (d) Kidder の境界圧力と半径の縮尺。青実線と朱破線が各パネルの二つの量、灰色の点線が (d) の終了時刻。">
-        <figcaption>図 A. 計算の設定。青の実線は左の縦軸、朱の破線は右の縦軸に対応する。(a) Sod の初期密度と左側の初期圧力で規格化した圧力。(b) Noh の初期密度と固定した中心節点を除く内向きの速度。(c) Kidder の初期密度と中心の初期圧力で規格化した圧力。(d) Kidder の境界圧力を初期値で割った量（対数軸）と半径の縮尺。灰色の点線は終了時刻を示す。</figcaption>
+        <img src="../../../assets/hydro1d-standard-problems-setup-ja.png" width="900" height="620" style="max-width:100%;height:auto" alt="(a) Sod、(b) Noh、(c) Kidder の初期状態と (d) Kidder の境界圧力と半径の縮尺。青実線と朱破線が各パネルの 2 つの量、灰色の点線が (d) の終了時刻。">
+        <figcaption>図A. 計算の設定。青の実線は左の縦軸、朱の破線は右の縦軸に対応する。(a) Sod の初期密度と左側の初期圧力で規格化した圧力。(b) Noh の初期密度と固定した中心節点を除く内向きの速度。(c) Kidder の初期密度と中心の初期圧力で規格化した圧力。(d) Kidder の境界圧力を初期値で割った量（対数軸）と半径の縮尺。灰色の点線は終了時刻を示す。</figcaption>
       </figure>
     </section>
 
@@ -72,7 +72,7 @@
       \end{aligned}
       $$
       <p>Noh の解析解 [1, p. 104] で、\(R_s\) は衝撃波半径、\(u_0\) は初期速度、\(t\) は時刻、\(r\) は半径である。\(\rho\)、\(u\)、\(e\)、\(p\) は密度、半径方向速度、比内部エネルギー（specific internal energy）、圧力を表す。式の値は cgs 単位で、衝撃波前方の密度の式には初期密度 1 g/cm³ を代入している。初期速度は −1 cm/s である。終了時の衝撃波半径は 0.2 cm である。</p>
-      <p>Kidder の解析解は相似圧縮（homologous compression）である。すべての流体要素の半径が同じ比率で縮み、密度と圧力は次式で変わる [2, p. 54, Eqs. (2.2), (2.5), (2.7)]。</p>
+      <p>Kidder の解析解は相似圧縮（homologous compression）である。すべての流体要素の半径が同じ比率で縮み、密度と圧力は次式で変わる [2, p. 54, 式 (2.2)・(2.5)・(2.7)]。</p>
       $$
       r=r_0 h(t),\qquad \rho=\rho_0(r_0)/h(t)^3,\qquad p=p_0(r_0)/h(t)^{3\gamma}.
       $$
@@ -84,11 +84,11 @@
       \qquad t_0=\sqrt{\frac{\rho_c}{5\beta p_c}}.
       \end{aligned}
       $$
-      <p>1 行目は Kidder [2, Eq. (2.8)] の運動方程式である。\(h\) は半径の縮尺、\(\ddot h\) はその時間に関する 2 階微分、\(\gamma\) は比熱比、\(r_0\) は初期半径、\(\rho_0\) と \(p_0\) は初期密度と初期圧力である。\(dp_0/dr_0\) は初期圧力の半径微分である。2 行目は<a href="#setup">初期分布</a>を代入した結果であり、圧力と密度の中心初期値 \(p_c\)、\(\rho_c\) と係数 \(\beta\) から収縮時間 \(t_0\) が 7.67 × 10<sup>−7</sup> s と求まる。</p>
+      <p>1 行目は Kidder [2, 式 (2.8)] の運動方程式である。\(h\) は半径の縮尺、\(\ddot h\) はその時間に関する 2 階微分、\(\gamma\) は比熱比、\(r_0\) は初期半径、\(\rho_0\) と \(p_0\) は初期密度と初期圧力である。\(dp_0/dr_0\) は初期圧力の半径微分である。2 行目は<a href="#setup">初期分布</a>を代入した結果であり、圧力と密度の中心初期値 \(p_c\)、\(\rho_c\) と係数 \(\beta\) から収縮時間 \(t_0\) が 7.67 × 10<sup>−7</sup> s と求まる。</p>
       $$
       h(t)=\sqrt{1-(t/t_0)^2},\qquad u_b=-\frac{R_0 t}{t_0^2 h(t)}.
       $$
-      <p>初期に静止し、比熱比が 5/3 の場合の解である [2, Eq. (2.13)]。\(h(t)\) は時刻 \(t\) の半径の縮尺、\(t_0\) は収縮時間、\(R_0\) は初期外半径、\(u_b\) は外端の節点速度である。終了時の \(u_b\) は解析解で −2,692,093.7 cm/s、数値解でセル数の少ない順に −2,692,100.8、−2,692,095.5、−2,692,094.2 cm/s である。</p>
+      <p>初期に静止し、比熱比が 5/3 の場合の解である [2, 式 (2.13)]。\(h(t)\) は時刻 \(t\) の半径の縮尺、\(t_0\) は収縮時間、\(R_0\) は初期外半径、\(u_b\) は外端の節点速度である。終了時の \(u_b\) は解析解で −2,692,093.7 cm/s、数値解でセル数の少ない順に −2,692,100.8、−2,692,095.5、−2,692,094.2 cm/s である。</p>
     </section>
 
     <section aria-labelledby="measures">
@@ -112,7 +112,7 @@
       q_{\rm shock}=\frac{\ln(E_{200}/E_{800})}{\ln 4},\qquad q_{\rm Kidder}=\log_2(E_{\rm coarse}/E_{\rm fine}).
       $$
       <p>\(q_{\rm shock}\) は Sod または Noh の観測収束次数で、\(E_{200}\) と \(E_{800}\) は 200 セルと 800 セルの密度誤差である。\(q_{\rm Kidder}\) は Kidder の隣り合う格子対での次数で、\(E_{\rm coarse}\) と \(E_{\rm fine}\) は、密度、圧力、外半径の同じ量に対する粗い格子と細かい格子の誤差である。</p>
-      <p>不連続があると、手法の形式次数（formal order）が高くても、観測収束次数はしばしば 1 以下に下がる [4, §8.3.3.4]。Sod の下限 0.90 は 1 次から 10% 引いた値で、格子収束指数（grid convergence index）の算出で用いる観測次数と形式次数の一致の範囲を目安とした [4, §8.6.2, Table 8.1]。球対称 Noh の下限は 0.77 とする。Burnett ら [5, Table 3, Eq. (65)] が報告したロスアラモス国立研究所（Los Alamos National Laboratory）の FLAG の L1 収束次数は、理想気体で 0.900、Noble–Abel 気体で 0.771–1.045 である。Kidder の下限は 1.7 とする。Burton ら [6, Table 3 および Kidder の球の節] は、等エントロピー球殻の半径で 1.75–2.86、球の密度と圧力の L1 誤差で、一方の手法では 1.89–1.92、もう一方の手法では 1.11–1.19 を報告している。下限による片側の判定なので、形式次数を上回る観測次数も合格となる。</p>
+      <p>不連続があると、手法の形式次数（formal order）が高くても、観測収束次数はしばしば 1 以下に下がる [4, §8.3.3.4]。Sod の下限 0.90 は 1 次から 10% 引いた値で、格子収束指数（grid convergence index）の算出で用いる観測次数と形式次数の一致の範囲を目安とした [4, §8.6.2, 表 8.1]。球対称 Noh の下限は 0.77 とする。Burnett ら [5, 表 3、式 (65)] が報告したロスアラモス国立研究所（Los Alamos National Laboratory）の FLAG の L1 収束次数は、理想気体で 0.900、Noble–Abel 気体で 0.771–1.045 である。Kidder の下限は 1.7 とする。Burton ら [6, 表 3 および Kidder の球の節] は、等エントロピー球殻の半径で 1.75–2.86、球の密度と圧力の L1 誤差で、一方の手法では 1.89–1.92、もう一方の手法では 1.11–1.19 を報告している。下限による片側の判定なので、形式次数を上回る観測次数も合格となる。</p>
       <p>すべての実行で、所定の終了時刻に達すること、各セルの質量がビット単位で一致すること、<a href="#ledger">エネルギー保存の基準</a>を満たすことを確認する。Noh では初期内部エネルギーが厳密に 0 であること、Noh と Kidder では中心節点が固定されることも確認する。</p>
     </section>
 
@@ -133,21 +133,21 @@
           <tr><th scope="row">Kidder</th><td>288</td><td>5,417</td><td>0.2568 / 0.4174 / 0.03814</td><td>1.99 / 1.99 / 2.00</td><td>1.7</td><td>3.79 × 10<sup>−13</sup></td><td>6.34</td></tr>
         </tbody>
       </table>
-      <p><a href="#fig-sod">図 B</a> では、Sod の接触不連続面と衝撃波が数セルにわたって広がる。セルを細かくすると両者の遷移幅が狭くなる。</p>
+      <p><a href="#fig-sod">図B</a>では、Sod の接触不連続面と衝撃波が数セルにわたって広がる。セルを細かくすると両者の遷移幅が狭くなる。</p>
       <figure id="fig-sod">
         <img src="../../../assets/hydro1d-standard-problems-sod-ja.png" width="900" height="620" style="max-width:100%;height:auto" alt="Sod の (a) 密度、(b) 速度、(c) 圧力、(d) 密度の拡大図。黒線が解析解、青の白抜き丸が 200 セル、緑実線が 800 セル。(d) の朱の一点鎖線が 400 セル。灰色の点線は波の位置。">
-        <figcaption>図 B. 終了時の Sod 解。(a) 密度。(b) 速度。(c) 圧力。(d) 接触不連続面と衝撃波の近傍の密度。数値解の速度は節点、密度と圧力はセル中心に示す。黒の実線は解析解、青の白抜き丸は 200 セル、緑の細い実線は 800 セルである。(d) には 400 セルを朱の一点鎖線で加えた。灰色の縦の点線は左から希薄波扇の先端・後端、接触不連続面、衝撃波を示す。</figcaption>
+        <figcaption>図B. 終了時の Sod 解。(a) 密度。(b) 速度。(c) 圧力。(d) 接触不連続面と衝撃波の近傍の密度。数値解の速度は節点、密度と圧力はセル中心に示す。黒の実線は解析解、青の白抜き丸は 200 セル、緑の細い実線は 800 セルである。(d) には 400 セルを朱の一点鎖線で加えた。灰色の縦の点線は左から希薄波扇の先端・後端、接触不連続面、衝撃波を示す。</figcaption>
       </figure>
-      <p>Noh の衝撃波通過後、半径 \(0.1\,\mathrm{cm} \lt r \lt 0.18\,\mathrm{cm}\) の範囲の密度中央値は、200、400、800 セルで 62.13、63.06、63.53 g/cm³ となり、解析値 64 g/cm³ に近づく（<a href="#fig-noh">図 C</a>）。中心に接するセルの密度は 15.68–15.78 g/cm³、比内部エネルギーは 2.01–2.02 erg/g である。解析値はそれぞれ 64 g/cm³、0.5 erg/g であり、中心付近で過剰な加熱と密度の不足が生じる。</p>
+      <p>Noh の衝撃波通過後、半径 \(0.1\,\mathrm{cm} \lt r \lt 0.18\,\mathrm{cm}\) の範囲の密度中央値は、200、400、800 セルで 62.13、63.06、63.53 g/cm³ となり、解析値 64 g/cm³ に近づく（<a href="#fig-noh">図C</a>）。中心に接するセルの密度は 15.68–15.78 g/cm³、比内部エネルギーは 2.01–2.02 erg/g である。解析値はそれぞれ 64 g/cm³、0.5 erg/g であり、中心付近で過剰な加熱と密度の不足が生じる。</p>
       <p>Noh [1, p. 88] は、人工粘性が衝撃波を有限の幅に広げると壁面加熱誤差が生じうることを示した。球対称では中心付近の過剰加熱が 1000% に達する場合があり、その大きさは人工粘性の形に依存する [1, p. 104]。中心から連続して密度が 64 g/cm³ から 10% を超えて外れる範囲は、200、400、800 セルでそれぞれ 23、22、21 セル、外端の半径は 0.03024、0.01447、0.006917 cm である。格子幅が小さくなるとこの領域も縮む。密度誤差のノルムにはこの領域を含める。</p>
       <figure id="fig-noh">
         <img src="../../../assets/hydro1d-standard-problems-noh-ja.png" width="900" height="335" style="max-width:100%;height:auto" alt="半径 0.5 cm までの Noh の (a) 密度と (b) 比内部エネルギー。黒線は解析解、青の白抜き丸は 200、朱の一点鎖線は 400、緑実線は 800 セル。灰色点線は衝撃波半径。">
-        <figcaption>図 C. 終了時の Noh 解。(a) 密度。(b) 比内部エネルギー。黒の実線は解析解、青の白抜き丸は 200 セル、朱の一点鎖線は 400 セル、緑の実線は 800 セルである。灰色の縦の点線は解析解の衝撃波半径 0.2 cm を示す。黒線は、終了時に約 0.4 cm にある計算上の気体の外端より外側まで相似解を延長して示す。</figcaption>
+        <figcaption>図C. 終了時の Noh 解。(a) 密度。(b) 比内部エネルギー。黒の実線は解析解、青の白抜き丸は 200 セル、朱の一点鎖線は 400 セル、緑の実線は 800 セルである。灰色の縦の点線は解析解の衝撃波半径 0.2 cm を示す。黒線は、終了時に約 0.4 cm にある計算上の気体の外端より外側まで相似解を延長して示す。</figcaption>
       </figure>
-      <p>Kidder では滑らかな圧縮が続き、終了時の密度は約 12.1–18.7 g/cm³ である（<a href="#fig-kidder">図 D</a>）。</p>
+      <p>Kidder では滑らかな圧縮が続き、終了時の密度は約 12.1–18.7 g/cm³ である（<a href="#fig-kidder">図D</a>）。</p>
       <figure id="fig-kidder">
         <img src="../../../assets/hydro1d-standard-problems-kidder-ja.png" width="900" height="335" style="max-width:100%;height:auto" alt="Kidder の (a) 密度分布と (b) セル密度の相対誤差。(a) の黒実線は終了時の解析解、灰色点線は初期密度。青は 72、朱は 144、緑は 288 セル。(a) は白抜き丸・一点鎖線・実線、(b) は破線・一点鎖線・実線。">
-        <figcaption>図 D. Kidder の圧縮と密度誤差。(a) の黒実線は終了時の解析解、灰色の点線は初期分布である。青の白抜き丸、朱の一点鎖線、緑の実線は 72、144、288 セルである。(b) は、初期のセル中心半径に対する \( |\rho_i/\rho_{\rm ref,i}-1| \) を対数軸で示す。72、144、288 セルはそれぞれ青の破線、朱の一点鎖線、緑の実線である。</figcaption>
+        <figcaption>図D. Kidder の圧縮と密度誤差。(a) の黒実線は終了時の解析解、灰色の点線は初期分布である。青の白抜き丸、朱の一点鎖線、緑の実線は 72、144、288 セルである。(b) は、初期のセル中心半径に対する \( |\rho_i/\rho_{\rm ref,i}-1| \) を対数軸で示す。72、144、288 セルはそれぞれ青の破線、朱の一点鎖線、緑の実線である。</figcaption>
       </figure>
       <p>Kidder の解析解では速度が半径に比例する。隣接セルの速度勾配が等しくなるので、数値解でも<a href="artificial-viscosity.html#csw98-1d">制限関数の式</a>で使う勾配の比は 1 に近い。制限関数の値も 1 に近くなり、人工粘性による応力は小さい。</p>
       $$
@@ -158,10 +158,10 @@
 
     <section aria-labelledby="convergence">
       <h2 id="convergence">収束</h2>
-      <p><a href="#fig-convergence">図 E</a> に、セル数に対する相対誤差を示す。衝撃波を含む Sod と Noh の観測次数は 1 に近い。滑らかな Kidder では、3 つの誤差がいずれもセル数を 2 倍にするごとにほぼ 4 分の 1 に減る。</p>
+      <p><a href="#fig-convergence">図E</a>に、セル数に対する相対誤差を示す。衝撃波を含む Sod と Noh の観測次数は 1 に近い。滑らかな Kidder では、3 つの誤差がいずれもセル数を 2 倍にするごとにほぼ 4 分の 1 に減る。</p>
       <figure id="fig-convergence">
         <img src="../../../assets/hydro1d-standard-problems-convergence-ja.png" width="900" height="350" style="max-width:100%;height:auto" alt="セル数と相対誤差の両対数図。青の丸、朱の四角、緑の三角で系列を区別し、灰色の破線は傾きの目安。(a) は Sod と Noh、(b) は Kidder の密度、圧力、外半径。">
-        <figcaption>図 E. 格子収束。(a) Sod（青の丸）と Noh（朱の四角）の密度誤差。(b) Kidder の密度（青の丸）、圧力（朱の四角）、外半径（緑の三角）の誤差。実線は同じ系列の点を結び、凡例の括弧内は観測次数である。灰色の破線は(a) で傾き −1、(b) で −2 の目安である。</figcaption>
+        <figcaption>図E. 格子収束。(a) Sod（青の丸）と Noh（朱の四角）の密度誤差。(b) Kidder の密度（青の丸）、圧力（朱の四角）、外半径（緑の三角）の誤差。実線は同じ系列の点を結び、凡例の括弧内は観測次数である。灰色の破線は(a) で傾き −1、(b) で −2 の目安である。</figcaption>
       </figure>
     </section>
 
@@ -174,10 +174,10 @@
       <p>\(r\) は呼び出しごとの残差、\(E_{\rm before}\) と \(E_{\rm after}\) はその前後の総エネルギー（運動エネルギーと内部エネルギーの和）、\(\Delta E_{\rm ext}\) は流体演算への外部からのエネルギーの正味の流入、\(E_{\max}\) は各流体演算の前後に記録した総エネルギーの最大値である。和は実行中のすべての流体演算を対象とする。</p>
       <p>1D の外部入力には、境界圧力の仕事、速度を拘束した節点での仕事、下限処理（floors）によるエネルギーの追加、輻射圧の仕事が含まれる。ここで非ゼロなのは Kidder の境界圧力の仕事だけで、下限処理からの追加は全実行で 0 であった。</p>
       <p>Kidder の総エネルギーは初期の 1.010 × 10<sup>13</sup> erg から 6.577 × 10<sup>13</sup> erg に増えた。境界圧力の仕事の累積 5.568 × 10<sup>13</sup> erg が増加分に対応する。これらの値は 3 格子で有効数字 4 桁まで一致する。Sod と Noh の外部入力の累積は 0 で、総エネルギーはそれぞれ 1.3171 × 10<sup>12</sup> erg/cm² と 2.0944 erg で一定であった。Noh の値は、半径 1 cm の球が一様に 1 cm/s で内向きに動くときの運動エネルギー（約 2π/3 erg）から、固定した中心節点が動いた場合の寄与を引いた値である。</p>
-      <p>残差比の実測値は 9.5 × 10<sup>−14</sup> から 3.1 × 10<sup>−12</sup> であり、呼び出し 1 回当たり約 10<sup>−16</sup> と、倍精度の丸めの水準である（<a href="#fig-energy">図 F</a>）。判定上限の 10<sup>−6</sup> は、力と仕事の対応が崩れた場合にこれらの実行で生じる残差の見積りの最小値（\(E_{\max}\) の 5 × 10<sup>−5</sup>）より 50 倍小さく、累積丸め誤差の見積り（\(E_{\max}\) の 8 × 10<sup>−9</sup> 以下）より 100 倍以上大きい。どちらも計算の条件から解析的に見積もった値で、実行では測っていない。</p>
+      <p>残差比の実測値は 9.5 × 10<sup>−14</sup> から 3.1 × 10<sup>−12</sup> であり、呼び出し 1 回当たり約 10<sup>−16</sup> と、倍精度の丸めの水準である（<a href="#fig-energy">図F</a>）。エネルギー整合が崩れた欠陥を確実に検出しつつ倍精度丸めの累積による誤検出を避けるため、判定上限の 10<sup>−6</sup> は、力と仕事の対応が崩れた場合にこれらの実行で生じる残差の見積りの最小値（\(E_{\max}\) の 5 × 10<sup>−5</sup>）より 50 倍小さく、累積丸め誤差の見積り（\(E_{\max}\) の 8 × 10<sup>−9</sup> 以下）より 100 倍以上大きく設定している。どちらも計算の条件から解析的に見積もった値で、実行では測っていない。</p>
       <figure id="fig-energy">
         <img src="../../../assets/hydro1d-standard-problems-energy-ja.png" width="900" height="350" style="max-width:100%;height:auto" alt="流体演算の呼び出し回数とエネルギー残差比。Sod は青丸、Noh は朱の四角、Kidder は緑の三角。黒の水平線は上限、灰色の破線は倍精度の単位丸めの累積の目安。">
-        <figcaption>図 F. 実行ごとのエネルギー残差比と流体演算の呼び出し回数（時間刻みの回数の 2 倍）。青の丸は Sod、朱の四角は Noh、緑の三角は Kidder。黒の水平線は判定上限 10<sup>−6</sup>、灰色の破線は呼び出し回数 \(n\) に倍精度の単位丸め（unit roundoff）2<sup>−53</sup> を掛けた目安である。両軸は対数である。</figcaption>
+        <figcaption>図F. 実行ごとのエネルギー残差比と流体演算の呼び出し回数（時間刻みの回数の 2 倍）。青の丸は Sod、朱の四角は Noh、緑の三角は Kidder。黒の水平線は判定上限 10<sup>−6</sup>、灰色の破線は呼び出し回数 \(n\) に倍精度の単位丸め（unit roundoff）2<sup>−53</sup> を掛けた目安である。両軸は対数である。</figcaption>
       </figure>
     </section>
 
@@ -204,12 +204,12 @@ TENRYU_KIDDER_DIAG_NR=72 ./build/tenryu verify kidder</code></pre>
     <section aria-labelledby="references">
       <h2 id="references">参考文献</h2>
       <ol class="references">
-        <li>W. F. Noh, “Errors for calculations of strong shocks using an artificial viscosity and an artificial heat flux,” J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
-        <li>R. E. Kidder, “Theory of homogeneous isentropic compression and its application to laser fusion,” Nucl. Fusion 14, 53–60 (1974). <a href="https://doi.org/10.1088/0029-5515/14/1/008">doi:10.1088/0029-5515/14/1/008</a></li>
-        <li>A. E. Mattsson and W. J. Rider, “Artificial viscosity: back to the basics,” Int. J. Numer. Methods Fluids 77, 400–417 (2015). <a href="https://doi.org/10.1002/fld.3981">doi:10.1002/fld.3981</a></li>
+        <li>W. F. Noh, "Errors for calculations of strong shocks using an artificial viscosity and an artificial heat flux," J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
+        <li>R. E. Kidder, "Theory of homogeneous isentropic compression and its application to laser fusion," Nucl. Fusion 14, 53–60 (1974). <a href="https://doi.org/10.1088/0029-5515/14/1/008">doi:10.1088/0029-5515/14/1/008</a></li>
+        <li>A. E. Mattsson and W. J. Rider, "Artificial viscosity: back to the basics," Int. J. Numer. Methods Fluids 77, 400–417 (2015). <a href="https://doi.org/10.1002/fld.3981">doi:10.1002/fld.3981</a></li>
         <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
-        <li>S. C. Burnett, K. G. Honnell, S. D. Ramsey, and R. L. Singleton Jr., “Verification Studies for the Noh Problem Using Nonideal Equations of State and Finite Strength Shocks,” J. Verif. Valid. Uncert. Quantif. 3, 021002 (2018). <a href="https://doi.org/10.1115/1.4041195">doi:10.1115/1.4041195</a></li>
-        <li>D. E. Burton, N. R. Morgan, T. C. Carney, and M. A. Kenamond, “Reduction of dissipation in Lagrange cell-centered hydrodynamics (CCH) through corner gradient reconstruction (CGR),” J. Comput. Phys. 299, 229–280 (2015). <a href="https://doi.org/10.1016/j.jcp.2015.06.041">doi:10.1016/j.jcp.2015.06.041</a></li>
+        <li>S. C. Burnett, K. G. Honnell, S. D. Ramsey, and R. L. Singleton Jr., "Verification Studies for the Noh Problem Using Nonideal Equations of State and Finite Strength Shocks," J. Verif. Valid. Uncert. Quantif. 3, 021002 (2018). <a href="https://doi.org/10.1115/1.4041195">doi:10.1115/1.4041195</a></li>
+        <li>D. E. Burton, N. R. Morgan, T. C. Carney, and M. A. Kenamond, "Reduction of dissipation in Lagrange cell-centered hydrodynamics (CCH) through corner gradient reconstruction (CGR)," J. Comput. Phys. 299, 229–280 (2015). <a href="https://doi.org/10.1016/j.jcp.2015.06.041">doi:10.1016/j.jcp.2015.06.041</a></li>
       </ol>
     </section>
 

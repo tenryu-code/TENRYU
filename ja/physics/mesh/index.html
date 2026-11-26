@@ -16,15 +16,15 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>メッシュと幾何</h1>
-    <p class="abstract">TENRYU の計算領域は、1D の半径方向の格子、または 2D 軸対称 RZ（axisymmetric R–Z）のメッシュとして構築する。1D は一様（uniform）または傾斜配置（graded zoning）のゾーニングと、球・円筒・平面の測度（measure。体積と面積の取り方）を備え、デッキ（deck。<a href="../../use/namelist.html#terms-deck">TENRYU の入力となる Python ファイル</a>）は、材料の領域（region。体積分率（volume fraction）を座標の関数として <code>Geometry.volfrac</code> で指定する。<a href="1d.html#terms-region">領域と体積分率</a>）、前駆プラズマ（preformed plasma）のコロナ、外側の<a href="../eos-opacity/index.html#void-materials">ボイド</a>（void）セルを割り当てる。2D は、構造矩形（structured rectangular）、球面極座標（spherical-polar half-plane）、箱の中の極座標（polar-in-box）、そして CSR（compressed sparse row）接続によるマルチブロック（multiblock）の各メッシュ族（mesh family）を備え、どのメッシュ族からも、物理カーネルへ、セルの RZ 体積、コーナー（corner。<a href="../hydrodynamics/discretization.html#terms-corner">流体のページ</a>で定義する）の幾何、節点（node）・セル・面の接続関係（mesh topology）の 3 つを同じ形で渡す。メッシュの品質を表す量（<a href="#terms-admissibility">許容性の判定</a>（admissibility check）、<a href="#terms-corner-jacobian">コーナーヤコビアン</a>（corner Jacobian）、<a href="#terms-gauss-jacobian">ガウス点ヤコビアン</a>（Gauss-point Jacobian）、<a href="#terms-axis-margin">軸マージン</a>（axis margin））は<a href="#terms">用語の節</a>で定義する。</p>
+    <p class="abstract">TENRYU の計算領域は、1D の半径方向の格子、または 2D 軸対称 RZ（axisymmetric R–Z）のメッシュとして構築する。1D は一様（uniform）または傾斜配置（graded zoning）のゾーニングと、球・円筒・平面の測度（measure。体積と面積の取り方）を備える。<a href="../../use/namelist.html#terms-deck">デッキ（deck）</a>は、材料の領域（<code>Geometry.volfrac</code> による体積分率の分布。<a href="1d.html#terms-region">領域と体積分率</a>）、前駆プラズマ（preformed plasma）のコロナ、外側の<a href="../eos-opacity/index.html#void-materials">ボイド</a>（void）セルを割り当てる。2D は、構造矩形（structured rectangular）、球面極座標（spherical-polar half-plane）、箱の中の極座標（polar-in-box）、および CSR（compressed sparse row）接続によるマルチブロック（multiblock）の各メッシュ族（mesh family）を備え、いずれからも物理カーネルへセルの RZ 体積、<a href="../hydrodynamics/discretization.html#terms-corner">コーナー（corner）</a>の幾何、節点（node）・セル・面の接続関係（mesh topology）の 3 つを同じ形で渡す。メッシュ品質の指標（<a href="#terms-admissibility">許容性の判定</a>、<a href="#terms-corner-jacobian">コーナーヤコビアン</a>、<a href="#terms-gauss-jacobian">ガウス点ヤコビアン</a>、<a href="#terms-axis-margin">軸マージン</a>）は<a href="#terms">用語の節</a>で定義する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>1D では節点がセルの境界、セルが熱力学の状態を保持し、幾何の測度は球・円筒・平面から選ぶ。</li>
-        <li><code>uniform</code> は等間隔、<code>graded</code> は区間ごとのセルの重みと、境界での整合を使う。</li>
-        <li>デッキ生成 GUI の <a href="../../use/gui.html">TENRYU Studio</a> は、体積分率による同心の領域、熱伝導と輻射から除外されるボイド（void）セル（<a href="../eos-opacity/index.html#void-materials">ボイドの材料</a>）、レーザー標的用の単調なコロナ層を、デッキに生成できる。</li>
-        <li>2D の既定は構造化された四辺形（structured quadrilateral）である。極座標、箱の中の極座標、円錐殻（cone shell）、五角形帯（pentagon belt）は、明示的に有効化する論理格子（logical mesh）・マルチブロックのメッシュ族である。このうち箱の中の極座標（<code>polar_in_box</code>）と円錐殻（<code>cone_shell</code>）は、現行版ではメッシュの生成、初期化、ステップ 0 の出力までを扱い、時間発展を始めると <code>ConfigError</code> になる。</li>
+        <li><strong>1D の構造：</strong>節点がセルの境界、セルが熱力学の状態を保持し、幾何の測度は球・円筒・平面から選ぶ。</li>
+        <li><strong>1D ゾーニング：</strong><code>uniform</code> は等間隔、<code>graded</code> は区間ごとのセルの重みと、境界での整合を使う。</li>
+        <li><strong>Studio の生成：</strong>デッキ生成 GUI の <a href="../../use/gui.html">TENRYU Studio</a> は、体積分率による同心の領域、熱伝導と輻射から除外されるボイド（void）セル（<a href="../eos-opacity/index.html#void-materials">ボイドの材料</a>）、レーザー標的用の単調なコロナ層を、デッキに生成できる。</li>
+        <li><strong>2D メッシュ族：</strong>2D の既定は構造化された四辺形（structured quadrilateral）である。極座標、箱の中の極座標、円錐殻（cone shell）、五角形帯（pentagon belt）は、明示的に有効化する論理格子（logical mesh）・マルチブロックのメッシュ族である。このうち箱の中の極座標（<code>polar_in_box</code>）と円錐殻（<code>cone_shell</code>）は、現行版ではメッシュの生成、初期化、ステップ 0 の出力までを扱い、時間発展を始めると <code>ConfigError</code> になる。</li>
       </ul>
     </aside>
 
@@ -104,7 +104,7 @@
       q_c=\frac{\min_qJ_{c,q}}{\max\left(\max_qJ_{c,q},\ 10^{-30}\,\mathrm{cm^2}\right)}
       $$
       <p>\(q_c=1\) は平行四辺形で、セルが歪むほど小さくなり、\(J_{c,q}\) に負の値があれば \(q_c\le0\) になる。三角形や五角形のセルをもつメッシュでは、2×2 のガウス点が使えないので、コーナーヤコビアンから \(q_c\) を作る（単一ブロックでは \(\min_kJ_{c,k}/\max_kJ_{c,k}\)、マルチブロックでは各コーナーの \(J_{c,k}\) を 2 辺の長さの積で割った値の最小値）。</p>
-      <p>\(q_c\) は、ALE のリゾーンを起動する指標（\(\min_cq_c&lt;\)<code>Numerics.ale.quality_threshold</code>、既定 0.2）になる。\(J_{c,q}&lt;0\) は、リゾーン後の候補を受理しない条件のひとつである。ラグランジュ段の経路の判定には、始点の値に対する相対値（既定 \(10^{-8}\)）を下限とする \(J_{c,q}\) の判定がある。キーと既定値は<a href="#terms-admissibility">許容性の判定</a>の一覧にある。</p>
+      <p>\(q_c\) は、ALE のリゾーンを起動する指標（\(\min_cq_c&lt;\)<code>Numerics.ale.quality_threshold</code>、既定 0.2）になる。\(J_{c,q}&lt;0\) は、リゾーン後の候補を受理しない条件の 1 つである。ラグランジュ段の経路の判定には、始点の値に対する相対値（既定 \(10^{-8}\)）を下限とする \(J_{c,q}\) の判定がある。キーと既定値は<a href="#terms-admissibility">許容性の判定</a>の一覧にある。</p>
 
       <h3 id="terms-axis-margin">軸マージン</h3>
       <p><strong>軸マージン（axis margin）</strong>\(M_j\) は、軸（\(r=0\)）に接するセルが、節点の移動で反転せずにいられる余裕を表す量で、そのセルの 4 つのコーナーヤコビアンの最小値を、軸の節点が \(r=0\) に固定されていることを使って閉じた式で書いたものである。軸に接するセル行（\(i=0\)）のセル \(j\) の頂点は \((0,z_{0,j})\)、\((r_{1,j},z_{1,j})\)、\((r_{1,j+1},z_{1,j+1})\)、\((0,z_{0,j+1})\) で、添字は（半径方向、軸方向）の節点の番号である（<a href="#fig-mesh-quality-measures">図A</a>(c)）。</p>

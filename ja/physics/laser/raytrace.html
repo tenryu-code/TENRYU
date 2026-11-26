@@ -20,15 +20,16 @@
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
-      <p>TENRYU は光線の束を、以下の単位で進め、再利用する。ここに挙げる用語は、このページの計算、とくに TENRYU の実装に固有の意味で使うので、まとめて定義する。弦、環、打ち出し面、衝突径数は<a href="beams.html#terms">ビームの頁の用語の節</a>で定義する。</p>
+      <p>TENRYU は光線の束を、以下の単位で進め、再利用する。ここに挙げる用語は、この頁の計算、とくに TENRYU の実装に固有の意味で使うので、まとめて定義する。弦、環、打ち出し面、衝突径数は<a href="beams.html#terms">ビームの頁の用語の節</a>で定義する。</p>
 
       <h3 id="terms-march">行進と区間</h3>
-      <p><strong>行進（marching）</strong>は、光線の方程式（<a href="#chord-raytrace">次節</a>）を、刻み \(\Delta s\) ずつ進めて解く方法である（<code>Laser.raytrace.integrator="leapfrog"</code>）。刻みは、その位置の半径方向の節点の間隔に <code>Laser.raytrace.cfl_ray</code>（既定 0.8）を掛けた値を基準にして、経路に沿って適応的に変え（<a href="index.html#pipeline">手順</a>の 3）、1 本の光線は最大 <code>Laser.raytrace.max_steps</code> 回（既定、上限とも 100000）まで進む。行進は一般的な方法で、2D RZ の 3 次元の光線もこの方法で進める。1D 球対称の既定は特性曲線積分（<a href="#characteristic">その節</a>）で、行進の刻み幅による誤差と、転回点に近づくと刻みが細かくなる負荷がない。</p>
+      <p><strong>行進（marching）</strong>は、光線の方程式（<a href="#chord-raytrace">次節</a>）を、刻み \(\Delta s\) ずつ進めて解く方法である（<code>Laser.raytrace.integrator="leapfrog"</code>）。刻みは、その位置の半径方向の節点の間隔に <code>Laser.raytrace.cfl_ray</code>（既定 0.8）を掛けた値を基準にして、経路に沿って適応的に変え（<a href="index.html#pipeline">レーザー概要の手順 3</a>）、1 本の光線は最大 <code>Laser.raytrace.max_steps</code> 回（既定、上限とも 100000）まで進む。行進は一般的な方法で、2D RZ の 3 次元の光線もこの方法で進める。1D 球対称の既定は<a href="#characteristic">特性曲線積分</a>で、行進の刻み幅による誤差と、転回点に近づくと刻みが細かくなる負荷がない。</p>
       <p><strong>区間（segment）</strong>は、光線の経路を区切った 1 片で、光学的厚さ（optical depth）\(S\) と沈着を区間ごとに求める。行進では 1 回の刻みで進む経路が 1 区間で、区間が流体セルの面をまたぐときの損失は区間の中点のセルへ沈着する。特性曲線積分では、半径方向の節点や流体セルの面などの区切り点のあいだの経路が 1 区間で、各区間は 1 つの流体セルに収まる。</p>
 
       <h3 id="terms-lasermesh">LaserMesh</h3>
       <p><strong>LaserMesh</strong>は、レーザーの光線追跡のために流体メッシュとは別に持つ、\((R,Z)\) 面の構造格子である。流体の密度、電子温度、平均電離度 \(\rho,T_e,\bar Z\) から、電子密度を臨界密度で規格化した \(\hat n\) とその勾配を節点へ写し、光線の位置での値は節点のあいだの補間で求める。LaserMesh の外側の端 \(R_{\rm max}\) が打ち出し面の位置 \(Z_{\rm init}\) になり、光線がこの範囲の外へ出ると、その光線の追跡を終えて、残りのパワーを未吸収に入れる（メッシュからの退出）。</p>
-      <p>1D 球対称では、LaserMesh の半径方向の節点を呼び出しごとに作り直す。臨界半径の両側に、間隔 \(dR_{\rm fine}\) の一様な細帯を各側 \(64\,dR_{\rm fine}\) の幅を目標に置き、細帯の外側は等比級数で粗くする（コア側の比 1.08、コロナ側の比 1.05）。\(dR_{\rm fine}\) は、臨界面の近くの最小の流体セル幅に <code>Laser.lasermesh.mesh_factor</code> を掛けた値で、<code>mesh_factor</code> の既定は 0.5、Studio がゴーストコロナと一緒に書き出す値は 0.1 である。\(Z\) 方向の節点は \(R\) 方向の節点を 0 の両側へ鏡映したもの（\(n_z=2n_r\)）である。外側の端は、\(\hat n\) が <code>Laser.lasermesh.rmax_n_hat_threshold</code>（既定 0.001）以上の最も外のセルの外面の <code>Laser.lasermesh.r_max_factor</code>（既定 1.5）倍で、半径方向のセル数 \(n_r\) は <code>Laser.lasermesh.nr_max</code>（既定 4096）以下に抑える（超えるときは \(dR_{\rm fine}\) を大きくする）。2D RZ では、流体の対称軸に沿う \(n_r\times n_z\) セルの LaserMesh（<code>Laser.lasermesh.nr</code>、<code>nz</code>。既定 128 × 256）を 1 つだけ作り、節点の幾何は初期化後に固定する。</p>
+      <p>1D 球対称では、LaserMesh の半径方向の節点を呼び出しごとに作り直す。臨界半径の両側に、間隔 \(dR_{\rm fine}\) の一様な細帯を各側 \(64\,dR_{\rm fine}\) の幅を目標に置き、細帯の外側は等比級数で粗くする（コア側の比 1.08、コロナ側の比 1.05）。\(dR_{\rm fine}\) は、臨界面の近くの最小の流体セル幅に <code>Laser.lasermesh.mesh_factor</code> を掛けた値で、<code>mesh_factor</code> の既定は 0.5、Studio がゴーストコロナと一緒に書き出す値は 0.1 である。\(Z\) 方向の節点は \(R\) 方向の節点を 0 の両側へ鏡映したもの（\(n_z=2n_r\)）である。外側の端は、\(\hat n\) が <code>Laser.lasermesh.rmax_n_hat_threshold</code>（既定 0.001）以上の最も外のセルの外面の <code>Laser.lasermesh.r_max_factor</code>（既定 1.5）倍で、半径方向のセル数 \(n_r\) は <code>Laser.lasermesh.nr_max</code>（既定 4096）以下に抑える（超えるときは \(dR_{\rm fine}\) を大きくする）。</p>
+      <p>2D RZ では、流体の対称軸に沿う \(n_r\times n_z\) セルの LaserMesh（<code>Laser.lasermesh.nr</code>、<code>nz</code>。既定 128 × 256）を 1 つだけ作り、節点の幾何は初期化後に固定する。</p>
       <p>LaserMesh は流体のセルとは独立なので、最も外側の物質セルより外側（ゴーストコロナや真空）にも節点を置ける。最も外側の物質セルまでの領域では、1D の光線追跡カーネルが読む半径方向の参照配列を、流体セルの面と中心に固定した節点の上で作る（<a href="#lasermesh-march">LaserMesh と光線の行進</a>）ので、<code>mesh_factor</code> を変えても、この領域の節点は動かない。LaserMesh の節点の間隔は、外側の領域の節点の間隔（行進の刻みの基準と、特性曲線積分の区間の数）と、打ち出し面の位置に効く。節点数 \((n_r+1)(n_z+1)\) に比例して、GPU のメモリと場の写像の計算量が増える。</p>
 
       <h3 id="terms-beam-group">ビームグループ</h3>
@@ -36,13 +37,13 @@
 
       <h3 id="terms-reuse-cache">再利用キャッシュ</h3>
       <p><strong>再利用キャッシュ（reuse cache。<code>Laser.raytrace_skip</code>）</strong>は、直前に光線を追跡した結果を保存し、プラズマがほとんど変わっていないあいだは、光線を追跡せずにその結果を使う仕組みである。保存するのは、パワーあたりの沈着の分布 \(\hat f_{g,c}\)（セル \(c\) の沈着を、その沈着を作ったパワーで割った値）と、そのときのセルごとの密度 \(\rho\)、電子温度 \(T_e\)、平均電離度 \(\bar Z\) である。分布は、1D ではビーム 1 本につき 1 つ（\(g\) はビームの番号）、2D RZ では全ビームグループの沈着の和を総パワーで割った 1 つだけである。再利用するステップでは、現在のパワー \(P_g\)（1D ではビーム \(g\) のパワー、2D RZ では全ビームの総パワー）を掛けて、セル \(c\) の沈着を \(\sum_g\hat f_{g,c}P_g\Delta t\) と作る。</p>
-      <p>キャッシュは既定で無効である（<code>Laser.raytrace_skip.enabled=False</code>）。有効にすると、キャッシュを取った時点からのプラズマの変化 \(\delta\) が <code>threshold</code>（既定 0.01）を下回るあいだ再利用し、連続して再利用するのは <code>max_consecutive</code>（既定 10）回までとする。ほかにも新たに追跡する条件があり、<a href="index.html#pipeline">手順</a>の 7 に挙げる。\(\delta\) は、<code>norm="max_relative"</code>（既定）では、全セルの \(\rho\)、\(T_e\)、\(\bar Z\) の、キャッシュ時の値に対する相対変化の最大値、<code>"l2_relative"</code> では、全セルと 3 つの量にわたる、現在の値に対する相対変化の二乗平均平方根である。相対変化の分母には、ゼロ割りを避ける下限を置く（\(\rho\) と \(T_e\) は<a href="../../overview/numerics-foundations.html#floors-safety">床（floor）</a>の値、\(\bar Z\) は 0.01）。</p>
+      <p>キャッシュは既定で無効である（<code>Laser.raytrace_skip.enabled=False</code>）。有効にすると、キャッシュを取った時点からのプラズマの変化 \(\delta\) が <code>threshold</code>（既定 0.01）を下回るあいだ再利用し、連続して再利用するのは <code>max_consecutive</code>（既定 10）回までとする。ほかにも新たに追跡する条件があり、<a href="index.html#pipeline">レーザー概要の手順 7</a> に挙げる。\(\delta\) は、<code>norm="max_relative"</code>（既定）では、全セルの \(\rho\)、\(T_e\)、\(\bar Z\) の、キャッシュ時の値に対する相対変化の最大値、<code>"l2_relative"</code> では、全セルと 3 つの量にわたる、現在の値に対する相対変化の二乗平均平方根である。相対変化の分母には、ゼロ割りを避ける下限を置く（\(\rho\) と \(T_e\) は<a href="../../overview/numerics-foundations.html#floors-safety">床（floor）</a>の値、\(\bar Z\) は 0.01）。</p>
       <p>再利用したステップでは、光線の追跡の費用がかからない。パワーで掛け直すことは、吸収係数がパワーに依らないかぎり厳密である。Langdon 因子は強度に依存するので、有効なときは厳密ではなく、総パワーの変化を 1% 以内に抑える条件が誤差を抑える。2D RZ の分布は全ビームグループを重ねた 1 つなので、グループ間のパワーの比が変わっても分布は更新されず、判定が見るのは総パワーの変化だけである。沈着の分布はキャッシュを取った時点のもので、プラズマが \(\delta\) まで変わるあいだは更新されない。</p>
     </section>
 
     <section aria-labelledby="chord-raytrace">
       <h2 id="chord-raytrace">1D 球対称の弦に沿う光線追跡</h2>
-      <p>1D の流体状態は半径だけの関数だが、斜入射での光路長と屈折を表すため、光線の運動はビームに固定した \((R,Z)\) 平面で解く。光線の位置から \(r=\sqrt{R^2+Z^2}\) を求め、電子密度、温度、電離度を 1D の半径方向分布から参照し、吸収したパワーも対応する流体セルへ直接加える。球対称性により、ビームの空間的な向きは吸収の分布を変えない。したがって、点灯するすべてのビームについて、その時間ステップでのパワー、F 値、軸上の焦点、波長のずれ \(\Delta\lambda\)、強度分布（種類と \(w_0\)、\(m\)。表の分布では標本）が完全に一致するときに限り、1 本のビームだけを追跡し、その沈着をビームの本数だけ足し合わせる。1 つでも異なれば、各ビームをそれぞれのパワーで別に追跡する。詳細ログ（<code>Main.verbosity="verbose"</code>）、光線の出力（<code>Laser.ray_output_count</code> が 0 より大きいとき）、スナップショットを書くステップ（光線の密度診断を作るため）、CBET が有効なときも、各ビームを別に追跡する。</p>
+      <p>1D の流体状態は半径だけの関数だが、斜入射での光路長と屈折を表すため、光線の運動はビームに固定した \((R,Z)\) 平面で解く。光線の位置から \(r=\sqrt{R^2+Z^2}\) を求め、電子密度、温度、電離度を 1D の半径方向分布から参照し、吸収したパワーも対応する流体セルへ直接加える。球対称性により、ビームの空間的な向きは吸収の分布を変えない。したがって、点灯するすべてのビームについて、その時間刻みでのパワー、F 値、軸上の焦点、波長のずれ \(\Delta\lambda\)、強度分布（種類と \(w_0\)、\(m\)。表の分布では標本）が完全に一致するときに限り、1 本のビームだけを追跡し、その沈着をビームの本数だけ足し合わせる。1 つでも異なれば、各ビームをそれぞれのパワーで別に追跡する。詳細ログ（<code>Main.verbosity="verbose"</code>）、光線の出力（<code>Laser.ray_output_count</code> が 0 より大きいとき）、スナップショットを書くステップ（光線の密度診断を作るため）、CBET が有効なときも、各ビームを別に追跡する。</p>
       <p>プラズマの屈折率と光線の方程式は次のとおりである。</p>
       $$
       n_{\rm refr}=\sqrt{\max(\varepsilon_n,1-\hat n)},\qquad
@@ -67,21 +68,21 @@
 
     <section aria-labelledby="lasermesh-march">
       <h2 id="lasermesh-march">LaserMesh と光線の行進</h2>
-      <p>1D 球対称では、<a href="#terms-lasermesh">LaserMesh</a> の半径方向の節点 1 組から、ビームに固定した \((R,Z)\) 構造を作る。\(Z\) 方向の節点は \(R\) 方向の節点を 0 の両側へ鏡映したものである。光線追跡カーネルが読む半径方向の参照配列は、流体セルの面と中心に固定した節点（流体の外側では LaserMesh の半径節点）の上で作る。2D RZ では単一の LaserMesh を流体の対称軸に合わせ、節点の幾何は初期化後に固定する。LaserMesh の上で光線を進める方法は、1D の既定の特性曲線積分（<a href="#characteristic">次節</a>）と、行進（<a href="#terms-march">用語</a>）である。これらの方法による処理の手順は、<a href="index.html#pipeline">手順の節</a>に示す。</p>
+      <p>1D 球対称では、<a href="#terms-lasermesh">LaserMesh</a> の半径方向の節点 1 組から、ビームに固定した \((R,Z)\) 構造を作る。\(Z\) 方向の節点は \(R\) 方向の節点を 0 の両側へ鏡映したものである。光線追跡カーネルが読む半径方向の参照配列は、流体セルの面と中心に固定した節点（流体の外側では LaserMesh の半径節点）の上で作る。2D RZ では単一の LaserMesh を流体の対称軸に合わせ、節点の幾何は初期化後に固定する。LaserMesh の上で光線を進める方法は、1D の既定の特性曲線積分（<a href="#characteristic">次節</a>）と、行進（<a href="#terms-march">用語</a>）である。これらの方法による処理の手順は、<a href="index.html#pipeline">レーザー概要の手順の節</a>に示す。</p>
     </section>
 
     <section aria-labelledby="characteristic">
       <h2 id="characteristic">特性曲線積分（1D の既定）</h2>
-      <p>1D の既定（<code>Laser.raytrace.integrator="auto"</code>）では、光線を刻み幅で行進させる代わりに、特性曲線に沿って区間ごとに積分する（下の手順 3 の<a href="#terms-march">行進</a>は <code>"leapfrog"</code> で選べる。1D 球のみ）。球対称の場では光線の角運動量、すなわち上で定義した Bouguer 不変量 \(B\)（真空から入射する光線では衝突径数）が保存されるので、\(\varepsilon=1-\hat n\)、\(Q(r)=r^2\varepsilon(r)-B^2\)（経路上で \(Q\ge0\)）として</p>
+      <p>1D の既定（<code>Laser.raytrace.integrator="auto"</code>）では、光線を刻み幅で行進させる代わりに、特性曲線に沿って区間ごとに積分する（<a href="index.html#pipeline">レーザー概要の手順 3</a> で述べた<a href="#terms-march">行進</a>は <code>"leapfrog"</code> で選べる。1D 球のみ）。球対称の場では光線の角運動量、すなわち上で定義した Bouguer 不変量 \(B\)（真空から入射する光線では衝突径数）が保存されるので、\(\varepsilon=1-\hat n\)、\(Q(r)=r^2\varepsilon(r)-B^2\)（経路上で \(Q\ge0\)）として</p>
       $$
       \frac{ds}{|dr|}=\frac{\sqrt{\varepsilon}\,r}{\sqrt{Q}},\qquad
       \frac{d\phi}{|dr|}=\frac{B}{r\sqrt{Q}},\qquad
       d\tau=\kappa_{\rm IB}\,ds
       $$
-      <p>を半径について積分すればよい（\(\phi\) は子午面内の極角）。経路は半径方向の参照配列の節点と流体セルの面などで区間に区切り、各区間の中で転回点（\(Q=0\)）、臨界、中心を事象として厳密に求める。区間の光路長・角度・光学的厚さは適応 Gauss–Kronrod 求積で求め、転回点（半径 \(r_B\)）の近くでは \(u=\sqrt{r-r_B}\) を変数にして \(1/\sqrt Q\) の特異性を取り除く。各区間はひとつの流体セルに収まるので、吸収はそのセルへ直接入る。行進の刻み幅による誤差と、転回点に近づくと刻みが細かくなる負荷がない。</p>
+      <p>を半径について積分すればよい（\(\phi\) は子午面内の極角）。経路は半径方向の参照配列の節点と流体セルの面などで区間に区切り、各区間の中で転回点（\(Q=0\)）、臨界、中心を事象として厳密に求める。区間の光路長・角度・光学的厚さは適応 Gauss–Kronrod 求積で求め、転回点（半径 \(r_B\)）の近くでは \(u=\sqrt{r-r_B}\) を変数にして \(1/\sqrt Q\) の特異性を取り除く。各区間は 1 つの流体セルに収まるので、吸収はそのセルへ直接入る。行進の刻み幅による誤差と、転回点に近づくと刻みが細かくなる負荷がない。</p>
       <p>この積分器では、臨界半径（\(\hat n=1-\varepsilon_{\rm crit}\)、\(\varepsilon_{\rm crit}\) は <code>Laser.absorption.eps_crit</code>）に達した光線は既定で反射し（<code>Laser.absorption.critical_handling.terminate=False</code>）、同じ区間を外向きにたどって往復で吸収される。<code>terminate=True</code> では、行進と同じく裾のクロージャ（<a href="absorption.html#terms-tail-closure">用語</a>）で臨界層の残りの吸収を解析的に閉じて終端する。1D の円筒・平面（<code>Mesh.geometry_1d</code>）でも同じ形で、円筒では断面内の角運動量と軸方向の速度、平面では横方向の速度が保存量になる（ビームの <code>power</code> は円筒で単位長さ、平面で単位面積あたり）。</p>
       <p>GPU では 1 本の光線を 32・64・128・256 レーンで追跡し、各レーンが経路に沿った 1 区間を受け持つ（<code>Laser.raytrace.lanes_per_ray</code>。既定の 0 は、全光線 × レーン数が GPU の同時に動かせるスレッド数に収まる最大の幅を選び、収まらなければ 32）。和の順序がレーン数で変わるので結果の丸めはレーン数によるが、同じ GPU・同じ光線数なら run の反復はビット一致する。別の種類の GPU とビットで比べるときはレーン数を固定する。</p>
-      <p>光線は内向きと外向きで同じ区間を通り、区間の光路長・角度・光学的厚さは半径の区間だけで決まるので、外向きの区間は内向きで求めた値をそのまま使う（<code>Laser.raytrace.reuse_inward_integrals</code>、既定 <code>True</code>）。臨界半径で反射する光線では、求積し直した場合とビット単位で同じ結果になる。転回点で折り返す光線では、転回点から離れた区間を内向きは \(r\)、外向きは \(u=\sqrt{r-r_B}\) を変数として求積していたので、同じ積分を同じ許容誤差（区間の \(10^{-7}\) 倍）で求めた別の値に置き換わり、Langdon 因子を評価する吸収の重心も区間幅の 2 次の大きさで動く。GXII（激光 XII 号、GEKKO XII）の 1D の爆縮では、結果の差は初期の時間刻みやレーザーエネルギーを 12 桁目で変えた計算どうしのばらつきと同じ大きさで、計算時間は 7〜12 % 短くなる。値の表に GPU のメモリを区間 1 つあたり 72 バイト × 光線数だけ使う（300 セル・1000 光線で約 100 MiB）。<code>False</code> では外向きの区間も求積する。</p>
+      <p>光線は内向きと外向きで同じ区間を通り、区間の光路長・角度・光学的厚さは半径の区間だけで決まるので、外向きの区間は内向きで求めた値をそのまま使う（<code>Laser.raytrace.reuse_inward_integrals</code>、既定 <code>True</code>）。臨界半径で反射する光線では、求積し直した場合とビット単位で同じ結果になる。転回点で折り返す光線では、従来は転回点から離れた区間を内向きに \(r\)、外向きに \(u=\sqrt{r-r_B}\) を変数として求積していたため、内向きの値を再利用すると、同じ積分を同じ許容誤差（区間の \(10^{-7}\) 倍）で求めた別の数値に置き換わり、Langdon 因子を評価する吸収の重心も区間幅の 2 次の大きさで動く。GXII（激光 XII 号、GEKKO XII）の 1D の爆縮では、結果の差は初期の時間刻みやレーザーエネルギーを 12 桁目で変えた計算どうしのばらつきと同じ大きさで、計算時間は 7〜12% 短くなる。値の表に GPU のメモリを区間 1 つあたり 72 バイト × 光線数だけ使う（300 セル・1000 光線で約 100 MiB）。<code>False</code> では外向きの区間も求積する。</p>
     </section>
 
     <section aria-labelledby="controls">
@@ -92,7 +93,7 @@
         <tbody>
           <tr><th><code>Laser.raytrace.integrator</code></th><td><code>"auto"</code></td><td>1D の光線の積分器。<code>"auto"</code> は 1D で特性曲線積分（<code>"characteristic"</code>）、それ以外で行進（<code>"leapfrog"</code>）。</td></tr>
           <tr><th><code>Laser.raytrace.lanes_per_ray</code></th><td><code>0</code></td><td>特性曲線積分で 1 本の光線を追跡するレーン数（32・64・128・256）。0 は光線数と GPU から自動で選ぶ。</td></tr>
-          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>特性曲線積分で、外向きの区間に内向きで求めた積分を使う。<code>False</code> では外向きも求積する（2026-10-03 より前と同じ算法。核の引数が増えたので、以前の build とビット単位で同じ結果になるかはコンパイラによる: CUDA 12.6 の nvcc では同じ、12.0 では積和の融合が変わり末尾の桁で違う）。</td></tr>
+          <tr><th><code>Laser.raytrace.reuse_inward_integrals</code></th><td><code>True</code></td><td>特性曲線積分で、外向きの区間に内向きで求めた積分を使う。<code>False</code> では外向きも求積する（2026-10-03 より前と同じ算法。カーネルの引数が増えたため、以前の build とビット単位で同じ結果になるかはコンパイラによる。CUDA 12.6 の nvcc では一致し、12.0 では積和の融合が変わり末尾の桁で異なる）。</td></tr>
         </tbody>
       </table>
     </section>

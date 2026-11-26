@@ -24,12 +24,11 @@
 
       <h3 id="terms-ledger">エネルギー台帳と人工項</h3>
       <p><strong>エネルギー台帳</strong>は、毎ステップ、系の全エネルギーの変化を、出入りと補正の各項と突き合わせる恒等式である。履歴の <code>energy/</code> の各チャネルがその項を持ち、<code>conservation_error</code> がその相対誤差 ε_budget である。恒等式と各項の定義は<a href="../../overview/numerics-foundations.html#energy-ledger">数値基盤のエネルギー台帳の節</a>にある。以下は、数値的な操作が状態へ加えたエネルギーを記帳する 4 項である。</p>
-      <p><strong>床補正（floor correction）</strong>は、各演算子がエネルギーそのものを下限まで引き上げた量の和である（<a href="../../overview/numerics-foundations.html#floors-safety">床・クランプ・安全ガード</a>）。<code>floor_injected</code> が run 全体の累積、<code>floor_injected_step</code> がそのステップの値である。</p>
+      <p><strong>床補正（floor correction）</strong>は、各演算子がエネルギーそのものを下限まで引き上げた量の和である（<a href="../../overview/numerics-foundations.html#floors-safety">床・クランプ・数値安全策</a>）。<code>floor_injected</code> が run 全体の累積、<code>floor_injected_step</code> がそのステップの値である。</p>
       <p><strong>安全補正（safety correction）</strong>は、伝導の安全補正を記帳する欄である。現在の実装は伝導の補正を床補正に含めて記帳し、この欄に床補正と同じ値を入れるので、<code>safety_injected</code> は <code>floor_injected</code> と同じ値になる。</p>
       <p><strong>ALE 再分配の未解決分（unresolved ALE redistribution）</strong>は、2D RZ の ALE（arbitrary Lagrangian–Eulerian、任意ラグランジュ・オイラー法）のリマップが、質量の床に落ちたセルを床の状態に置いたときのエネルギー差と、運動エネルギー・クロージャの再配分（<code>Numerics.ale.ke_closure_redistribute_floor</code>、既定は False）が吸収しきれなかった不足の和である。ALE を使わなければ 0 である。<code>redistribution_unresolved</code> には、そのステップの値だけを書く。</p>
       <p><strong>ソルバ残差（solver residual）</strong>は、陰的ソルバの残差を符号つきで記帳する欄である。どの演算子も加算しないので、<code>solver_residual</code> は常に 0 である。0 以外の値は、符号に応じて流入または流出の項になる。</p>
       <p>保存誤差 ε_budget の計算では、床補正と ALE 再分配の未解決分の和を人工項として全エネルギー変化から差し引く（安全補正は床補正と同じ値なので、加えない）。人工項は、物理的な出入りではなく数値的な操作がもたらしたエネルギーなので、ε_budget には数えない。ε_budget は <code>Diagnostics.energy_budget.warn_threshold</code>（既定 \(10^{-3}\)）を超えると警告する（最初のステップは検査しない）。床補正・安全補正・ALE 再分配の未解決分は、それぞれステップ開始時のエネルギーの大きさ <code>E_denom</code> との比が \(10^{-3}\) を超えると警告する。ε_budget が跳ねたときは、まず人工項の比を見る。人工項が支配的なら床とクランプの発動源を、そうでなければ境界と源の帰属（吸収率・逸出）を疑う。</p>
-
 
       <h3 id="terms-shell">シェルの半径・厚さ・IFAR・収束比</h3>
       <p><strong>シェル（shell）</strong>は、爆縮するカプセルの高密度の殻である。履歴の <code>diagnostics/icf/v1/</code> は、密度の分布からシェルの位置と形を次の規則で測る。1D の規則を述べる。\(\rho_{peak}\) は全セルの密度の最大値である。</p>
@@ -41,13 +40,13 @@
 
       <h3 id="terms-hotspot">ホットスポットのガスと R50…R99</h3>
       <p><strong>ホットスポットのガス（hotspot gas）</strong>は、初期に標的の中心部にあったガスを、流れとともに運ぶ受動トレーサで印を付けたものである。<code>Numerics.diagnostics.hotspot_gas.enabled=True</code> にすると、ステップ 0 で、セル重心の中心からの距離 \(\sqrt{r^2+z^2}\)（1D は \(r\)）が <code>Numerics.diagnostics.hotspot_gas.R_g_cm</code>（\(R_g\) [cm]。有効なら 0 より大きくする）より小さいセルにトレーサ \(Y_g=1\) を付け、ほかのセルは 0 とする。トレーサは、ラグランジュ流体ではセルとともに動き、ALE のリマップでは質量 \(mY_g\) を流体の質量流束と同じ風上の規則と制限子で運ぶ。値は <code>hydro/gas_tracer_Y</code> に残る。印を付けた最初の質量が <code>gas_mass_initial_g</code>、各時刻の質量 \(M_g=\sum_c m_cY_{g,c}\) の初期値との相対差が <code>gas_mass_rel_drift</code> で、その絶対値が <code>Numerics.diagnostics.hotspot_gas.mass_drift_warn_rel</code>（既定 \(10^{-10}\)）を超えると警告する。</p>
-      <p><strong>ガスの半径 R50・R90・R95・R99</strong> は、ガスの質量で重み付けした半径の分位数である。トレーサを持つセルをセル重心の中心からの距離で昇順に並べ、質量 \(mY_g\) の累積が \(M_g\) の p %（p = 50・90・95・99）に最初に達するセルの距離を、それぞれ \(R_{p}\)（<code>R50_cm</code>・<code>R90_cm</code>・<code>R95_cm</code>・<code>R99_cm</code>）とする。ガスの収束比 \(\mathrm{CR}_{p}=R_g/R_{p}\)（<code>CR50</code>・<code>CR90</code>・<code>CR95</code>・<code>CR99</code>）は、初期の半径 \(R_g\) を現在の半径で割った量である。シェルの収束比 <code>CR</code> とは別の量である。\(\mathrm{CR}_{50}\) の初期値は 1 でない（密度が一様な球では \(2^{1/3}\simeq1.26\)）ので、その初期値で割った <code>C_R50_norm</code> も書く。</p>
+      <p><strong>ガスの半径 R50・R90・R95・R99</strong> は、ガスの質量で重み付けした半径の分位数である。トレーサを持つセルをセル重心の中心からの距離で昇順に並べ、質量 \(mY_g\) の累積が \(M_g\) の p%（p = 50・90・95・99）に最初に達するセルの距離を、それぞれ \(R_{p}\)（<code>R50_cm</code>・<code>R90_cm</code>・<code>R95_cm</code>・<code>R99_cm</code>）とする。ガスの収束比 \(\mathrm{CR}_{p}=R_g/R_{p}\)（<code>CR50</code>・<code>CR90</code>・<code>CR95</code>・<code>CR99</code>）は、初期の半径 \(R_g\) を現在の半径で割った量である。シェルの収束比 <code>CR</code> とは別の量である。\(\mathrm{CR}_{50}\) の初期値は 1 でない（密度が一様な球では \(2^{1/3}\simeq1.26\)）ので、その初期値で割った <code>C_R50_norm</code> も書く。</p>
       <p>そのほかの量を次のように定義する。rms 半径 \(R_{rms}=\sqrt{(5/3)\langle r^2\rangle}\)（<code>Rrms_cm</code>。一様な球では球の半径に等しい）とその収束比 <code>CRrms</code>。ガスの体積平均密度 \(M_g/\sum_c Y_{g,c}V_c\)（<code>rho_bar_volume_gcc</code>）の初期値に対する比の 1/3 乗 <code>CR_V</code>。ガスの質量中央値の密度 <code>rho50_gcc</code> の初期値に対する比の 1/3 乗 <code>CR_rho50</code>。圧力 \(p\)（電子 + イオン）と、断熱線を表す量 \(K=p/\rho^{\gamma}\)（<code>K_mean</code>・<code>K50</code>・<code>K90</code>・<code>K95</code>・<code>K99</code>。\(\gamma\) は最初のボイドでない理想気体材料の断熱指数で、定義できなければ 5/3）の質量重みの平均と分位数。電子温度とイオン温度（イオン温度は 2 温度のときだけ）の質量重みの平均と p10・p50・p90。エネルギー（内部・運動・合計）と、その初期値からの変化である仕事プロキシ（work proxy）<code>hotspot_work_proxy_*_erg</code>。仕事プロキシは、トレーサで定義した領域の全エネルギー \(\sum_c Y_gm(e_e+e_i+\tfrac12|\mathbf{u}|^2)\) の変化であり、境界の圧力仕事の積分ではない（<code>hotspot_work_definition</code> に同じ定義を書く）。</p>
     </section>
 
     <section aria-labelledby="history">
       <h2 id="history">履歴のチャネル</h2>
-      <p><code>results/&lt;name&gt;_history.h5</code> は追記型の時系列である。履歴の個々の時系列を、このページではチャネル（channel）と呼ぶ。ルートには <code>t</code>・<code>cycle</code>・<code>dt</code> の 3 本が入る。停止理由は <code>run_info.json</code> の <code>termination_reason</code>（<code>"t_end_reached"</code>・<code>"max_steps_reached"</code> など）に記録される。</p>
+      <p><code>results/&lt;name&gt;_history.h5</code> は追記型の時系列である。履歴の個々の時系列を、この頁ではチャネル（channel）と呼ぶ。ルートには <code>t</code>・<code>cycle</code>・<code>dt</code> の 3 本が入る。停止理由は <code>run_info.json</code> の <code>termination_reason</code>（<code>"t_end_reached"</code>・<code>"max_steps_reached"</code> など）に記録される。</p>
 
       <h3>energy/ — エネルギー台帳（常時。条件つきのチャネルは行に条件を書く）</h3>
       <table class="quick-facts">
@@ -128,7 +127,7 @@
           <tr><th><code>diagnostics/ale_provenance/v1/</code></th><td><code>Numerics.diagnostics.ale_provenance_emission.enabled</code>（または <code>Numerics.profile.icf_standard_ale.enabled</code>）。<code>Numerics.profile.icf_standard_ale</code> は、ALE の設定を標準の組に限り、メッシュを修復する機構（セルの緊急無効化、境界と内部の局所修復、軸の変分射影など）を禁じるプロファイルである。このグループは、禁じた設定を有効にした数（<code>forbidden_config_violations</code>）、メッシュの救済処理（mesh rescue。許可した上で、禁じた修復機構が実際に動いたこと）の回数（<code>escape_valve_activations</code>）、メッシュの幾何の失敗のカウンタ、救済処理ごとのイベント表（<code>escape_valve_events/</code>）、run 終了時の状態を記す属性（<code>final_claim_level</code>・<code>reached_t_end</code> など）を持つ。</td></tr>
           <tr><th><code>diagnostics/mesh_quality_min/v1/</code></th><td><code>Numerics.diagnostics.mesh_quality_min.enabled</code>。受理したメッシュの、<a href="../../physics/mesh/index.html#terms-corner-jacobian">コーナーヤコビアン</a>とガウス点ヤコビアン（Jacobian。<a href="../../physics/mesh/index.html#terms-gauss-jacobian">定義</a>）J の最小、最小体積、最小の辺長と高さ（初期値との比）、条件数（condition number）の最大。</td></tr>
           <tr><th><code>diagnostics/ale_lambda_sweep/v1/</code></th><td>ALE の後退探索（backtracking line search）で、リゾーンの移動量に掛ける割合 λ を掃引（sweep）する診断（ガウス点とコーナーの J と体積について、メッシュの許容性（admissibility。<a href="../../physics/mesh/index.html#terms-admissibility">定義</a>）を λ ごとに記す）。</td></tr>
-          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子の段ごとの動径フーリエ監査（radial Fourier audit。v1: 最大振幅、v2: 固定した動径モード m と z 方向の行 j の複素係数）。</td></tr>
+          <tr><th><code>diagnostics/radial_fourier_audit/v1/</code>・<code>_v2/v1/</code></th><td>演算子の段ごとの動径フーリエ監査（radial Fourier audit。v1：最大振幅、v2：固定した動径モード m と z 方向の行 j の複素係数）。</td></tr>
           <tr><th><code>diagnostics/dt_breakdown_history/</code></th><td><code>Numerics.diagnostics.dt_breakdown_history_enabled</code>（既定で有効）。毎ステップの Δt の内訳と、Δt を決めた制約の名前 <code>dt_winner</code>（<a href="../../overview/timestep.html#observing">時間刻み制御</a>参照）。</td></tr>
           <tr><th><code>diagnostics/cfl_winner/</code>・<code>corner_bc_audit/v1/</code></th><td>音響 CFL の最小を与えたセル（Δt を決めたセル。グループ名の winner はこの意味）の記録と、そのセルが特定のコーナーハローに入った場合の境界値の監査。</td></tr>
           <tr><th><code>diagnostics/per_row_mass/</code>・<code>av_max/</code></th><td>Δt の内訳の診断（<code>dt_breakdown_history_enabled</code>）が有効のとき。z 行ごとの質量・密度サマリと、最大人工粘性セルの記録。</td></tr>
@@ -137,9 +136,9 @@
           <tr><th><code>mc/</code>・<code>difference/</code>・<code>holo/</code></th><td>2026-09-29（schema 2）に削除した。退役したモンテカルロ輻射の統計で、FLD・S<sub>N</sub> では最大値原理の 2 列（現在の <code>radiation/overshoot_*</code>）を除いて 0 だった。それより前に始めた履歴ファイルへ追記するときは、その 2 列を <code>mc/overshoot_*</code> に書き続ける。</td></tr>
         </tbody>
       </table>
-      <p>検証ページで引用される基準回帰の要約指標は、これらの時系列の時間方向の縮約である: <code>rho_peak_max</code> = <code>implosion/rho_peak</code> の最大、<code>rhoR_max</code> = <code>implosion/rho_R</code> の最初の角度（<code>angles_deg</code> の先頭）の最大、<code>Tc_max_eV</code> = <code>implosion/center_temperature</code> の最大、<code>shell_r_min_cm</code> = <code>implosion/shell_radius_min</code> の最小。</p>
+      <p>検証の頁で引用される基準回帰の要約指標は、これらの時系列の時間方向の縮約である。<code>rho_peak_max</code> = <code>implosion/rho_peak</code> の最大、<code>rhoR_max</code> = <code>implosion/rho_R</code> の最初の角度（<code>angles_deg</code> の先頭）の最大、<code>Tc_max_eV</code> = <code>implosion/center_temperature</code> の最大、<code>shell_r_min_cm</code> = <code>implosion/shell_radius_min</code> の最小である。</p>
       <aside class="planned" aria-labelledby="cadence-warning">
-        <h3 id="cadence-warning">警告: 出力間隔によるピークの取り逃がし</h3>
+        <h3 id="cadence-warning">警告：出力間隔によるピークの取り逃がし</h3>
         <p>スナップショットの出力間隔はデッキごとに設定するが、爆縮の停滞期のピークは非常に短いことがある — GXII 級のレーザー爆縮の計算での実測（2026-07-31）では約 15 ps。出力の時刻がピークの前後に来てしまうと、スナップショット中の最大密度は真のピークを大きく過小評価する。鋭いピークの値とその時刻はステップごとの履歴にある <code>implosion/rho_peak</code> から読み、スナップショットはピーク前後の空間構造を調べるために使うこと。</p>
       </aside>
     </section>

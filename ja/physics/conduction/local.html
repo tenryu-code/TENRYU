@@ -32,7 +32,7 @@
       \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
       $$
       <p>ここで \(\kappa_0\) は cgs + eV 単位系での Spitzer 前置係数、\(\xi(\bar Z)\) は下の箇条書きで詳述する Z 依存補正、\(\ln\Lambda\) はクーロン対数（Coulomb logarithm）、\(\mathbf q_{SH}\) が得られる制限前の熱流束である。</p>
-      <p>1D の局所モデルでは流束制限を面ごとに適用する。1D SNB は流束制限を適用しない。面の電子密度と温度（いずれも左右セルの算術平均）と、その温度から求めた熱速度から \(q_{max}\) を作り、機構節で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
+      <p>1D の局所モデルでは流束制限を面ごとに適用する。1D SNB は流束制限を適用しない。面の電子密度と温度（いずれも左右セルの算術平均）と、その温度から求めた熱速度から \(q_{max}\) を作り、<a href="index.html#mechanism">概要の頁の物理機構</a>で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
       $$
       v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
       q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad
@@ -72,7 +72,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li><strong>衝突電荷と GXII の回帰試験の参照値：</strong><code>nonlocal_model="none"</code> のとき、非局所補正は計算しない。1D の熱伝導率はセル内の混合イオンの衝突電荷 ⟨<i>Z</i>²⟩/⟨<i>Z</i>⟩ を使い、<i>Z</i> はイオン種の電荷、山括弧はセル内のイオン種にわたる平均を表す（<a href="../eos-opacity/ionization.html#ionization">電荷のモーメント</a>を参照）。従来の熱伝導率とビット単位で一致するのは、正の重みをもつ材料がひとつで組成指定のないセルに限られる。<a href="../../verification/index.html#gxii">GXII</a> の回帰試験デッキの CH シェルは C/H 組成をもつ。前の版の参照値に対する FLD の 6 つの指標の相対変化は最大 0.79 %（ピーク密度）であり、参照値はこの版から再生成した。</li>
+        <li><strong>衝突電荷と GXII の回帰試験の参照値：</strong><code>nonlocal_model="none"</code> のとき、非局所補正は計算しない。1D の熱伝導率はセル内の混合イオンの衝突電荷 ⟨<i>Z</i>²⟩/⟨<i>Z</i>⟩ を使い、<i>Z</i> はイオン種の電荷、山括弧はセル内のイオン種にわたる平均を表す（<a href="../eos-opacity/ionization.html#ionization">電荷のモーメント</a>を参照）。従来の熱伝導率とビット単位で一致するのは、正の重みをもつ材料が 1 つで組成指定のないセルに限られる。<a href="../../verification/index.html#gxii">GXII</a> の回帰試験デッキの CH シェルは C/H 組成をもつ。前の版の参照値に対する FLD の 6 つの指標の相対変化は最大 0.79%（ピーク密度）であり、参照値はこの版から再生成した。</li>
       </ul>
     </section>
 

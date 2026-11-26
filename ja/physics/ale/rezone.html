@@ -25,7 +25,8 @@
       <h3 id="terms-reference">参照メッシュ、参照目標、参照障壁</h3>
       <p><strong>参照メッシュ（reference mesh）</strong>は、状態が保持する節点座標（<code>x_r_reference</code>、<code>x_z_reference</code>）である。多ブロックのメッシュでは、初期化時のメッシュの座標を保持し、取引のたびには更新しない。リマップの目標メッシュは、取引の間だけこの座標の位置に置かれ、リマップの後に元の座標が戻される。M1 の形状尺度と、参照障壁の相対下限は、この座標を基準にする。</p>
       <p><strong>参照目標（reference target）</strong>は、参照障壁のリゾーンが節点を寄せる先のメッシュで、<code>reference_target</code> で選ぶ。<code>"none"</code>（既定）は変位を作らない。<code>"eulerian_initial"</code> は初期メッシュの座標（オイラー格子）である。<code>"spherical_equal_angle"</code> は、初期メッシュの殻 \(i\) の半径 \(s_i\)（節点 \((i,0)\) の原点からの距離）を保ち、軸方向に等しい角度 \(\theta_j=\pi j/n_z\) で並べた球面のメッシュ \((r,z)=(s_i\sin\theta_j,\;s_i\cos\theta_j)\) である。</p>
-      <p><strong>参照障壁（reference barrier）</strong>は、実行間隔を待たずに起動する保護的なリゾーンである（<code>reference_barrier_enabled</code>、既定 False）。現在のメッシュから参照目標へ向かう変位 \(\Delta\mathbf x\) を、混合率 \(\lambda\) で加える。\(\lambda\) は、<code>reference_blend_default</code>（既定 1.0）から半分ずつ小さくして最大 <code>reference_linesearch_max_iters</code>（既定 24）回まで試し、RZ 体積・コーナーヤコビアン・ガウス点ヤコビアンが、参照メッシュの値に対する相対下限（既定 1.0e-8）を割らない最大の値を採る。起動の条件は 2 つで、どちらも既定で有効である。(a) セル重心の \(\sin\theta=|r_c|/\sqrt{r_c^2+z_c^2}\)（\(\theta\) は +z 軸からの極角）の最小値が、<code>reference_trigger_axis_margin_threshold</code>（既定 1.0e-2）を下回る。この \(\sin\theta\) は、軸マージン（単位 cm²）とは別の量である。(b) コーナーヤコビアンの比（各コーナーの現在の値を初期メッシュでの値で割った値）と、対角コーナーの辺長の比（セルの 1 つのコーナーに接する 2 辺の長さの平均 \(b_{\rm eff}\) の、初期メッシュに対する比）の最小値が、<code>reference_trigger_corner_j_ratio_threshold</code>（既定 0.5）を下回る。</p>
+      <p><strong>参照障壁（reference barrier）</strong>は、実行間隔を待たずに起動する保護的なリゾーンである（<code>reference_barrier_enabled</code>、既定 False）。現在のメッシュから参照目標へ向かう変位 \(\Delta\mathbf x\) を、混合率 \(\lambda\) で加える。\(\lambda\) は、<code>reference_blend_default</code>（既定 1.0）から半分ずつ小さくして最大 <code>reference_linesearch_max_iters</code>（既定 24）回まで試し、RZ 体積・コーナーヤコビアン・ガウス点ヤコビアンが、参照メッシュの値に対する相対下限（既定 1.0e-8）を割らない最大の値を採る。</p>
+      <p>起動の条件は 2 つあり、どちらも既定で有効である。(a) セル重心の \(\sin\theta=|r_c|/\sqrt{r_c^2+z_c^2}\)（\(\theta\) は +z 軸からの極角）の最小値が、<code>reference_trigger_axis_margin_threshold</code>（既定 1.0e-2）を下回る。この \(\sin\theta\) は、軸マージン（単位 cm²）とは別の量である。(b) コーナーヤコビアンの比（各コーナーの現在の値を初期メッシュでの値で割った値）と、対角コーナーの辺長の比（セルの 1 つのコーナーに接する 2 辺の長さの平均 \(b_{\rm eff}\) の、初期メッシュに対する比）の最小値が、<code>reference_trigger_corner_j_ratio_threshold</code>（既定 0.5）を下回る。</p>
 
       <h3 id="terms-m1">M1 の目的関数</h3>
       <p><strong>M1 の目的関数（M1 objective）</strong>は、リゾーンソルバ <code>m1_tmop</code> が最小化する、メッシュの品質の関数である。「M1」は、この目的関数のキーの接頭辞（<code>m1_*</code>）で、TMOP（target-matrix optimization paradigm [3]）の考え方による。式は<a href="#rezone-solvers">リゾーンソルバ族</a>に示す。4 つの項の和で、重みの既定は、整列重み \(\gamma_{\rm align}\)（<code>m1_gamma_align</code>）が 0、係留の重み \(\lambda_{\rm tether}\)（<code>m1_lambda_tether</code>）が 0、極方向の行の間隔の重み \(w_\theta\)（<code>m1_theta_reg</code>）が 0、障壁の重み \(\beta\)（<code>m1_barrier_beta</code>）が 1.0e-3 である。</p>
@@ -35,7 +36,7 @@
 
     <section aria-labelledby="rezone-solvers">
       <h2 id="rezone-solvers">リゾーンソルバ族</h2>
-      <p><code>legacy_winslow</code> は、既定である簡略化直交 Winslow 更新 [1] をビット単位で従来どおりに保つ。論理格子（logical grid）上の計量係数（metric coefficients）を現在の座標から 1 反復遅らせてヤコビ反復（Jacobi iteration）し、交差微分項（cross derivative term）を省いた式（ここでの \(\alpha\)・\(\beta\) は Winslow の計量係数であり、輻射ページの同名記号とは無関係である）</p>
+      <p><code>legacy_winslow</code> は、既定である簡略化直交 Winslow 更新 [1] をビット単位で従来どおりに保つ。論理格子（logical grid）上の計量係数（metric coefficients）を現在の座標から 1 反復遅らせてヤコビ反復（Jacobi iteration）し、交差微分項（cross derivative term）を省いた式（ここでの \(\alpha\)・\(\beta\) は Winslow の計量係数であり、輻射の頁の同名記号とは無関係である）</p>
       $$
       r_{i,j}^{new}=\frac{\alpha(r_{i+1,j}+r_{i-1,j})+\beta(r_{i,j+1}+r_{i,j-1})}
       {2(\alpha+\beta)}

@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Analytic gates compare against known solutions, independent integrals, conservation identities, or convergence, and localize sign, unit, coefficient, and boundary errors.</li>
-        <li>A golden is a change detector for one grid and one set of run conditions, not proof of correctness or grid convergence.</li>
-        <li>Deterministic 1D paths require bitwise run-to-run identity with the same binary, input, and GPU configuration.</li>
-        <li>In 2D RZ as well, the floating-point sums that enter the state or the time step in one step run in a fixed order, and two runs of the same configuration must agree bitwise. <a href="../verification/index.html#reproducibility">Noise bands</a> (bands, calibrated from the scatter of same-configuration replicas, that set how large a difference is accepted) apply only to paths whose replicas differ, deck by deck and metric by metric.</li>
+        <li><strong>Analytic gates:</strong> Analytic gates compare against known solutions, independent integrals, conservation identities, or convergence, and localize sign, unit, coefficient, and boundary errors.</li>
+        <li><strong>Role of goldens:</strong> A golden is a change detector for one grid and one set of run conditions, not proof of correctness or grid convergence.</li>
+        <li><strong>1D determinism:</strong> Deterministic 1D paths require bitwise run-to-run identity with the same binary, input, and GPU configuration.</li>
+        <li><strong>2D RZ fixed-order sums and noise bands:</strong> In 2D RZ as well, the floating-point sums that enter the state or the time step in one step run in a fixed order, and two runs of the same configuration must agree bitwise. <a href="../verification/index.html#reproducibility">Noise bands</a> (bands, calibrated from the scatter of same-configuration replicas, that set how large a difference is accepted) apply only to paths whose replicas differ, deck by deck and metric by metric.</li>
       </ul>
     </aside>
 

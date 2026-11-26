@@ -25,7 +25,8 @@
       <p>予測段（predictor stage）では、開始時の力を用いて流体の積分区間の半分だけ節点を進める。予測したセル体積から中点の密度を求め、実際の体積変化、開始時の圧力、開始時の粘性仕事を用いて内部エネルギーを進める。この状態に状態方程式を適用して中点の圧力と物質の音速を求め、中点の状態から人工粘性を評価する。</p>
       <p>修正段（corrector stage）では、開始時の状態から中点の圧力と粘性を用いて節点速度を更新する。力の幾何学的な尺度は、予測した中点速度で積分区間を進めたときの試行変位から求める。節点の拘束条件を適用した後、開始時と修正後の速度の平均で節点を動かす。エネルギー整合な更新では、同じ変位と力の幾何学的な尺度を用いて圧力仕事と粘性仕事を求める。交換を無効にし、電離状態を開始時の値に固定した滑らかな流体運動では、時間 2 次精度である。電子–イオン交換を分割して解く場合、または変化する電離状態を各呼び出しの開始時の値に固定して結合する場合は、時間精度を 1 次とする。</p>
       <p>2D RZ の <code>pc_v0</code> は、<code>time_integration</code> のキーがなかった時代の<a href="../../use/running.html#terms-freeze">凍結設定</a>を再現するために残してある。このキーを持たない凍結設定は <code>pc_v0</code> として読まれる。<code>pc_v0</code> は、旧時刻の力から中点の位置と速度を予測し、中点での幾何と力を評価して、全ステップ更新を修正する。予測段階で内部エネルギーを進めないため、圧縮中の圧力クロージャが古いままとなり、滑らかな流れの時間収束では約 1 次と測定されている。</p>
-      <p><code>midpoint_v1</code>（単一ブロックメッシュの既定）は、中点までのエネルギー整合な仕事を行い、中点の幾何から厳密に \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を再クロージャする。運動量、仕事、エネルギー収支の検査はひとつの中点コーナー力の組を共有する。暫定的な全ステップ更新のあと、修正した中点で力を厳密に 1 回だけ、決定論的に再評価する。最終状態はあらためて \(t^n\) から進め、\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使う。滑らかな流れでの精度次数の測定値（2026-07-27、検証デッキ <code>2d_rz_v3_smooth_temporal</code> による）は \(p_\rho=2.0000\)、\(p_e=1.9999\) で、<code>pc_v0</code> は約 1.0007 である。マルチブロックメッシュ（接続関係を CSR、compressed sparse row 形式で保持する）では、<code>time_integration</code> を省略すると <code>pc_v0</code> になり、<code>midpoint_v1</code> を明示すると中点法が使える。ただし、マルチブロックの中点法では、<code>av_model="scalar_vnr_legacy"</code> と <code>state_supply</code> の境界を入力検証が拒否する。また、混合セル（mixed cell。複数の材料が共存するセル）の圧力緩和（pressure relaxation、<code>Numerics.materials.mixed_cell_closure="pressure_relaxation"</code>。<a href="../../overview/timestep.html#mixed-cell-dt">時間刻み制御</a>の頁に述べた）は中点の段をもたないので、<code>midpoint_v1</code> との組を入力検証が拒否する。HLLC（Harten–Lax–van Leer-contact 近似リーマン解法、approximate Riemann solver）の経路と<a href="../mesh/2d.html#terms-center">中心ボタン</a>（center button） — 極中心を組み立てた「ボタン」メッシュ — の経路は、<code>time_integration</code> の値によらず <code>pc_v0</code> のままである。なお 2 ランク以上の MPI（Message Passing Interface）ではドライバが <code>midpoint_v1</code> を明示的に拒否するため、複数ランクの 2D デッキでは <code>pc_v0</code> を指定する必要がある（<a href="../../overview/mpi.html">MPI ページ</a>参照）。</p>
+      <p><code>midpoint_v1</code>（単一ブロックメッシュの既定）は、中点までのエネルギー整合な仕事を行い、中点の幾何から厳密に \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を再クロージャする。運動量、仕事、エネルギー収支の検査は 1 つの中点コーナー力の組を共有する。暫定的な全ステップ更新のあと、修正した中点で力を厳密に 1 回だけ、決定論的に再評価する。最終状態はあらためて \(t^n\) から進め、\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使う。滑らかな流れでの精度次数の測定値（2026-07-27、検証デッキ <code>2d_rz_v3_smooth_temporal</code> による）は \(p_\rho=2.0000\)、\(p_e=1.9999\) で、<code>pc_v0</code> は約 1.0007 である。</p>
+      <p><code>midpoint_v1</code> の適用にはいくつかの制約がある。マルチブロックメッシュ（接続関係を CSR、compressed sparse row 形式で保持する）では、<code>time_integration</code> を省略すると <code>pc_v0</code> になり、<code>midpoint_v1</code> を明示すると中点法が使えるが、<code>av_model="scalar_vnr_legacy"</code> と <code>state_supply</code> の境界は入力検証が拒否する。混合セル（mixed cell。複数の材料が共存するセル）の圧力緩和（pressure relaxation、<code>Numerics.materials.mixed_cell_closure="pressure_relaxation"</code>。<a href="../../overview/timestep.html#mixed-cell-dt">時間刻み制御</a>の頁に述べた）は中点の段をもたないため、<code>midpoint_v1</code> との組は入力検証が拒否する。HLLC（Harten–Lax–van Leer-contact 近似リーマン解法、approximate Riemann solver）の経路と<a href="../mesh/2d.html#terms-center">中心ボタン</a>（center button。極中心を組み立てた「ボタン」メッシュ）の経路は、<code>time_integration</code> の値によらず <code>pc_v0</code> のままである。さらに 2 ランク以上の MPI（Message Passing Interface）ではドライバが <code>midpoint_v1</code> を明示的に拒否するため、複数ランクの 2D デッキでは <code>pc_v0</code> を指定する必要がある（<a href="../../overview/mpi.html">MPI の頁</a>参照）。</p>
 
       <figure id="fig-hydro-step-flow">
         <img src="../../../assets/hydro-step-flow-ja.png" width="840" height="340" style="max-width:100%;height:auto" alt="2D RZ の流体半ステップ 1 回（midpoint_v1）の手順を、6 つの箱と矢印で順に示した流れ図。旧時刻のコーナー力、中点までの更新、中点のコーナー力の組、暫定的な全ステップ更新、厳密に 1 回だけの再評価、最終更新の順に並ぶ。">
@@ -39,7 +40,7 @@
       <ol>
         <li>\(t^n\) における EOS 適用後の状態から始め、\(P+Q\) と保持しておいたコーナーベクトル \(\mathbf S\) から旧時刻のコーナー力を組み立てる。</li>
         <li>エネルギー整合な更新として中点の位置と速度 \(x^h,u^h\) を進め、中点までの力の仕事を \(e^h\) に積み上げ、中点の幾何から厳密な密度 \(\rho^h=M_c/V(x^h)\) を求め、\((\rho^h,e^h)\) で EOS を再クロージャする。</li>
-        <li>中点でのコーナー力の組 — 圧力、有効化されていればサブゾーン圧力、別配列に置く辺ごとの人工粘性 — をひとつだけ組み立て、運動量にも仕事にもエネルギー収支の検査にも同じものを使う。</li>
+        <li>中点でのコーナー力の組 — 圧力、有効化されていればサブゾーン圧力、別配列に置く辺ごとの人工粘性 — を 1 つだけ組み立て、運動量にも仕事にもエネルギー収支の検査にも同じものを使う。</li>
         <li>暫定的な全ステップ更新 \(x^{n+1,*},u^{n+1,*}\) を作る。</li>
         <li>厳密に 1 回だけ再評価する。修正した中点で幾何、エネルギー、力を計算し直す。これで修正の回数は 1 回に固定され、演算回数が一定になる。</li>
         <li>\(\bar{\mathbf u}=(\mathbf u^n+\mathbf u^{n+1})/2\) を使って \(t^n\) から最終状態をあらためて進め、境界条件を適用し、EOS を再クロージャする。</li>
@@ -70,7 +71,7 @@
       <h2 id="verification">検証</h2>
       <ul>
         <li><code>2d_rz_v3_smooth_temporal</code> は、上記 <code>midpoint_v1</code> の密度とエネルギーの精度次数を測定し、保持されている <code>pc_v0</code> の次数と区別する。</li>
-        <li><a href="standard-problems.html">標準問題による検証</a> 平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存。</li>
+        <li><a href="standard-problems.html">標準問題による検証</a>では、平面 Sod、球対称 Noh、Kidder の解析解との比較、格子収束、質量とエネルギーの保存を検査する。</li>
       </ul>
     </section>
 

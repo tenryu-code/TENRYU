@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Every preset was run to its end time and compared with a run on a twice finer mesh (to 0.5 ns for the CBET one); Studio shows the result on each card, under "Verification run" (<a href="#terms-mesh-difference">terms</a>).</li>
-        <li>The meshes are <a href="#terms-mesh">recommended meshes</a> (built from the experimental conditions by <code>tools/<wbr>assist/<wbr>assist.py recommend-mesh</code>) for the six laser-driven presets and <a href="#terms-mesh">per-layer tables</a> for the five driven by a radiation temperature or a pressure.</li>
-        <li>Known problems are stated with the results: the outermost boundary cell that keeps accelerating on finer meshes under a spherical Marshak drive, the mesh dependence of the absorbed energy in the SNB foil, the <a href="../overview/numerics-foundations.html#floors-safety">clamping</a> of values in the table foil, and the 0.6 % density difference behind the pressure-driven shock.</li>
-        <li>The canonical regression reference is <code>examples/verification/gxii_1d_fld_regression.py</code> — the <a href="../verification/index.html#gxii">GXII benchmark deck</a> (GXII: the twelve-beam GEKKO XII laser at the Institute of Laser Engineering, The University of Osaka).</li>
+        <li><strong>Verified preset runs:</strong> Every preset was run to its end time and compared with a run on a twice finer mesh (to 0.5 ns for the CBET one); Studio shows the result on each card, under "Verification run" (<a href="#terms-mesh-difference">terms</a>).</li>
+        <li><strong>Mesh construction:</strong> The meshes are <a href="#terms-mesh">recommended meshes</a> (built from the experimental conditions by <code>tools/<wbr>assist/<wbr>assist.py recommend-mesh</code>) for the six laser-driven presets and <a href="#terms-mesh">per-layer tables</a> for the five driven by a radiation temperature or a pressure.</li>
+        <li><strong>Known problems stated:</strong> Known problems are stated with the results: the outermost boundary cell that keeps accelerating on finer meshes under a spherical Marshak drive, the mesh dependence of the absorbed energy in the SNB foil, the <a href="../overview/numerics-foundations.html#floors-safety">clamping</a> of values in the table foil, and the 0.6% density difference behind the pressure-driven shock.</li>
+        <li><strong>Canonical regression deck:</strong> The canonical regression reference is <code>examples/verification/gxii_1d_fld_regression.py</code> — the <a href="../verification/index.html#gxii">GXII benchmark deck</a> (GXII: the twelve-beam GEKKO XII laser at the Institute of Laser Engineering, The University of Osaka).</li>
       </ul>
     </aside>
 
@@ -70,7 +70,7 @@
       <p>A <strong>per-layer table</strong> is a mesh method in which the number of cells and the spacing are set for each layer (a material region). The spacing is equal width, equal mass, or geometric; for a geometric spacing, the width of the end cell or the width ratio of adjacent cells is given. Studio computes the nodes and writes them into the deck as <code>Mesh.explicit_nodes</code>, so the grid displayed is exactly the one used in the calculation. A recommended mesh takes its limit from the laser conditions, so it can be made only for a laser-driven deck. The five presets driven by a radiation temperature or a pressure (<code>pressure_driven_shock</code>, <code>marshak_wave</code>, <code>indirect_drive_capsule</code>, <code>sn_radiation_foil</code>, and <code>burn_exploding_pusher</code>) use a per-layer table: the finest cells are on the side where the drive enters, the cell widths are continuous across material interfaces, and the convergence was checked by comparison with a run on a twice finer mesh.</p>
 
       <h3 id="terms-mesh-difference">Mesh difference and verification run</h3>
-      <p>The <strong>mesh difference</strong> is the difference (in %), observable by observable, between the result of the same setup run on a twice finer mesh and the result of the preset. The twice finer mesh is the mesh of the deck that Studio's “Convergence pair” makes from the preset, with twice the number of cells. “Uniform,” “Imported node coordinates,” and the equal-width and equal-mass layers of “Per-layer table” split every original cell in two. “Recommended mesh (from the laser conditions)” and “Declarative zoning (zoning_intent)” generate the mesh anew with twice the target cell count and half any specified cell-measure bounds, so their cells need not be halves of the original cells (see <a href="gui.html#terms-verification-run">the verification run in TENRYU Studio</a> for details). The SNB preset's differences are measured instead against the preset's mesh with every cell split in two. If the observables do not change when the mesh is refined, they are converged on the preset's mesh. The convergence target for the absorbed energy is 3 %. Differences that exceed the target are stated as they are.</p>
+      <p>The <strong>mesh difference</strong> is the difference (in %), observable by observable, between the result of the same setup run on a twice finer mesh and the result of the preset. The twice finer mesh is the mesh of the deck that Studio's "Convergence pair" makes from the preset, with twice the number of cells. "Uniform", "Imported node coordinates", and the equal-width and equal-mass layers of "Per-layer table" split every original cell in two. "Recommended mesh (from the laser conditions)" and "Declarative zoning (zoning_intent)" generate the mesh anew with twice the target cell count and half any specified cell-measure bounds, so their cells need not be halves of the original cells (see <a href="gui.html#terms-verification-run">the verification run in TENRYU Studio</a> for details). The SNB preset's differences are measured instead against the preset's mesh with every cell split in two. If the observables do not change when the mesh is refined, they are converged on the preset's mesh. The convergence target for the absorbed energy is 3%. Differences that exceed the target are stated as they are.</p>
       <p>The <strong>verification run</strong> is the name of the result field on a Studio card: the run of the preset to its end time in which the mesh difference was measured. It is distinct from <code>tenryu validate</code>, which checks an input, and from <code>tenryu verify</code>, which runs the solver's verification. Studio's "Convergence pair" builds a finer deck for your own deck (the case name ends in <code>_fine</code>) so that you can check mesh differences (see the <a href="gui.html#terms-preset">TENRYU Studio</a> page).</p>
 
       <h3 id="terms-corona">The corona ramp, the ghost corona, and radial absorption</h3>
@@ -113,57 +113,57 @@
           <tr>
             <th><code>pressure_driven_shock</code><br>Pressure-driven shock</th>
             <td>Planar; a constant 1 Mbar on the outer face of a 100 µm ideal-gas slab. Hydro only, one temperature (1T). 5 ns.</td>
-            <td>The shock speed matches the exact Rankine–Hugoniot value of 11.27 km/s within 0.01 %. Behind the shock the flow velocity is 0.14 % and the density 0.6 % above the exact values; the density difference does not shrink on a finer mesh (cause not identified).</td>
+            <td>The shock speed matches the exact Rankine–Hugoniot value of 11.27 km/s within 0.01%. Behind the shock the flow velocity is 0.14% and the density 0.6% above the exact values; the density difference does not shrink on a finer mesh (cause not identified).</td>
           </tr>
           <tr>
             <th><code>marshak_wave</code><br>Radiative heat wave</th>
             <td>Planar; a 120 eV radiation drive on a 0.2 g/cm³ slab with the hydrodynamics off. Gray FLD, 1T. 1 ns.</td>
-            <td>At 1 ns the electron temperature at the wall is 104 eV and the front is 37.9 µm from the wall (20.6 µm at 0.5 ns); mesh difference of the front position 0.16 %.</td>
+            <td>At 1 ns the electron temperature at the wall is 104 eV and the front is 37.9 µm from the wall (20.6 µm at 0.5 ns); mesh difference of the front position 0.16%.</td>
           </tr>
           <tr>
             <th><code>laser_foil</code><br>Laser-driven planar foil</th>
             <td>Planar; a 25 µm CH foil at 351 nm, 1e14 W/cm² for 1 ns. <a href="#terms-corona">Radial absorption</a>, <a href="#terms-corona">ghost corona</a>, implicit two-temperature electron conduction. 1.5 ns.</td>
-            <td>Absorption 89 %. The shock reaches the rear wall at 0.62 ns; the mean ablation pressure until then is 17 Mbar. Mesh differences: absorbed energy 3.3 %, ablation pressure 2.2 %.</td>
+            <td>Absorption 89%. The shock reaches the rear wall at 0.62 ns; the mean ablation pressure until then is 17 Mbar. Mesh differences: absorbed energy 3.3%, ablation pressure 2.2%.</td>
           </tr>
           <tr>
             <th><code>laser_shell_implosion</code><br>Direct-drive shell implosion</th>
             <td>Spherical; a 7 µm CD shell of 250 µm outer radius on 0.02 g/cm³ D2 gas, a 527 nm Gaussian pulse (3e14 W/cm² peak, 1 ns FWHM) absorbed by ray tracing. 2.4 ns.</td>
-            <td>Absorption 67 %, <a href="#terms-implosion">stagnation</a> at 1.83 ns, <a href="#terms-implosion">convergence ratio</a> 5.0 (minimum radius 49 µm), peak density 141 g/cm³; mesh differences within 0.5 %.</td>
+            <td>Absorption 67%, <a href="#terms-implosion">stagnation</a> at 1.83 ns, <a href="#terms-implosion">convergence ratio</a> 5.0 (minimum radius 49 µm), peak density 141 g/cm³; mesh differences within 0.5%.</td>
           </tr>
           <tr>
             <th><code>indirect_drive_capsule</code><br>Indirect-drive implosion</th>
             <td>Spherical; a capsule of a 30 µm CH ablator on DT gas driven through the outer boundary by a radiation temperature Tr(t) (120 eV foot, 200 eV main drive, ending at 2.6 ns). Gray FLD, 2T. 3 ns.</td>
-            <td>Stagnation at 2.42 ns, minimum radius 47 µm, convergence ratio 6.7, peak density 38 g/cm³; mesh difference of the minimum radius 1.8 %. On a finer mesh the outermost boundary cell keeps accelerating after the drive ends and the energy entering through the boundary grows 110-fold (a known defect).</td>
+            <td>Stagnation at 2.42 ns, minimum radius 47 µm, convergence ratio 6.7, peak density 38 g/cm³; mesh difference of the minimum radius 1.8%. On a finer mesh the outermost boundary cell keeps accelerating after the drive ends and the energy entering through the boundary grows 110-fold (a known defect).</td>
           </tr>
           <tr>
             <th><code>sn_radiation_foil</code><br>Radiation-driven planar foil (S<sub>N</sub>)</th>
             <td>Planar; a 40 µm CH foil driven by 150 eV radiation through its outer face. S<sub>N</sub> transport (16 directions, 4 groups). 2 ns.</td>
-            <td>The shock reaches the rear wall at 0.74 ns; ablated mass 3.1 mg/cm²; the S<sub>N</sub> iteration converged at every step. Mesh difference of the ablated mass 0.6 %.</td>
+            <td>The shock reaches the rear wall at 0.74 ns; ablated mass 3.1 mg/cm²; the S<sub>N</sub> iteration converged at every step. Mesh difference of the ablated mass 0.6%.</td>
           </tr>
           <tr>
             <th><code>snb_nonlocal_foil</code><br>Nonlocal electron heat conduction (SNB)</th>
             <td>Planar; a 25 µm CH foil at 351 nm, 5e14 W/cm² for 1 ns, with the electron heat flux from the SNB nonlocal model. 1.2 ns.</td>
-            <td>Absorption 88 %. The shock reaches the rear wall at 0.36 ns; the mean ablation pressure until then is 47 Mbar. Against the preset's mesh with every cell split in two, the absorbed energy differs by 0.7 %.</td>
+            <td>Absorption 88%. The shock reaches the rear wall at 0.36 ns; the mean ablation pressure until then is 47 Mbar. Against the preset's mesh with every cell split in two, the absorbed energy differs by 0.7%.</td>
           </tr>
           <tr>
             <th><code>cbet_hot_electrons</code><br>CBET and hot electrons</th>
             <td>Spherical; the 12 GXII ports with CBET and hot electrons from two-plasmon decay (TPD) and stimulated Raman scattering (SRS) (threshold model). A 20 µm CD shell, 351 nm at 5e14 W/cm² for 1 ns, 200 rays per beam. 1.2 ns. The Studio card is titled "Direct drive with CBET and hot electrons".</td>
-            <td>Run to 1.2 ns (2.6 h and 110 000 steps on an RTX 4090; a step takes about 5 ms at the start of the pulse and grows with the corona to about 200 ms at the end). Absorption 74 %. The CBET iteration converged on every step (3 iterations on average). No hot electrons arise in this setup: the TPD threshold measure I14·Ln·λ/(82 Te) (I14 is the laser intensity divided by 10<sup>14</sup> W/cm², Ln the density scale length [µm], λ the wavelength [µm], and Te the electron temperature [keV]; <a href="gui.html#tpd-threshold">definition</a>) peaks at 0.79 (1.1 ns), below 1, so the conversion of laser power to hot electrons stays 0 throughout. Against the twice finer mesh, compared up to 0.5 ns: the absorbed energy is 1.3 % lower on the finer mesh, and the mean shell radius differs by 0.2 %, the peak density by 1.6 %, the areal density ρR by 0.4 %, and the TPD threshold measure by 2.0 %. A comparison to the end time is not done yet: the finer run takes about 11 h.</td>
+            <td>Run to 1.2 ns (2.6 h and 110 000 steps on an RTX 4090; a step takes about 5 ms at the start of the pulse and grows with the corona to about 200 ms at the end). Absorption 74%. The CBET iteration converged on every step (3 iterations on average). No hot electrons arise in this setup: the TPD threshold measure I14·Ln·λ/(82 Te) (I14 is the laser intensity divided by 10<sup>14</sup> W/cm², Ln the density scale length [µm], λ the wavelength [µm], and Te the electron temperature [keV]; <a href="gui.html#tpd-threshold">definition</a>) peaks at 0.79 (1.1 ns), below 1, so the conversion of laser power to hot electrons stays 0 throughout. Against the twice finer mesh, compared up to 0.5 ns: the absorbed energy is 1.3% lower on the finer mesh, and the mean shell radius differs by 0.2%, the peak density by 1.6%, the areal density ρR by 0.4%, and the TPD threshold measure by 2.0%. A comparison to the end time is not done yet: the finer run takes about 11 h.</td>
           </tr>
           <tr>
             <th><code>burn_exploding_pusher</code><br>Burning exploding pusher</th>
             <td>Spherical; a 10 µm CD shell on 0.004 g/cm³ DT gas driven by a stepped Tr(t) (60, 120, 180 eV). DT fusion burn, ion plasma viscosity, ion heat conduction, 8-group radiation diffusion. 4 ns.</td>
-            <td>DT neutron yield 3.9e10, <a href="#terms-implosion">bang time</a> 2.74 ns, stagnation at 2.92 ns, convergence ratio 4.2. Mesh differences: yield 1.5 %, bang time 0.2 %. The known outer-boundary defect appears on a finer mesh (about 5 times the boundary energy).</td>
+            <td>DT neutron yield 3.9e10, <a href="#terms-implosion">bang time</a> 2.74 ns, stagnation at 2.92 ns, convergence ratio 4.2. Mesh differences: yield 1.5%, bang time 0.2%. The known outer-boundary defect appears on a finer mesh (about 5 times the boundary energy).</td>
           </tr>
           <tr>
             <th><code>table_radiation_foil</code><br>Material tables and multigroup radiation</th>
             <td>Planar; a 25 µm CD foil on the CD table (<a href="#terms-tmat">tmat</a>: equation of state and 80-group opacity) at 351 nm, 1e14 W/cm², the corona's X-rays solved by multigroup FLD. 1.5 ns.</td>
-            <td>Absorption 87 %. The shock reaches the rear wall at 0.64 ns; the mean ablation pressure until then is 16 Mbar. Mesh difference of the absorbed energy 2.8 %. Values are clamped 9.4 million times during the run; which quantity is clamped has not been identified.</td>
+            <td>Absorption 87%. The shock reaches the rear wall at 0.64 ns; the mean ablation pressure until then is 16 Mbar. Mesh difference of the absorbed energy 2.8%. Values are clamped 9.4 million times during the run; which quantity is clamped has not been identified.</td>
           </tr>
           <tr>
             <th><code>cold_equilibrium_layers</code><br>Two-layer target in cold equilibrium</th>
             <td>Planar; a 25 µm CD ablator on 50 µm of liquid D2 with table equations of state (tmat), held in mechanical equilibrium at the initial state by the <a href="#terms-cold-equilibrium">cold-equilibrium constitutive law</a>; laser drive. 1.5 ns.</td>
-            <td>Absorption 88 %, mean ablation pressure 16 Mbar; the shock reaches the rear wall at 1.36 ns. Every compared quantity is within 2.4 % on a finer mesh.</td>
+            <td>Absorption 88%, mean ablation pressure 16 Mbar; the shock reaches the rear wall at 1.36 ns. Every compared quantity is within 2.4% on a finer mesh.</td>
           </tr>
         </tbody>
       </table>

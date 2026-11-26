@@ -24,7 +24,7 @@
 
     <section aria-labelledby="introduction">
       <h2 id="introduction">Introduction</h2>
-      <p>The <a href='raytrace.html'>characteristic ray integrator</a> follows rays through a spherical plasma and accumulates <a href='absorption.html'>collisional absorption</a> along their paths. The exponential profile isolates absorption near a critical turning point. The corona samples turning points at different radii. In the sphere, refraction at a density step changes the length of the absorbing chord.</p>
+      <p>The <a href="raytrace.html">characteristic ray integrator</a> follows rays through a spherical plasma and accumulates <a href="absorption.html">collisional absorption</a> along their paths. The exponential profile isolates absorption near a critical turning point. The corona samples turning points at different radii. In the sphere, refraction at a density step changes the length of the absorbing chord.</p>
       <p>The analytic comparisons draw on the absorption integral for an exponential profile [2, p. 129, Eqs. (4.84)–(4.88)], rays in an inverse-square corona [3, p. 12, Eqs. (19)–(21)], and attenuation in a uniform sub-critical plasma [4, p. 4]. The profiles and the convergence criteria below define the TENRYU tests.</p>
     </section>
 
@@ -36,9 +36,9 @@
         <thead><tr><th scope="col">Setting</th><th scope="col">Value</th></tr></thead>
         <tbody>
           <tr><th scope="row">Geometry and mesh</th><td><code>1D_SPH</code>, uniform radial cells from the center to the outer face</td></tr>
-          <tr><th scope="row">Laser</th><td>One 351 nm beam directed along −z, at constant power 10<sup>7</sup> erg/s</td></tr>
+          <tr><th scope="row">Laser</th><td>One 351 nm beam directed along −z, at constant power 10<sup>7</sup> erg/s (Maxwellian absorption fraction is independent of power)</td></tr>
           <tr><th scope="row">Trace</th><td><code>raytrace_2d</code> mode with characteristic integration and critical-surface absorption termination disabled</td></tr>
-          <tr><th scope="row">Plasma and duration</th><td>Hydrogen with fixed charge one and equal electron and ion temperatures. One laser call spans 10<sup>−13</sup> s with hydrodynamics, conduction, and radiation disabled.</td></tr>
+          <tr><th scope="row">Plasma and duration</th><td>Hydrogen with fixed charge one and equal electron and ion temperatures. One laser call spans 10<sup>−13</sup> s with hydrodynamics, conduction, and radiation disabled (absorption fraction is independent of duration).</td></tr>
           <tr><th scope="row">Absorption closure</th><td>Maxwellian absorption. The exponential profile and corona fix the Coulomb logarithm at 7. The sphere uses the default logarithm.</td></tr>
         </tbody>
       </table>
@@ -121,7 +121,7 @@
         W_k(r)=A(b_k)-2e^{-T_t}\sinh D(r),\qquad
         W_{\rm ref}(r)=\sum_k p_k W_k(r) .
       \end{aligned} $$
-      <p>In the corona, \(u_r\) is the square root defined above for the ray under consideration and \(D(r)\) is the one-way optical depth from the turning point to a face at radius \(r\). \(D(r)\) is zero at and below the turning point. \(T_t\) is the one-way depth from the outer boundary to the turning point for the same ray. In the expression for the deposited fraction of ray k, all depths are evaluated for that ray. \(W_k(r)\) is the fraction of ray \(k\)'s incident energy deposited outside the face during both passes. The weighted sum \(W_{\rm ref}(r)\) is the corresponding beam fraction.</p>
+      <p>In the corona, \(u_r\) is the square root defined above for the ray under consideration and \(D(r)\) is the one-way optical depth from the turning point to a face at radius \(r\). \(D(r)\) is zero at and below the turning point. \(T_t\) is the one-way depth from the outer boundary to the turning point for the same ray. In the expression for the deposited fraction of ray \(k\), all depths are evaluated for that ray. \(W_k(r)\) is the fraction of ray \(k\)'s incident energy deposited outside the face during both passes. The weighted sum \(W_{\rm ref}(r)\) is the corresponding beam fraction.</p>
       <figure id="fig-absorption">
         <img src="../../../assets/laser1d-standard-problems-absorption-en.png" width="880" height="355" style="max-width:100%;height:auto" alt="Ray absorption and ray weights versus impact parameter in the corona and sphere, and cumulative corona deposition versus radius.">
         <figcaption>Figure C. Coarsest-mesh references. In the left and middle panels, solid blue curves show the absorbed fraction of each ray and dashed vermilion curves show ray weights on the right-hand axes. The green curve at right gives the reference fraction of incident energy deposited outside each interior face of the corona mesh.</figcaption>
@@ -140,7 +140,7 @@
       $$  p_1=\log_2(E_1/E_2),\qquad p_2=\log_2(E_2/E_3),
         \qquad p_{\min}=0.9\,p_{\rm claim} . $$
       <p>The errors in order of mesh refinement are \(E_1\), \(E_2\), and \(E_3\). The observed orders \(p_1,p_2\) use adjacent meshes with cell widths differing by a factor of two. The claimed order \(p_{\rm claim}\) is 3/2 for the exponential profile and both corona measures. The optical depth has a square-root branch at the turning point, so errors in the reconstructed slope and turning radius contribute at order 3/2. The expected order for the sphere is 1. The density reconstruction is linear in radius between adjacent cell centers and uses their average at the shared face on a uniform grid. The reconstruction spreads the sphere's density step over one cell width. The minimum accepted order \(p_{\min}\) is 1.35 or 0.9, respectively.</p>
-      <p>The rounding floor \(F\) is 10<sup>−10</sup>. The quadrature estimate \(\sigma\) is the maximum over rays of their accumulated optical-depth error estimates. The verdict applies the model-error allowance of the exponential profile on each mesh and uses zero for the other two problems. The checks proceed in the order shown below. The two adjacent-mesh orders face a one-sided lower bound [7, PDF pp. 34–35]. Reduced order at singularities and a 10% band in grid-convergence analysis are discussed in [8, p. 182 and p. 326, Table 8.1].</p>
+      <p>The rounding floor \(F\) is 10<sup>−10</sup>. The quadrature estimate \(\sigma\) is the maximum over rays of their accumulated optical-depth error estimates. The verdict applies the model-error allowance of the exponential profile on each mesh and uses zero for the other two problems. Cases where rounding, quadrature, or model error masks the discretization error — or where the mesh sequence is not yet asymptotic — receive <code>BLOCKED</code> to distinguish them from convergence failures (<code>FAIL</code>). The checks proceed in the order shown below. The two adjacent-mesh orders face a one-sided lower bound [7, PDF pp. 34–35]. Reduced order at singularities and a 10% band in grid-convergence analysis are discussed in [8, p. 182 and p. 326, Table 8.1].</p>
       <table class="quick-facts">
         <caption>Table 3. Verdict in evaluation order. The first applicable condition determines the verdict.</caption>
         <thead><tr><th scope="col">Step</th><th scope="col">Condition</th><th scope="col">Verdict</th></tr></thead>
@@ -154,13 +154,13 @@
           <tr><th scope="row">7</th><td>One order meets the threshold and one falls below it.</td><td><code>BLOCKED order_<wbr>not_<wbr>asymptotic</code></td></tr>
         </tbody>
       </table>
-      <p>Both <code>FAIL</code> and <code>BLOCKED</code> cause an assertion failure. Each run also checks the ledger and the three error flags described under <a href='#energy'>energy conservation</a>.</p>
+      <p>Both <code>FAIL</code> and <code>BLOCKED</code> cause an assertion failure. Each run also checks the ledger and the three error flags described under <a href="#energy">energy conservation</a>.</p>
     </section>
 
     <section aria-labelledby="results">
       <h2 id="results">Results</h2>
       <p>The recorded run used one NVIDIA RTX PRO 6000 Blackwell Max-Q GPU on November 25, 2026 at 10:50 JST. The run conditions and printed output are stored in the repository under <code>tools/site_figures/<wbr>data/<wbr>laser1d_standard_problems/</code>.</p>
-      <p>The <code>unresolved_quadrature</code> count records ray pieces whose quadrature was accepted at the panel depth or count cap. Their estimated errors enter \(\sigma\). The count itself has no zero requirement.</p>
+      <p>The <code>unresolved_quadrature</code> count records ray pieces whose adaptive quadrature was accepted at the panel depth or count cap. Their estimated errors enter \(\sigma\); even in the inverse-square corona of Table 4, \(\sigma\) remains below 1% of the measured error (within Step 3 of Table 3), so the count itself has no zero requirement.</p>
       <table class="quick-facts">
         <caption>Table 4. Measured errors, ledger residual, and capped quadrature pieces on each mesh. A dash marks an unmeasured quantity.</caption>
         <thead><tr><th scope="col">Problem</th><th scope="col">Cells</th><th scope="col">\(E_A\)</th><th scope="col">\(E_W\)</th><th scope="col">\(\sigma\)</th><th scope="col">Ledger</th><th scope="col">Capped pieces</th></tr></thead>
@@ -210,7 +210,7 @@
       $$  L(\alpha)=1-\frac{0.553}{1+(0.27/\alpha)^{0.75}},
         \qquad L(0)=1 . $$
       <p>\(\alpha\) is the shell's Langdon parameter and \(L(\alpha)\) is its absorption multiplier. The measured absorption and deposition errors, each divided by the Langdon reference beam absorption fraction \(f_{\rm ref}\), must be at most 0.01. They are 2.97804 × 10<sup>−4</sup> and 1.42876 × 10<sup>−4</sup>, respectively.</p>
-      <p>The carbon–hydrogen check uses the finest exponential mesh, equal number fractions, and fixed charges of 6 and 1. The effective charge \(Z_{\rm eff}\) is the ratio of the number-fraction-weighted second and first charge moments, giving 37/7. The test enables the species-dependent calculation and raises the temperature by (37/7)<sup>2/3</sup>, which leaves the factor proportional to \(Z_{\rm eff}\) divided by temperature to the power 3/2 equal to its value in the hydrogen reference. It compares the absorbed fraction with the original exponential reference. The absolute error is 2.21966 × 10<sup>−6</sup> against a tolerance of 0.01. Both closure checks pass.</p>
+      <p>The carbon–hydrogen check uses the finest exponential mesh, equal number fractions, and fixed charges of 6 and 1. The effective charge \(Z_{\rm eff}\) is the ratio of the number-fraction-weighted second and first charge moments, giving 37/7. The test enables the species-dependent calculation and raises the temperature by (37/7)<sup>2/3</sup>, which keeps \(Z_{\rm eff}\) divided by temperature to the power 3/2 equal to pure hydrogen; the absorption coefficient is therefore identical and the original exponential analytic reference applies directly. The absolute error is 2.21966 × 10<sup>−6</sup> against a tolerance of 0.01. Both closure checks pass.</p>
     </section>
 
     <section aria-labelledby="limitations">
@@ -239,12 +239,12 @@
     <section aria-labelledby="references">
       <h2 id="references">References</h2>
       <ol class="references">
-        <li>T. W. Johnston and J. M. Dawson, “Correct values for high-frequency power absorption by inverse bremsstrahlung in plasmas,” <i>Phys. Fluids</i> 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
+        <li>T. W. Johnston and J. M. Dawson, "Correct values for high-frequency power absorption by inverse bremsstrahlung in plasmas," Phys. Fluids 16, 722 (1973). <a href="https://doi.org/10.1063/1.1694419">doi:10.1063/1.1694419</a></li>
         <li>P. Michel, <i>Introduction to Laser-Plasma Interactions</i> (Springer, 2023). <a href="https://doi.org/10.1007/978-3-031-23424-8">doi:10.1007/978-3-031-23424-8</a></li>
-        <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, “Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion,” <i>J. Comput. Phys.</i> 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
-        <li>A. Hyder, W. Fox, K. V. Lezhnin, and S. R. Totorica, “Ray-tracing laser-deposition model for plasma particle-in-cell simulation,” <i>Comput. Phys. Commun.</i> 318, 109847 (2026). <a href="https://doi.org/10.1016/j.cpc.2025.109847">doi:10.1016/j.cpc.2025.109847</a></li>
-        <li>R. Ramis and J. Meyer-ter-Vehn, “MULTI-IFE—A one-dimensional computer code for Inertial Fusion Energy (IFE) target simulations,” <i>Comput. Phys. Commun.</i> 203, 226 (2016). <a href="https://doi.org/10.1016/j.cpc.2016.02.014">doi:10.1016/j.cpc.2016.02.014</a></li>
-        <li>R. K. Follett, I. V. Igumenshchev, A. Colaïtis, J. P. Palastro, D. H. Froula, and D. Turnbull, “Modeling cross-beam energy transfer with sector ray tracing,” <i>Phys. Plasmas</i> 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
+        <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, "Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion," J. Comput. Phys. 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
+        <li>A. Hyder, W. Fox, K. V. Lezhnin, and S. R. Totorica, "Ray-tracing laser-deposition model for plasma particle-in-cell simulation," Comput. Phys. Commun. 318, 109847 (2026). <a href="https://doi.org/10.1016/j.cpc.2025.109847">doi:10.1016/j.cpc.2025.109847</a></li>
+        <li>R. Ramis and J. Meyer-ter-Vehn, "MULTI-IFE—A one-dimensional computer code for Inertial Fusion Energy (IFE) target simulations," Comput. Phys. Commun. 203, 226 (2016). <a href="https://doi.org/10.1016/j.cpc.2016.02.014">doi:10.1016/j.cpc.2016.02.014</a></li>
+        <li>R. K. Follett, I. V. Igumenshchev, A. Colaïtis, J. P. Palastro, D. H. Froula, and D. Turnbull, "Modeling cross-beam energy transfer with sector ray tracing," Phys. Plasmas 32, 022709 (2025). <a href="https://doi.org/10.1063/5.0253858">doi:10.1063/5.0253858</a></li>
         <li>K. Salari and P. Knupp, <i>Code Verification by the Method of Manufactured Solutions</i>, SAND2000-1444 (2000). <a href="https://doi.org/10.2172/759450">doi:10.2172/759450</a></li>
         <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
       </ol>

@@ -21,10 +21,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>3 種の HDF5: スナップショット <code>&lt;name&gt;_NNNN.h5</code>、履歴 <code>&lt;name&gt;_history.h5</code>（追記型）、チェックポイント <code>&lt;name&gt;_ckpt_NNNN.h5</code>。出力間隔は「N ステップごと」（<code>plot_every</code> 等）と「T 秒ごと」（<code>plot_every_s</code> 等）の OR で発火する。</li>
-        <li>全数値データセットに <code>units</code> 属性が付く。<code>mesh/</code>・<code>hydro/</code> のデータセット名は内部の State フィールド名と 1:1 対応する。</li>
-        <li>爆縮（implosion）の停滞期（stagnation phase）のピークは短い — 2026-07-31 の <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）級のレーザー爆縮の計算では約 15 ps — ため、ピーク値はスナップショットではなくステップごとの履歴（<code>implosion/*</code>）から読む。</li>
-        <li>同じ出力ディレクトリへ再実行すると、上書きせず <code>_001</code> のような連番ディレクトリに書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
+        <li><strong>3 種の HDF5 と出力間隔：</strong>スナップショット <code>&lt;name&gt;_NNNN.h5</code>、履歴 <code>&lt;name&gt;_history.h5</code>（追記型）、チェックポイント <code>&lt;name&gt;_ckpt_NNNN.h5</code> の 3 種を出力する。出力間隔は「N ステップごと」（<code>plot_every</code> 等）と「T 秒ごと」（<code>plot_every_s</code> 等）の OR で発火する。</li>
+        <li><strong>単位と State の対応：</strong>全数値データセットに <code>units</code> 属性が付く。<code>mesh/</code>・<code>hydro/</code> のデータセット名は内部の State フィールド名と 1:1 対応する。</li>
+        <li><strong>停滞ピークの読み取り：</strong>爆縮（implosion）の停滞期（stagnation phase）のピークは短い（2026-07-31 の <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）級のレーザー爆縮の計算では約 15 ps）ため、ピーク値はスナップショットではなくステップごとの履歴（<code>implosion/*</code>）から読む。</li>
+        <li><strong>出力先の自動連番：</strong>同じ出力ディレクトリへ再実行すると、上書きせず <code>_001</code> のような連番ディレクトリに書かれる。「結果が変わらない」と思ったらまず出力先を確認する。</li>
       </ul>
     </aside>
 
@@ -65,20 +65,20 @@
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
-<p>この頁の来歴に固有の用語を、以下で定義する。来歴と凍結設定である。エネルギー台帳の人工項、シェルの半径・厚さ・IFAR・収束比、ホットスポットのガスは、<a href="history.html#terms">履歴の頁の用語の節</a>で定義する。</p>
+      <p>この頁の来歴に固有の用語を、以下で定義する。来歴と凍結設定である。エネルギー台帳の人工項、シェルの半径・厚さ・IFAR・収束比、ホットスポットのガスは、<a href="history.html#terms">履歴の頁の用語の節</a>で定義する。</p>
 
       <h3 id="terms-provenance">来歴と凍結設定</h3>
       <p><strong>来歴（provenance）</strong>は、ある出力がどの入力とどの実行環境から生まれたかを、後から確かめるための記録である。TENRYU は、デッキの写し <code>config/&lt;name&gt;_namelist.py</code>（<code>Output.save_namelist_copy</code>、既定は True）、凍結設定の JSON <code>config/&lt;name&gt;_frozen.json</code>（<code>Output.save_frozen_config</code>、既定は True）、実行の要約 <code>run_info.json</code>、実行ログ <code>log/tenryu.log</code>、各 HDF5 の <code>metadata/</code> グループ（デッキ全文 <code>namelist_source</code>、凍結設定 <code>frozen_config</code>、輻射群の境界 <code>group_bounds_eV</code> など）を来歴として残す。「入力したつもりの値」ではなく、実行が実際に受け取った構成を監査する一次資料である。各ファイルの中身は<a href="#provenance">来歴の節</a>に書く。再開が元の run の厳密な継続でないときは、ルート属性 <code>restart_provenance</code> にその印を書き、再開した run の出力を継続した run の出力と区別できるようにする。グループ名に provenance を含む <code>diagnostics/ale_provenance/v1/</code> は別の記録で、ALE の設定が標準のプロファイルに沿っていたかを記す（<a href="history.html">履歴の頁</a>の表）。</p>
-      <p><strong>凍結設定（frozen configuration）</strong>は、初期化時に Python の関数を表にし、既定値を補って確定した設定である。定義は<a href="../running.html#terms-freeze">実行ページ</a>にある。来歴の凍結設定は、解決した設定の全体と実行時の値の要約を持つ <code>config/&lt;name&gt;_frozen.json</code> と、再開時の照合に使う HDF5 の <code>metadata/frozen_config</code> の 2 つの形で残る。HDF5 の属性 <code>git_hash</code> は常に <code>"unknown"</code> なので、HDF5 からは実行したコミットが分からない。<code>config/&lt;name&gt;_frozen.json</code> の <code>_tenryu_version</code> は、公開版の番号である。</p>
+      <p><strong>凍結設定（frozen configuration）</strong>は、初期化時に Python の関数を表にし、既定値を補って確定した設定である。定義は<a href="../running.html#terms-freeze">実行の頁</a>にある。来歴の凍結設定は、解決した設定の全体と実行時の値の要約を持つ <code>config/&lt;name&gt;_frozen.json</code> と、再開時の照合に使う HDF5 の <code>metadata/frozen_config</code> の 2 つの形で残る。HDF5 の属性 <code>git_hash</code> は常に <code>"unknown"</code> なので、HDF5 からは実行したコミットが分からない。<code>config/&lt;name&gt;_frozen.json</code> の <code>_tenryu_version</code> は、公開版の番号である。</p>
     </section>
 
     <section aria-labelledby="provenance">
-      <h2 id="provenance">来歴: 凍結設定の JSON・run_info・ログ</h2>
+      <h2 id="provenance">来歴：凍結設定の JSON・run_info・ログ</h2>
       <p><code>config/&lt;name&gt;_frozen.json</code> は、既定値を解決した設定の全体（<code>main</code>・<code>mesh</code>・<code>materials</code>・<code>laser</code>・<code>numerics</code> などの節。Python の関数は <code>name</code>・<code>repr</code>・<code>source_hash</code>（ソースコードのハッシュ）で記す）に、TENRYU のバージョン <code>_tenryu_version</code>、凍結した UTC 時刻 <code>_frozen_at</code>、デッキ本文のハッシュ <code>_namelist_source_hash</code>、<code>frozen_summary</code> を加えた JSON である。<code>frozen_summary</code> には、初期の密度（最小・最大・平均）、電子温度とイオン温度（最小・最大）、材料ごとの体積、および初期化時に表へ変換した関数ごとの時間の範囲（<code>t_min</code>・<code>t_max</code>）・点数 <code>n_points</code>・最大値 <code>peak_value</code>・積分値 <code>integrated_value</code> が入る。HDF5 の <code>metadata/frozen_config</code> は、同じ設定から <code>_tenryu_version</code>・<code>_frozen_at</code>・<code>frozen_summary</code> を除いた JSON である。<code>--output-dir</code>（新規 run）や <code>--t-end</code>・<code>--max-steps</code>（再開）で上書きした値は、<code>config/&lt;name&gt;_frozen.json</code> には実際に使った値が入り、<code>metadata/frozen_config</code> にはデッキの値が残る。「入力したつもりの値」ではなく実行が実際に受け取った構成を監査する一次資料であり、再現・比較の際はデッキとともに保管する。<code>run_info.json</code> は実行の要約、<code>log/</code> には実行ログが残る。「設定が効いたか怪しい」ときは、凍結設定の JSON → ログの warning の順に見るのが早い。</p>
     </section>
 
     <section aria-labelledby="analysis-tools">
-      <h2 id="analysis-tools">読み方: CLI・付属ツール・Scope</h2>
+      <h2 id="analysis-tools">読み方：CLI・付属ツール・Scope</h2>
       <p>構造の確認は HDF5 標準ツールで足りる。</p>
       <pre><code>h5ls  outputs/&lt;name&gt;/results/&lt;name&gt;_0010.h5          # グループ一覧
 h5dump -H outputs/&lt;name&gt;/results/&lt;name&gt;_history.h5  # ヘッダ構造</code></pre>

@@ -16,35 +16,36 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>ホット電子 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU のホット電子（hot electron）モデルは、Colaïtis ら [1] と、LLE（Laboratory for Laser Energetics、米国ロチェスター大学）の 1D 流体コード LILAC に倣った、あらかじめ与える形のレーザープラズマ不安定性（laser–plasma instability、LPI）予熱（preheat）を、レーザーのパワーの捕獲（capture）、3 次元マクスウェル分布（3D Maxwellian）の放出スペクトル、円錐方向の求積（quadrature）、直線の弦（chord）に沿う輸送、衝突による減速（collisional slowing-down）、物質へのエネルギー付与（deposition）として組み立てたものである。LPI の波の成長や飽和を自己無撞着（self-consistent）に解くのではなく、ホット電子温度は較正（calibration）された入力として与え、変換効率（conversion efficiency）η(t) は較正された入力または縮約クロージャ（reduced closure）から与える。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+    <p class="abstract">TENRYU のホット電子（hot electron）モデルは、Colaïtis ら [1] と LLE（Laboratory for Laser Energetics、米国ロチェスター大学）の 1D 流体コード LILAC に倣った、レーザープラズマ不安定性（laser–plasma instability。本節の LPI のうち TPD や SRS などの不安定性）による予熱（preheat）の処方モデルである。レーザーパワーの捕獲（capture）、3 次元マクスウェル分布（3D Maxwellian）の放出スペクトル、円錐方向の求積（quadrature）、直線の弦（chord）に沿う輸送、衝突による減速（collisional slowing-down）、物質へのエネルギー付与（deposition）の連鎖として計算を構成する。不安定性の波の成長や飽和を自己無撞着（self-consistent）に解くのではなく、ホット電子温度は較正（calibration）された入力として与え、変換効率（conversion efficiency）η(t) は較正された入力または縮約クロージャ（reduced closure）から与える。この計算に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>既定の<a href="#terms-capture">捕獲面（capture surface）</a>は \(n_e=0.25n_c\)（\(n_e\) は電子密度、\(n_c\) はレーザーの臨界密度（critical density））である。<a href="#scope-source">捕獲の規則</a>で定まるレーザーパワーのうち、割合 η(t) をホット電子に変換する。</li>
-        <li>既定の 3 次元マクスウェル分布を対数間隔の群（group）に分け、<a href="#terms-channel">角度帯（angular band）</a>の求積点を方向の候補とする。既定の 1D 円錐輸送は、候補のあるチャネルごとに各群の弦を 1 本抽出する。</li>
-        <li>1D では、衝突が電子を減速させ、弦に沿う飛程を短くする飛程短縮（range shortening）も計算する。外面では、シース（sheath）が電子を標的へ反射し得る。既定の追跡モードでは、時間刻みの終了時に飛行中の電子を保存する。</li>
-        <li><code>subtract_from_laser=True</code> は、変換したパワーを光線のパワーから差し引き、同じパワーをレーザー吸収とホット電子の両方に数える二重計上を防ぐ。</li>
-        <li><code>1D_SPH</code> では、単一の MPI（Message Passing Interface）ランクで <code>"radial_absorption_1d"</code> または <code>"raytrace_2d"</code> を実行する。平面幾何の <code>"cone"</code> では <code>planar_inner_face</code> の明示が必要である。円筒幾何では <code>"radial"</code> を使う。</li>
+        <li><strong>捕獲：</strong>既定の<a href="#terms-capture">捕獲面（capture surface）</a>は \(n_e=0.25n_c\)（\(n_e\) は電子密度、\(n_c\) はレーザーの臨界密度（critical density））である。<a href="#scope-source">捕獲の規則</a>で定まるレーザーパワーのうち、割合 η(t) をホット電子に変換する。</li>
+        <li><strong>スペクトルと方向：</strong>既定の 3 次元マクスウェル分布を対数間隔の群（group）に分け、<a href="#terms-channel">角度帯（angular band）</a>の求積点を方向の候補とする。既定の 1D 円錐輸送は、放出候補をもつ各チャネルでエネルギー群ごとに弦を 1 本抽出する。</li>
+        <li><strong>1D 輸送：</strong>1D では、衝突が電子を減速させ、弦に沿う飛程を短くする飛程短縮（range shortening）も計算する。外面では、シース（sheath）が電子を標的へ反射し得る。既定の追跡モードでは、時間刻みの終了時に飛行中の電子を保存する。</li>
+        <li><strong>収支：</strong><code>subtract_from_laser=True</code> は、変換したパワーを光線のパワーから差し引き、同じパワーをレーザー吸収とホット電子の両方に数える二重計上を防ぐ。</li>
+        <li><strong>対応次元：</strong><code>1D_SPH</code> では、単一の MPI（Message Passing Interface）ランクで <code>"radial_absorption_1d"</code> または <code>"raytrace_2d"</code> を実行する。平面幾何の <code>"cone"</code> では <code>planar_inner_face</code> の明示が必要である。円筒幾何では <code>"radial"</code> を使う。</li>
       </ul>
     </aside>
 
     <section aria-labelledby="mechanism">
       <h2 id="mechanism">物理機構</h2>
       <p>レーザー強度が閾値を超えると、パラメトリック不安定性（parametric instability） — 2 プラズモン崩壊（two-plasmon decay、TPD）と誘導ラマン散乱（stimulated Raman scattering、SRS） — が大振幅の電子プラズマ波（electron plasma wave）を励起する。これらの不安定性が主に起こる場所が四分の一臨界密度（quarter-critical density）付近になるのは、そこで娘波（daughter wave）の電子プラズマ波の振動数がレーザー振動数の約半分となり、TPD・SRS の周波数整合条件（frequency-matching condition）を満たせるからである。励起されたプラズマ波は電子を捕捉（trapping）し、熱的な主成分をはるかに超える数十〜数百 keV まで加速する。その飛程（range）は熱的な電子よりずっと長いため、衝撃波に先行してシェルを貫き、燃料を予熱して断熱度（adiabat）を上げ、圧縮性能を劣化させる。この予熱を定量化することが、この物理カーネルの目的である。</p>
-      <p>これらの不安定性の成長と飽和は運動論的（kinetic）なスケールで起こる。TENRYU はホット電子温度 \(T_h\)（<code>T_hot_eV</code>）を指定し、変換効率（conversion efficiency）η(t) は較正（calibration）した入力または局所のプラズマ量で駆動する縮約クロージャ（reduced closure）から与える。<a href="#scope-source">捕獲の規則</a>が生成源の位置と変換に使うレーザーパワーを定める。</p>
+      <p>これらの不安定性の成長と飽和は運動論的（kinetic）なスケールで起こる。TENRYU はホット電子温度 \(T_h\)（<code>T_hot_eV</code>）を指定し、変換効率 η(t) は較正した入力または局所のプラズマ量で駆動する縮約クロージャから与える。<a href="#scope-source">捕獲の規則</a>が生成源の位置と変換に使うレーザーパワーを定める。</p>
       <p>既定の 3 次元マクスウェル分布の解析的なモーメントから、対数間隔の各群のパワー重み（power weight）\(W_g\) とパワーで重み付けした平均エネルギー（power-weighted mean energy）を求める。各群の端点値の差を足すと中間項が打ち消し合い、丸め誤差の範囲で \(\sum_g W_g=1\) になる。既定の 1D 円錐輸送では、立体角の求積点を候補とし、各群の<a href="#terms-chord">弦</a>を 1 本抽出する。</p>
       <p>1D では、連続減速（continuous slowing-down）によって経路に沿う電子の運動エネルギーが減る。衝突による角度散乱（collisional angular scattering）は経路の弦方向への平均射影を減らすため、同じエネルギー損失に対して弦方向に進む距離は短くなる。外面のシースは逸出（escape）しない分を反射させ、再流入（reflux）を表す。飛行時間を時間刻みごとに区切ることで、飛行中の電子は後続の時間刻みにも輸送される。<a href="#coupling-timestep">エネルギー台帳（energy ledger）</a>には、付与、逸出、未解決エネルギー、および飛行中エネルギーの変化を計上する。</p>
     </section>
 
     <section aria-labelledby="scope-source">
       <h2 id="scope-source">モデルの適用範囲と生成源</h2>
-      <p><code>Laser.hot_electron.enable=True</code> でモデルを有効にする。<code>raytrace_2d</code> では、内向きの光線が \(n_e=f_s n_c\) を密度の増加方向に初めて横切る点に生成源を置く。スカラーの簡易指定では密度比 \(f_s\) の既定値は 0.25（<code>source_nc_fraction</code>）である。通常の区間は交差点で分け、交差点までの逆制動輻射（inverse bremsstrahlung、IB）吸収を捕獲の前に適用する。臨界密度に達する区間では、区間入口のパワーから捕獲分を差し引いた値を末尾の吸収計算に渡す。<code>radial_absorption_1d</code> では、中点の \(n_e/n_c\) が \(f_s\) 以上になる最初のセルに入るパワーを使い、その外面に動径内向きの生成源を置く。</p>
+      <p><code>Laser.hot_electron.enable=True</code> でモデルを有効にする。<code>raytrace_2d</code> では、内向きの光線が \(n_e=f_s n_c\) を密度の増加方向に初めて横切る点に生成源を置く。スカラーの簡易指定では密度比 \(f_s\) の既定値は 0.25（<code>source_nc_fraction</code>）である。通常の区間は交差点で分け、交差点までの逆制動輻射（inverse bremsstrahlung、IB）吸収を捕獲の前に適用する。臨界密度に達する区間では、区間入口のパワーから捕獲分を差し引いた値を<a href="../laser/absorption.html#terms-tail-closure">裾のクロージャ（tail closure）</a>に渡す。<code>radial_absorption_1d</code> では、中点の \(n_e/n_c\) が \(f_s\) 以上になる最初のセルに入るパワーを使い、その外面に動径内向きの生成源を置く。</p>
       $$
       P_{h,ray}(t)=\eta(t)P_{ray}^{cross}(t).
       $$
-      <p>\(P_{h,ray}(t)\) は時刻 \(t\) に 1 本の光線から変換するパワー、η(t) は変換効率、\(P_{ray}^{cross}\) は上の捕獲の規則で定まる光線のパワーである。<a href="cbet.html">交差ビームエネルギー転送（cross-beam energy transfer、CBET）</a>との併用時は、初回の追跡と各再計算（replay）で捕獲事象（capture event）の位置に減耗を適用する。事象までの光学的厚さは通常の区間では交差点までの値、臨界密度に達する区間では入口から 0 である。最終の再計算で、参照光線ごとにポート順に合算した捕獲記録と交差点の半径・方向を輸送に渡す。併用には <code>cbet.geometry_mode="port_section"</code> と <code>eta_mode="model"</code> が必要である。</p>
-      <p>η(t) の与え方は 4 通りある。<a href="#terms-channel">スカラーの簡易指定（scalar shorthand）</a>では、<code>eta_hot</code> が一定値を、<code>eta_hot_table</code> が初期化時に<a href="../../use/running.html#terms-freeze">凍結（freeze）</a>する時間表を与える。<code>sources</code> は最大 4 つの cone / TPD / SRS の<a href="#terms-channel">チャネル（channel）</a>を定義し、チャネルごとに捕獲面、定数または表の η、温度、エネルギー窓、<a href="#terms-channel">角度帯</a>を設定できる。複数のチャネルは \(f_s\) の昇順に発火し、レーザーの減耗を有効にすると同じ順で逐次適用する。さらに <code>eta_mode="model"</code> は、局所のプラズマ量で駆動される η の時間発展を選ぶ。いずれもホット電子生成の縮約処方であり、自己無撞着な LPI の求解にはならない。</p>
+      <p>\(P_{h,ray}(t)\) は時刻 \(t\) に 1 本の光線から変換するパワー、η(t) は変換効率、\(P_{ray}^{cross}\) は上の捕獲の規則で定まる光線のパワーである。<a href="cbet.html">交差ビームエネルギー転送（cross-beam energy transfer、CBET）</a>との併用時は、初回の追跡と各再伝播（replay）で捕獲事象（capture event）の位置に減耗を適用する。事象までの光学的厚さは通常の区間では交差点までの値、臨界密度に達する区間では入口から 0 である。最終の再伝播で、参照光線ごとにポート順に合算した捕獲記録と交差点の半径・方向を輸送に渡す。併用には <code>cbet.geometry_mode="port_section"</code> と <code>eta_mode="model"</code> が必要である。</p>
+      <p>η(t) の与え方は 4 通りある。<a href="#terms-channel">スカラーの簡易指定（scalar shorthand）</a>では、<code>eta_hot</code> が一定値を、<code>eta_hot_table</code> が初期化時に<a href="../../use/running.html#terms-freeze">凍結（freeze）</a>する時間表を与える。<code>sources</code> は最大 4 つの cone / TPD / SRS の<a href="#terms-channel">チャネル（channel）</a>を定義し、チャネルごとに捕獲面、定数または表の η、温度、エネルギー窓、<a href="#terms-channel">角度帯</a>を設定できる。複数のチャネルは \(f_s\) の昇順に発火し、レーザーの減耗を有効にすると同じ順で逐次適用する。さらに <code>eta_mode="model"</code> は、局所のプラズマ量で駆動される η の時間発展を選ぶ。いずれもホット電子生成の縮約処方であり、自己無撞着な不安定性の求解にはならない。</p>
+      <p>実際の 1D 計算では、この変換効率の選び方（<code>eta_mode</code>）に加え、輸送の追跡方式（<code>tracking</code>：既定の <code>"time_dependent"</code> は飛行時間を時間刻みごとに区切って飛行中の電子を保持し、<code>"adiabatic"</code> は 1 時間刻み内で瞬時に減速し切る）と角度モデル（<code>angular_model</code>：既定の <code>"cone"</code> は角度帯の弦を運び、<code>"radial"</code> は検証用に 1 本の動径のみを運ぶ）の 3 軸で構成が決まる。</p>
     </section>
 
     <section aria-labelledby="spectrum-angle">
@@ -103,13 +104,13 @@
         <li>指数分布の群モーメントが erg 単位でアンダーフロー（underflow）することを避けるため、<code>T_hot_eV</code> は 1 eV 以上とする。</li>
         <li>群積分のアンダーフローを避けるため、<code>E_max_over_Th</code> は <code>E_min_over_Th</code> より大きく、600 以下とする。<code>E_min_over_Th</code> は正とする。</li>
         <li>群境界が近づきすぎることを避けるため、対数群幅 \(\ln(\texttt{E_max_over_Th}/\texttt{E_min_over_Th})/\texttt{n_energy_groups}\ge2^{-16}\) を要求する。</li>
-        <li>小さい無次元エネルギーや狭い群では、閉形式のほぼ等しい値どうしの差で桁落ち（cancellation）が起こる。群積分で 26 ビットを超える精度を失う窓と群数の組合せを拒否する。桁落ちによる誤差の上限を見積もるために使う群積分の下限の見積り、またはモーメント関数 \(\psi_1\)・\(\psi_2\) の値が 0 または非有限となり、この上限を計算できない場合も同じ検査で拒否する。</li>
+        <li>小さい無次元エネルギーや狭い群では、閉形式のほぼ等しい値どうしの差で桁落ち（cancellation）が起こる。群積分で 26 ビットを超える精度を失うと見積もられる窓と群数の組合せは拒否する。その判定に使う群積分の下限値、またはモーメント関数 \(\psi_1\)・\(\psi_2\) の値が 0 または非有限となり、精度損失を評価できない場合も同様に拒否する。</li>
       </ul>
       <p>生成源のパワーと方向の扱いは次のとおりである。</p>
       <ul>
         <li>生成源に使うパワーは、レーザーの経路に応じた<a href="#scope-source">捕獲の規則</a>で決まる。</li>
         <li>円錐の求積では \(\mu\) にガウス–ルジャンドル求積（Gauss–Legendre quadrature）の点、\(\phi\) に等間隔点を使う。重みの総和は 1 であり、既定の 1D 円錐放出では各求積点が方向の候補となる。</li>
-        <li>\(f_s=\texttt{source_nc_fraction}=0.25\) — 既定の捕獲面の位置である四分の一臨界密度である。</li>
+        <li>既定の捕獲面の位置は、四分の一臨界密度 \(f_s=\texttt{source_nc_fraction}=0.25\) である。</li>
         <li><code>subtract_from_laser=True</code> のとき、捕獲後に \((1-\eta)P^{cross}\) がレーザーの経路を進む。<code>False</code> のときは捕獲に使った光線パワーを減らさず先へ進める。</li>
       </ul>
       <p>円錐の軸は光線の進行方向であり、<code>theta_div_deg</code> が半角を定める。極角の余弦には <code>n_mu</code> 点のガウス–ルジャンドル求積、方位角には <code>n_phi</code> 点の等間隔求積を使う。半角を変えると、候補となる弦の集合とそれぞれが通る面密度が変わる。検証用の <code>radial</code> は 1 本の動径に沿って内向きに進む。TPD と SRS の角度帯は<a href="#terms-channel">用語の節</a>に示す。</p>
@@ -120,7 +121,7 @@
       <p>ホット電子がセルへ付与するエネルギーは、電子が出発する半径、出発する向き、電子のエネルギーに強く依存する。1D の流体計算が持つのは半径方向の分布だけなので、TENRYU は光線が運ぶパワーを、生成源、方向、エネルギー群に分けて、電子の輸送の計算へ渡す。この分け方に使う語は、TENRYU の実装に固有の意味をもつので、まとめて定義する。なお、この頁では、ホット電子がセルへエネルギーを渡すことを付与、レーザー光の吸収によってセルへエネルギーが入ることを沈着と書き分ける。</p>
 
       <h3 id="terms-capture">捕獲面と生成源</h3>
-      <p><strong>捕獲面</strong>は、電子密度がレーザーの臨界密度 \(n_c\) の \(f_s\) 倍となる \(n_e=f_s n_c\) の面である。光線が密度の増加方向にこの面を初めて横切る点が交差点である。<a href="#scope-source">捕獲の規則</a>が定めるパワー \(P_{ray}^{cross}\) のうち、割合 η をホット電子に変換する。<code>subtract_from_laser=True</code> のときは残りの \((1-\eta)P_{ray}^{cross}\) を、<code>False</code> のときは元のパワーを先へ進める。捕獲は、指定した効率または縮約クロージャによって生成を表す操作である。</p>
+      <p><strong>捕獲面（capture surface）</strong>は、電子密度がレーザーの臨界密度 \(n_c\) の \(f_s\) 倍となる \(n_e=f_s n_c\) の面である。光線が密度の増加方向にこの面を初めて横切る点が交差点である。<a href="#scope-source">捕獲の規則</a>が定めるパワー \(P_{ray}^{cross}\) のうち、割合 η をホット電子に変換する。<code>subtract_from_laser=True</code> のときは残りの \((1-\eta)P_{ray}^{cross}\) を、<code>False</code> のときは元のパワーを先へ進める。捕獲は、指定した効率または縮約クロージャによって生成を表す操作である。</p>
       <p>捕獲面の密度の割合 \(f_s\) は、スカラーの簡易指定では <code>source_nc_fraction</code>、チャネルでは <code>capture_nc_fraction</code> で与える（どちらも 0 より大きく 1 以下）。既定は 0.25、すなわち四分の一臨界密度で、SRS のチャネルの既定は <code>eta_mode="model"</code> で 0.20、<code>"legacy"</code> で 0.18 である。\(f_s\) は、光線が捕獲面に届くまでに上流で吸収されるパワーと、電子が出発する半径を決める。</p>
       <p><strong>生成源（source）</strong>は、ホット電子が出発する位置、軸の向き、パワーの組である。位置は交差点の半径 \(r_s\)、軸の向きは交差点での光線の進行方向と外向きの動径方向のなす角の余弦 \(\mu_{axis}\)（動径方向に内向きの光線で \(-1\)）、パワーは \(P_h=\eta P^{cross}_{ray}\) である。光線 1 本が、チャネルごとに高々 1 つの生成源を作る。輸送の計算は、同じ<a href="#terms-bin">ビン（bin）</a>に入った生成源を 1 つにまとめたものを単位にする。</p>
 
@@ -131,13 +132,13 @@
       r_s=\frac{1}{P}\sum_k P_k\,r_{s,k},\qquad
       \mu_{axis}=\frac{1}{P}\sum_k P_k\,\mu_{axis,k}.
       $$
-      <p>\(P\)、\(r_s\)、\(\mu_{axis}\) は集約後の生成源のパワー、半径、方向余弦である。ここで \(k\) はビンに入った生成源の添字、\(P_k\)、\(r_{s,k}\)、\(\mu_{axis,k}\) はその生成源のパワー、半径、方向余弦である。輸送はこの平均値から始めるので、出発点をセル面へ丸めることはない。ビンは (セル, 区間) の昇順に処理し、実行のたびに同じ順序になる。</p>
-      <p>ビンの数 16 は定数（コードの <code>kAxisBins</code>）で、namelist のキーではなく、変更できない。ビンにまとめる理由は、輸送の計算量を光線の本数から切り離すためである。1D の光線は 1 ビームあたり既定で 1000 本（<code>Laser.rays_per_beam</code>）あり、交差点ごとに輸送すると計算量が光線の本数に比例する。ビンにまとめると、輸送する生成源は 1 つのチャネルあたり高々 (セル数) × 16 個で、光線の本数に依らない。代償として、同じビンの光線は 1 つの平均の方向に束ねられるので、方向余弦の広がりは 0.125 の分解能でしか残らない。</p>
+      <p>\(P\)、\(r_s\)、\(\mu_{axis}\) は集約後の生成源のパワー、半径、方向余弦である。ここで \(k\) はビンに入った生成源の添字、\(P_k\)、\(r_{s,k}\)、\(\mu_{axis,k}\) はその生成源のパワー、半径、方向余弦である。輸送はこの平均値から始めるので、出発点をセル面へ丸めることはない。ビンは（セル、区間）の昇順に処理し、実行のたびに同じ順序になる。</p>
+      <p>ビンの数 16 は定数（コードの <code>kAxisBins</code>）で、namelist のキーではなく、変更できない。ビンにまとめる理由は、輸送の計算量を光線の本数から切り離すためである。1D の光線は 1 ビームあたり既定で 1000 本（<code>Laser.rays_per_beam</code>）あり、交差点ごとに輸送すると計算量が光線の本数に比例する。ビンにまとめると、輸送する生成源は 1 つのチャネルあたり高々 セル数 × 16 個で、光線の本数に依らない。代償として、同じビンの光線は 1 つの平均の方向に束ねられるので、方向余弦の広がりは 0.125 の分解能でしか残らない。</p>
       <p>2D RZ では、生成源の向きが 3 次元なので、ビンの切り方が異なる。セルごとに、子午面内の向き \(\chi=\operatorname{atan2}(k_R,k_Z)\) を \([-\pi,\pi]\) で 16 等分し（コードの <code>kChiBins</code>）、方位方向の成分 \(|k_\phi|\) が 0.3 未満か以上かで 2 つに分けて、1 セルあたり 32 個のビンにまとめる。ここで \(k_R\)、\(k_\phi\)、\(k_Z\) は、光線の進行方向の単位ベクトルの、動径方向、方位方向、軸方向の成分である。ビンごとの生成源は、パワーで重み付けした平均の位置と向き（向きは単位ベクトルに規格化する）をもつ。</p>
 
       <h3 id="terms-beamlet">微小ビーム</h3>
       <p><strong>微小ビーム（electron beamlet）</strong>は、群 \(g\) の代表エネルギー \(E_g\) で 1 本の弦を進む、重み付きの電子の集団である。1D 円錐輸送で <code>tracking="adiabatic"</code> を選ぶと、ビンの生成源ごとに、伝播する方向の求積点とエネルギー群の組につき 1 本を出す。平面幾何では、面内方向のパワーは、生成源がボイドでないセルにあればそのセルに直接付与する。パワーは \(P\,w\,W_g\) であり、\(P\) はビンの生成源のパワー、\(w\) は方向重み、\(W_g\) は群重みである。全求積点が寄与する場合、既定の <code>n_mu=6</code>、<code>n_phi=8</code>、<code>n_energy_groups=50</code> で 1 ビンにつき 2400 本となる。動径モードでは、チャネルの全パワーを集め、最外の生成源から各群につき 1 本を出す。</p>
-      <p>既定の円錐モード <code>tracking="time_dependent"</code> では、チャネル内の全ビンから弦の候補を集める。各エネルギー群について、Philox の乱数を用いて候補のパワーに比例する確率で 1 本を選ぶ。選んだ弦には、候補の合計パワーに群重みを掛けた値を割り当てる。候補があるチャネルは既定の群数で 50 本の<a href="#terms-history">行</a>を放出する。GPU はセルごとの固定小数点（fixed-point）加算器に付与エネルギーを足す。</p>
+      <p>既定の円錐モード <code>tracking="time_dependent"</code> では、時間刻みをまたいで飛行中の電子集団を履歴に保持するため、全ビン・全求積点・全エネルギー群の微小ビームをそのまま運ぶと記憶容量と計算量が膨らむ。そこで、チャネル内の全ビンから弦の候補を集め、各エネルギー群について Philox の乱数で候補のパワーに比例する確率により 1 本だけを選ぶ。選んだ弦には候補の合計パワーに群重みを掛けた値を割り当て、1 本の微小ビームに対応する追跡単位（<a href="#terms-history">行</a>）を作る。既定の群数 50 では、候補のあるチャネルごとに 50 個の追跡用の行を生成する。GPU はセルごとの固定小数点（fixed-point）加算器に付与エネルギーを足す。</p>
 
       <h3 id="terms-channel">チャネルと角度帯</h3>
       <p><strong>チャネル（channel）</strong>は、<code>Laser.hot_electron.sources</code> の 1 要素で、ホット電子を作る 1 つの機構を表す。機構（<code>mechanism</code>）は <code>"cone"</code>、<code>"tpd"</code>、<code>"srs"</code> のいずれかで、チャネルは最大 4 つ指定できる。チャネルごとに、捕獲面（<code>capture_nc_fraction</code>）、変換効率（<code>eta</code> または <code>eta_table</code>。<code>eta_mode="model"</code> ではモデルが与える）、温度（<code>T_hot_eV</code>）、エネルギー窓、角度帯を独立に決める。光線は外側から内向きに進むので、密度の低い捕獲面から順にチャネルを通り、光線のパワーの減耗を有効にすると \(f_s\) の昇順に逐次適用する。同じ \(f_s\) のチャネルは <code>sources</code> に書いた順である。機構によって、ホット電子が生成される密度、温度、方向の分布が違う。チャネルは、この違いを機構ごとの較正入力として別々に与える仕組みである。</p>
@@ -165,7 +166,7 @@
       <p>キー <code>angular_model</code> は、すべてのチャネルに共通の選択である。<code>"cone"</code> は上の角度帯から選ぶ弦で電子を輸送し、<code>"radial"</code> は \(\mu=1\) の 1 方向だけを、チャネルの全パワーを集めた最外の生成源から内向きに進める検証用のモードである。機構の名前 <code>"cone"</code> はチャネルの種類を表し、<code>angular_model</code> の値とは別のものである。</p>
 
       <h3 id="terms-chord">弦と近点</h3>
-      <p><strong>弦</strong>は、電子の輸送を射影する直線である。球幾何では、シェル面との交点で弦をセルごとの区間に分ける。散乱で弦方向の平均射影がどう変わるかは<a href="#range-shortening">飛程短縮</a>に示す。</p>
+      <p><strong>弦（chord）</strong>は、電子の輸送を射影する直線である。球幾何では、シェル面との交点で弦をセルごとの区間に分ける。散乱で弦方向の平均射影がどう変わるかは<a href="#range-shortening">飛程短縮</a>に示す。</p>
       <p><strong>近点（pericenter）</strong>は、弦が球の中心に最も近づく点である。生成源の半径が \(r_s\)、弦の方向と動径方向の余弦が \(\mu_{dir}\) のとき、近点の半径は次式で、これは弦と中心の距離に等しい。</p>
       $$
       r_{peri}=r_s\sqrt{1-\mu_{dir}^2}.
@@ -173,15 +174,15 @@
       <p>\(r_{peri}\) は近点の半径、\(r_s\) は生成源の半径、\(\mu_{dir}\) は発射時の弦方向とその位置の動径外向き方向のなす角の余弦である。内向きの弦は最初に近点に向かい、その後外向きに進む。近点を含むセルでは内向き区間と外向き区間に分ける。1D 円錐輸送では、<a href="#sheath">境界で反射</a>した電子が新たな弦に沿って進む。</p>
 
       <h3 id="terms-history">行と履歴の保存</h3>
-      <p><strong>行（row）</strong>は、電子 1 個あたりの現在の運動エネルギー（初期値は群の代表エネルギー）、電子数、軌道、放出後の飛行時間、平均方向余弦の対数、乱数列の位置を保持する。各行を、熱化（thermalization）や逸出などで完了するか、その刻みの時間予算を使い切るまで進める。エネルギーと電子数が正の行が生存行である。</p>
-      <p><strong>履歴の保存領域（history store）</strong>は、時間刻みの間に生存行を保持する。次の刻みでは、現在のメッシュ上で、移動する行が属するセルを求め直す。局所的な行はセルの添字を保持する。同じ時間刻みで発射した行は再利用時に一つの集団（cohort）として扱う。<code>history_capacity</code> の既定値は 16777216 行で、既定の <code>history_reuse="oldest"</code> は古い集団から選ぶ。<code>"fewest"</code> は生存行数の少ない集団から選び、同数なら古い集団を先に選ぶ。</p>
+      <p><strong>行（row）</strong>は、1 つの追跡対象の電子集団の状態を履歴表の 1 行として保持する単位であり、電子 1 個あたりの現在の運動エネルギー（初期値は群の代表エネルギー）、電子数、軌道、放出後の飛行時間、平均方向余弦の対数、乱数列の位置を格納する。各行を、熱化（thermalization）や逸出などで完了するか、その刻みの時間予算を使い切るまで進める。エネルギーと電子数が正の行が生存行である。</p>
+      <p><strong>履歴の保存領域（history store）</strong>は、時間刻みの間に生存行を保持する。次の刻みでは、弦に沿って移動する行について現在のメッシュ上で属するセルを求め直す。一方、後述の<a href="#terms-orientation">方向の下限</a>に達して 1 つのセル内にとどまる行（局所的な行）は移動せず、セルの添字をそのまま保持する。同じ時間刻みで生成した行は再利用時にひとつの集団（cohort）として扱う。履歴が容量上限（<code>history_capacity</code>、既定 16777216 行）に達すると、古い電子を捨てるのではなく、選んだ集団を時間予算なしでその場で最後まで減速・付与し切る（強制完了）ことでエネルギーを保ったまま空き領域を作る。既定の <code>history_reuse="oldest"</code> は古い集団から選び、<code>"fewest"</code> は生存行数の少ない集団から選ぶ（同数なら古い集団が先）。</p>
 
       <h3 id="terms-orientation">方向の下限</h3>
-      <p><strong>方向の下限（orientation floor）</strong>は、平均方向余弦の対数の固定下限 −20 である。有限の時間予算でこの下限に達した行は、弦に沿って進まず、そのセル内で減速を続ける。時間予算が無限なら行の残りのエネルギーをそのセルに付与する。この下限は既定の <code>range_shortening=True</code> で使う。</p>
+      <p><strong>方向の下限（orientation floor）</strong>は、平均方向余弦の対数の固定下限 −20 である。exp(−20) ≈ 2 × 10<sup>−9</sup> となり、衝突散乱で電子がほぼ等方化して弦方向への前進速度が実質 0 になった状態にあたる。有限の時間予算でこの下限に達した行は、弦に沿って進まず、そのセル内で減速を続ける。時間予算が無限なら行の残りのエネルギーをそのセルに付与する。この下限は既定の <code>range_shortening=True</code> で使う。</p>
 
       <h3 id="terms-pass">周回と未解決エネルギー</h3>
-      <p><strong>周回（pass）</strong>は、外面で反射してから次に外面に達するまでの経路である。鏡面反射による無損失の周回はまとめて進められる。時間予算が無限の場合も、条件を満たす鏡面反射の周回をまとめる。</p>
-      <p><strong>未解決エネルギー（unresolved energy）</strong>には、逸出率が 0 で時間予算が無限のときに無損失の反射軌道に残るエネルギーが含まれる。<code>sheath_unresolved_limit</code> の既定値は <code>1e-3</code> であり、チャネルごとに、その刻みの注入と開始時に飛行中のエネルギーの和に対する許容割合を定める。</p>
+      <p><strong>周回（pass）</strong>は、外面で反射してから次に外面に達するまでの経路である。通過した全セルで適用される阻止能と散乱係数が 0 となる周回を無損失の周回と呼ぶ（飛程短縮ありの実計算では、ボイドセルだけを通る周回に限る）。鏡面反射による無損失の周回はまとめて進められる。時間予算が無限の場合も、条件を満たす鏡面反射の周回をまとめられる。</p>
+      <p><strong>未解決エネルギー（unresolved energy）</strong>は、境界からの逸出にもセルへの付与にも確定できないエネルギーである。時間予算が無限の計算で、逸出率が 0 のまま無損失の鏡面反射周回を繰り返す行や、周回集約の範囲を下回る微小な損失しかない行に残るエネルギーがこれに当たる。<code>sheath_unresolved_limit</code> の既定値は <code>1e-3</code> であり、チャネルごとに、その刻みの注入エネルギーと開始時に飛行中のエネルギーの和に対する許容割合を定める。</p>
       <h3 id="terms-ghost-corona">ゴーストコロナ</h3>
       <p><strong>ゴーストコロナ（ghost corona、キー <code>Laser.lasermesh.ghost_corona</code>）</strong>は、最外の流体セルの外側に置く、光線追跡だけが使う合成の低密度プロファイルである。流体の初期条件が固体と真空の鋭い界面で、プレプラズマがないとき、レーザーの吸収が最外の固体セルに集中して、非物理的な加熱と数値不安定を起こす。これを避けるために、光線が通る格子 LaserMesh（<a href="../laser/raytrace.html#lasermesh-march">LaserMesh1D と光線の行進</a>）の上にだけ、電子密度が最外の流体セルの値から外向きに指数関数的に下がる帯を置く。密度の範囲は \(n_c\) の 0.03 倍から 0.99 倍（<code>ne_min_frac</code> と <code>ne_max_frac</code> の既定）で、流体の密度、温度、電荷数は変えない。1D_SPH の LaserMesh だけが使い、既定は無効（<code>enabled=False</code>）である。</p>
       <p>光線がゴーストコロナ内で捕獲面を横切ると、交差点は流体メッシュの外側にある。この生成源は最外のセルのビンに入れ、その回数とパワーを警告に出す。</p>
@@ -201,35 +202,35 @@
       $$
       E_{\rm floor}=\max(2T_e,10^{-3}T_h).
       $$
-      <p>\(E_{\rm floor}\) は熱化の下限、\(T_e\) はセルの電子温度、\(T_h\) はチャネルのスペクトル温度であり、すべて erg で表す。物質中で熱化の下限に達したときは残りのエネルギーをそのセルに付与する。真空では下限の判定より先に飛行を進める。物質中の更新が熱化の下限をまたぎ、始点・中点・下限の停止能が正なら、飛行時間と付与の時間に関する一次モーメントをシンプソン則（Simpson's rule）で求める。</p>
+      <p>\(E_{\rm floor}\) は熱化の下限、\(T_e\) はセルの電子温度、\(T_h\) はチャネルのスペクトル温度であり、すべて erg で表す。物質中で熱化の下限に達したときは残りのエネルギーをそのセルに付与する。真空では下限の判定より先に飛行を進める。物質中の更新が熱化の下限をまたぎ、始点・中点・下限の阻止能が正なら、飛行時間と付与エネルギーで重み付けした飛行時間の分子（付与時刻の一次モーメント）をシンプソン則（Simpson's rule）で求める。</p>
       <p><code>radial</code> モードの内側境界では、<code>inner_bc="deposit_residual"</code> により残りのエネルギーを最も内側の<a href="../eos-opacity/index.html#void-materials">ボイド（void）</a>でないセルに付与する。<code>"escape"</code> は残りを逸出として計上する。</p>
-      <h3 id="stopping-model">停止モデル</h3>
+      <h3 id="stopping-model">阻止モデル</h3>
       <p><code>Laser.hot_electron.stopping_model</code> の 1D の既定値は <code>"free_and_bound_electrons"</code> であり、自由電子と束縛電子（bound electron）による減速および集団励起（collective excitation）を含む。<code>"free_electrons"</code> を指定すると自由電子モデルを使う。</p>
-      <p>束縛電子による減速と飛程短縮では、ボイドでない全材料の <code>Z</code> が正でなければならない。組成を指定した場合、その原子数分率で重み付けした平均電荷数が相対 <code>1e-3</code> 以内で <code>Z</code> と一致する必要がある。飛程短縮では組成の元素、または組成がなければ材料の <code>Z</code> が 13 を超えると警告する。束縛電子を含む場合、パーサーは中性材料の<a href="../../use/namelist.html#hot-electron-transport">平均励起エネルギー（mean excitation energy）</a>を明示値、元素表、または元素組成から決める。</p>
-      <p>束縛電子を含むモデルの質量停止能（mass stopping power）は次式である。</p>
+      <p>束縛電子による減速と飛程短縮では、ボイドでない全材料の <code>Z</code> が正でなければならない。組成を指定した場合、その原子数分率で重み付けした平均原子番号（核電荷数）が相対 <code>1e-3</code> 以内で <code>Z</code> と一致する必要がある。飛程短縮では組成の元素、または組成がなければ材料の <code>Z</code> が 13 を超えると警告する。束縛電子を含む場合、パーサーは中性材料の<a href="../../use/namelist.html#hot-electron-transport">平均励起エネルギー（mean excitation energy）</a>を明示値、元素表、または元素組成から決める。</p>
+      <p>束縛電子を含むモデルの質量阻止能（mass stopping power）は次式である。</p>
       $$
       S_m(T)=\frac{4\pi e^4}{\rho m_e v^2}
       \left[n_f\max(0,G(x))\max(2,L_f)+n_bL_b\right].
       $$
-      <p>\(S_m\) は質量停止能 [erg cm²/g]、\(T\) は運動エネルギー [erg]、\(e\) は電気素量、\(m_e\) は電子質量、\(v\) は相対論的な電子速度、\(\rho\) は質量密度である。\(n_f\) と \(n_b\) は自由電子と束縛電子の数密度である。\(G(x)\) は背景電子の熱運動を表す因子で、\(x^2=m_ev^2/(2T_e)\)、\(T_e\) は erg 単位の電子温度である。電子温度または自由電子密度が正でなければ自由電子項は 0 になる。\(L_f\) は自由電子の近接衝突と集団励起の停止数、\(L_b\) は下限 2 を適用した束縛電子の停止数である。</p>
+      <p>\(S_m\) は質量阻止能 [erg cm²/g]、\(T\) は運動エネルギー [erg]、\(e\) は電気素量、\(m_e\) は電子質量、\(v\) は相対論的な電子速度、\(\rho\) は質量密度である。\(n_f\) と \(n_b\) は自由電子と束縛電子の数密度である。\(G(x)\) は背景電子の熱運動を表す因子で、\(x^2=m_ev^2/(2T_e)\)、\(T_e\) は erg 単位の電子温度である。電子温度または自由電子密度が正でなければ自由電子項は 0 になる。\(L_f\) は自由電子の近接衝突と集団励起の阻止数、\(L_b\) は下限 2 を適用した束縛電子の阻止数である。</p>
       $$
       n_f=\frac{\rho\max(\bar Z,0)}{A_{\rm eff}m_p},\qquad
       n_b=\frac{\rho\max(Z_{\rm nuc}-\max(\bar Z,0),0)}{A_{\rm eff}m_p}.
       $$
-      <p>\(n_f\) と \(n_b\) は自由電子と束縛電子の数密度、\(\rho\) は質量密度、\(\bar Z\) は平均電離度、\(Z_{\rm nuc}\) は原子核の電荷数、\(m_p\) は陽子質量、\(A_{\rm eff}\) は有効質量数である。1D の両停止モデルは、ボイドでない材料について体積分率で重み付けした調和平均の質量数を状態から読む。</p>
+      <p>\(n_f\) と \(n_b\) は自由電子と束縛電子の数密度、\(\rho\) は質量密度、\(\bar Z\) は平均電離度、\(Z_{\rm nuc}\) は原子核の電荷数、\(m_p\) は陽子質量、\(A_{\rm eff}\) は有効質量数である。1D の両阻止モデルは、ボイドでない材料について体積分率で重み付けした調和平均の質量数を状態から読む。</p>
 
       <h3 id="range-shortening">飛程短縮</h3>
-      <p><code>range_shortening=True</code> のとき、1D の両停止モデルは円錐輸送と動径輸送で散乱角の平均余弦を使う。Solodov と Betti [16] の式 (13) のルジャンドル一次モーメント（first Legendre moment）を取ると、同論文の式 (15) の平均方向余弦が得られる。TENRYU はこの余弦の対数も用いる。</p>
+      <p><code>range_shortening=True</code> のとき、1D の両阻止モデルは円錐輸送と動径輸送で散乱角の平均余弦を使う。Solodov と Betti [16] の式 (13) のルジャンドル一次モーメント（first Legendre moment）を取ると、同論文の式 (15) の平均方向余弦が得られる。TENRYU はこの余弦の対数も用いる。</p>
       $$
       \left\langle\cos\theta\right\rangle=\exp\!\left(-\int_0^s k_1(s')\,ds'\right),
       \qquad l=\ln\left\langle\cos\theta\right\rangle .
       $$
-      <p>\(\theta\) は弦からの偏向角、\(s\) は電子の経路に沿う路程、\(s'\) は積分変数、\(k_1\) は単位路程あたりの一次モーメントの散乱係数、\(l\) は平均方向余弦の対数である。行の発射時の平均余弦は 1 である。弦に沿う進行速度は電子速度に平均余弦を掛けた値である。このため弦上を進む面密度は、電子の経路に沿う面密度より小さくなる。局所付与への移行は<a href="#terms-orientation">方向の下限</a>で決まる。文献 [16] の式 (23) の侵入長の積分には、終端エネルギーの選択肢が二つある。一つは \(3T_e/2\)（\(T_e\) は背景電子温度）、もう一つは平均余弦が \(1/e\) に達するエネルギーである。</p>
-      <p>飛程短縮では質量停止能と質量散乱係数（散乱係数を密度で割った値）の表をセルごとに作る。エネルギーの自然対数を \(1/64\) 間隔で離散化し、表のエネルギー区間ごとに補間用のデータも作る。表の範囲外と電子温度が 20 keV を超える場合には係数を直接評価する。条件を満たす区間の高速な通過計算は補間用のデータを使う。飛程短縮を使う残りの計算では、各副刻みの始点で係数を固定して進める。飛程短縮を無効にすると、停止能を直接評価して古典的な 4 次ルンゲ–クッタ法（Runge–Kutta method）で積分する。</p>
+      <p>\(\theta\) は弦からの偏向角、\(s\) は電子の経路に沿う路程、\(s'\) は積分変数、\(k_1\) は単位路程あたりの一次モーメントの散乱係数、\(l\) は平均方向余弦の対数である。行の発射時の平均余弦は 1 である。弦に沿う進行速度は電子速度に平均余弦を掛けた値である。このため弦上を進む面密度は、電子の経路に沿う面密度より小さくなる。局所付与への移行は<a href="#terms-orientation">方向の下限</a>で決まる。文献 [16] の式 (23) の侵入長の積分には、終端エネルギーの選択肢が 2 つある。ひとつは \(3T_e/2\)（\(T_e\) は背景電子温度）、もうひとつは平均余弦が \(1/e\) に達するエネルギーである。</p>
+      <p>飛程短縮では質量阻止能と質量散乱係数（散乱係数を密度で割った値）の表をセルごとに作る。エネルギーの自然対数を \(1/64\) 間隔で離散化し、表のエネルギー区間ごとに補間用のデータも作る。表の範囲内かつ電子温度が 20 keV 以下の区間では、高速通過計算の条件を満たすセル通過に補間用のデータを使う。表の範囲外、電子温度が 20 keV を超える場合、および高速通過の条件を満たさない副刻みでは、各副刻みの始点で係数を固定して進める（表の範囲外と 20 keV 超では係数を直接評価する）。飛程短縮を無効にすると、阻止能を直接評価して古典的な 4 次ルンゲ–クッタ法（Runge–Kutta method）で積分する。</p>
 
       <h3 id="sheath">シースと境界反射</h3>
       <p>1D 円錐輸送の行がシースに達すると、到達時の電子 1 個あたりのエネルギーを保ったまま、<code>sheath_escape_fraction</code> で指定した割合の電子が逸出する。残る行は反射する。鏡面反射（specular reflection）の方向から <code>sheath_deviation_deg</code> 以内の立体角に一様な方向を抽出し、領域外を向いた場合は内向きに折り返す。既定の逸出率は 0、偏向の半角は 5° である。平面の内面で <code>"symmetry"</code> は逸出なしの鏡面反射、<code>"sheath"</code> は外面と同じ逸出と反射、<code>"outflow"</code> は行全体の逸出を適用する。</p>
-      <p>時間予算が有限なら、無損失で鏡面反射する<a href="#terms-pass">周回</a>を時間予算内でまとめて進め、シースに達するたびに逸出する電子数もまとめて計算できる。時間予算が無限で、逸出率が 1 未満であり、平面の内面がある場合はそこで反射するなら、鏡面反射の周回をまとめられる。まとめた更新ごとにエネルギーと方向の変化を制限する。無限の時間予算で無損失の鏡面周回が続く場合、逸出率が正なら残りを逸出、0 なら未解決エネルギーに計上する。</p>
+      <p>時間予算が有限の場合、無損失で鏡面反射する<a href="#terms-pass">周回</a>は時間予算の範囲内でまとめて進め、シース到達ごとの電子数の逸出も一括して計算できる。時間予算が無限の場合は、逸出率が 1 未満で、かつ平面の内面があるときにそこで反射する条件のもとで、鏡面反射の周回をまとめて更新できる（1 回の更新あたりのエネルギーと方向の変化量には上限を課す）。時間予算が無限で無損失の鏡面反射周回が続く場合は、逸出率が正なら残りを逸出に、0 なら未解決エネルギーに計上する。</p>
     </section>
 
     <section aria-labelledby="pipeline">
@@ -238,22 +239,23 @@
       <ol>
         <li><strong>パワーを捕獲する。</strong> レーザーの経路に応じた<a href="#scope-source">捕獲の規則</a>を適用する。<a href="#terms-ghost-corona">ゴーストコロナ</a>の捕獲は最外セルのビンに割り当て、報告する。</li>
         <li><strong>生成源をまとめる。</strong> セルと方向余弦の区間で<a href="#terms-bin">ビン</a>を作る。各ビンにパワー重み付きの半径と方向を保持する。</li>
-        <li><strong>行を放出する。</strong> 対数間隔のエネルギー群と弦の候補を作る。既定の時間依存円錐輸送では、候補のあるチャネルごとに各群の弦を 1 本抽出する。新規行の領域を確保する。新規行だけで <code>history_capacity</code> を超える場合はエラーで停止する。必要に応じて <code>history_reuse</code> で選んだ既存の集団を時間予算なしで強制完了し、空きを作る。</li>
+        <li><strong>追跡用の行を生成する。</strong> 対数間隔のエネルギー群と弦の候補を作る。既定の時間依存円錐輸送では、候補のあるチャネルごとに各群の弦を 1 本抽出する。新規行の領域を確保する。新規行だけで <code>history_capacity</code> を超える場合はエラーで停止する。容量が足りない場合は、<code>history_reuse</code> で選んだ既存の集団を時間予算なしでその場で最後まで減速・付与し切る（強制完了）ことで空きを作る。</li>
         <li><strong>行を進める。</strong> 保存した行を再開し、新規行とともにセルの区間を進める。<code>time_dependent</code> の各行は流体の時間刻み幅だけ進める。<code>adiabatic</code> と強制完了では時間予算を無限とする。レーザーのパワーの供給が止まっても生存行を進める。1D のセル区間での副刻み数の上限は次式である。
           $$
           N_{\rm cap}=\left\lceil\frac{\ln(1000 E_{max}/T_h)}{0.0199}\right\rceil+
                         \left\lceil\frac{20}{0.95\times0.1}\right\rceil+1.
           $$
-          <p>\(N_{\rm cap}\) は副刻み数の上限、\(E_{max}\) は放出スペクトル窓の上端、\(T_h\) はスペクトル温度である。副刻み幅は、始点の停止能で見積もったエネルギー損失が 2% 以下となるように選ぶ。飛程短縮を使うときは、余弦の対数の変化幅にも 0.1 を目安とする。既定の窓では 664 となる。上限に達したときは残りのエネルギーをセルに付与し、その事象を報告する。</p>
+          <p>\(N_{\rm cap}\) は副刻み数の上限、\(E_{max}\) は放出スペクトル窓の上端、\(T_h\) はスペクトル温度である。副刻み幅は、始点の阻止能で見積もったエネルギー損失が 2% 以下となるように選ぶ。飛程短縮を使うときは、余弦の対数の変化幅にも 0.1 を目安とする。既定の窓では 664 となる。上限に達したときは残りのエネルギーをセルに付与し、その事象を報告する。</p>
         </li>
         <li><strong>下限と境界条件を適用する。</strong> 熱化の下限で残りのエネルギーを付与する。方向の下限では、時間予算に応じて同じセルで減速を続けるか、そのセルで行を完了する。円錐輸送が境界に達したときは<a href="#sheath">シースと平面内面の規則</a>を適用する。生存行と乱数列の位置は次の時間刻みに引き継ぐ。</li>
-        <li><strong>台帳を検査し、物質に連成する。</strong> <a href="#coupling-timestep">エネルギー収支</a>と未解決エネルギーの上限を検査する。セルへの付与を固定小数点で加算し、飛行中エネルギー、付与で重み付けした飛行時間、強制完了の対象となった行数とエネルギーを記録する。レーザー光による付与の平滑化の後でホット電子の付与を加え、次の時間刻み幅を<a href="#coupling-timestep">源項の制限</a>で抑える。</li>
+        <li><strong>台帳を検査し、物質に連成する。</strong> <a href="#coupling-timestep">エネルギー収支</a>と未解決エネルギーの上限を検査する。セルへの付与を固定小数点で加算し、飛行中エネルギー、付与で重み付けした飛行時間、強制完了の対象となった行数とエネルギーを記録する。レーザー光の沈着の平滑化の後でホット電子の付与を加え、次の時間刻み幅を<a href="#coupling-timestep">源項の制限</a>で抑える。</li>
       </ol>
     </section>
 
     <section aria-labelledby="coupling-timestep">
       <h2 id="coupling-timestep">レーザーのパワーの収支、物質との連成、時間刻み</h2>
-      <p><code>subtract_from_laser=True</code> のとき、通常のレーザー台帳は、光とホット電子の付与パワー、未吸収光、受け取り先のセルがなかったパワーに、ホット電子の逸出・未解決エネルギー・飛行中エネルギーの符号付き変化を時間刻み幅で割った値を足す。<code>False</code> では捕獲分が外部からの源となり、光吸収に使う光線パワーが残る。<code>geometry_mode="port_section"</code> と <code>eta_mode="model"</code> を指定し、その時間刻みに捕獲チャネルがある場合に限り、光学側の検査は、光による付与パワー、未吸収光のパワー、捕獲したホット電子のパワー、イオン音波に渡したパワー、および CBET の交換残差の合計を入力レーザーパワーと比較する。これらの条件を満たさない 1D の時間刻みでは、CBET を使用していても通常のレーザー台帳を使う。この検査は、入力レーザーパワーから、付与パワー、未吸収光のパワー、ホット電子の逸出パワー、転送できなかったパワー、イオン音波に渡したパワー、および CBET の交換残差を差し引く。</p>
+      <p><code>subtract_from_laser=True</code> のときは捕獲分を光線のパワーから差し引き、<code>False</code> のときは捕獲分を外部からの源として扱って光吸収用の光線パワーを残す。1D で <code>subtract_from_laser=True</code> のときのレーザーパワー台帳には、光学側を捕獲時点で閉じるか、輸送後の最終収支まで 1 本にまとめるかに応じた 2 通りの検査がある。</p>
+      <p><code>cbet.geometry_mode="port_section"</code> と <code>eta_mode="model"</code> を併用し、その時間刻みに有効な捕獲チャネルがある場合は、CBET の再伝播が終わった時点の捕獲パワーで光学側を先に閉じ（ホット電子の収支は下の輸送台帳で別途検査する）、入力レーザーパワーを、レーザー光の沈着パワー、未吸収光のパワー、ホット電子として捕獲したパワー、イオン音波に渡したパワー、および CBET の交換残差の合計と比較する。それ以外の 1D の時間刻み（CBET のみ有効な場合を含む）では、通常のレーザー台帳が光とホット電子の収支をまとめて閉じ、入力レーザーパワーを、レーザー光の沈着とホット電子の付与を合わせた総パワー、未吸収光のパワー、受け取り先のセルがないパワー（転写先の流体セルがボイドまたは超臨界のため流体へ渡せなかったパワー）、イオン音波に渡したパワー、CBET の交換残差、およびホット電子の逸出・未解決エネルギーと飛行中エネルギーの符号付き変化の和を時間刻み幅で割ったパワーの合計と比較する。</p>
       <p>1D 輸送はチャネルごとにエネルギー台帳を検査する。</p>
       $$
       E_{\rm inj}+U_{\rm before}
@@ -272,14 +274,14 @@
     </section>
 
     <section aria-labelledby="eta-model">
-      <h2 id="eta-model">η(t) の物理モデルという選択肢</h2>
+      <h2 id="eta-model">変換効率 η(t) の物理モデル</h2>
       <p><code>eta_mode="model"</code> は、定数や表で与える η を、TPD / SRS のチャネルごとの 1 次緩和方程式（first-order relaxation equation）へ置き換える、<code>Main.dimension="1D_SPH"</code>（平面幾何の円錐輸送、および平面・円筒・球幾何の動径輸送を含む）の明示指定オプションである。<code>sources</code> に TPD / SRS チャネルを指定し、<code>subtract_from_laser=True</code> とする必要がある。スカラーの簡易指定は受け付けない。平衡効率には CHIC のクロージャ（文献 [1] の式 (2)–(3)）を使い、駆動強度には光線追跡で求める重なり強度を使う（Derriey ら [12]、pp. 4, 16）。</p>
       <p>各チャネルの駆動面は、そのチャネルの<a href="#terms-capture">捕獲面</a>である。TPD の <code>tpd_overlap_mode="single_beam"</code> と SRS は、この面を内向きに横切る全光線の重なり強度で駆動する。ビーム別・クラス別の駆動には分けない。強度は次式で求める。</p>
       $$
       I=10^{-7}\frac{M_s\sum_iP_i}{4\pi\bar r_s^2 f_{\rm illum}}.
       $$
-      <p>ここで \(I\) は W/cm² 単位の駆動強度、\(i\) は内向きに交差する光線の添字、\(P_i\) は各光線の交差点における、自チャネルの捕獲前、先行チャネルの捕獲後のパワー [erg/s]、\(\bar r_s\) は同じ交差点のパワーで重み付けした平均半径 [cm] である。\(4\pi\bar r_s^2\) は球面積、\(\pi\) は円周率、\(f_{\rm illum}\) は照射面積の係数、\(M_s\) は交差角と旋回点付近の制限から求める無次元の駆動係数、\(10^{-7}\) は erg/s から W への換算係数である。<code>illumination_metric="fixed"</code> では \(f_{\rm illum}=1\) とする。各光線の内向き交差を一度だけ数え、CHIC のセル強度に含まれる戻り光線 [12] は数えない。<code>common_wave_cluster</code> の TPD は、この式の代わりに共通の電子プラズマ波を駆動するビームの強度和 <code>I_drive</code> を使う。</p>
-      <p>光線が厚さ \(dr\) の球殻に滞在する時間は \(dr/(v|\mu|)\) である。\(v\) は光線の速度、\(\mu\) は光線方向と動径方向のなす角の余弦である。そのため、旋回点（turning point）から離れた幾何光学の強度は、各光線の \(P_i/(4\pi\bar r_s^2|\mu_i|)\) の和となる。この強度は \(vW\) に対応し、\(W\) は光線のエネルギー密度である。真空光速 \(c\) を使う \(cW\) とは規格化が異なる。旋回点では \(|\mu_i|\) が 0 に近づき、この式は発散する。波動解は有限であり、旋回点付近でエアリー関数（Airy function）によって変化する領域の幅がエアリー尺度である。各光線の旋回点自身の尺度を使って発散を制限する（文献 [12] の式 (13), (20)–(21)、Kravtsov と Orlov [13]、pp. 70–73, 118、Michel [14] の式 (3.15), (3.40)）。</p>
+      <p>ここで \(I\) は W/cm² 単位の駆動強度、\(i\) は内向きに交差する光線の添字、\(P_i\) は各光線の交差点における、自チャネルの捕獲前、先行チャネルの捕獲後のパワー [erg/s]、\(\bar r_s\) は同じ交差点のパワーで重み付けした平均半径 [cm] である。\(4\pi\bar r_s^2\) は球面積、\(\pi\) は円周率、\(f_{\rm illum}\) は照射面積の係数、\(M_s\) は交差角と転回点（turning point）付近の制限から求める無次元の駆動係数、\(10^{-7}\) は erg/s から W への換算係数である。<code>illumination_metric="fixed"</code> では \(f_{\rm illum}=1\) とする。各光線の内向き交差を一度だけ数え、CHIC のセル強度に含まれる戻り光線 [12] は数えない。<code>common_wave_cluster</code> の TPD は、この式の代わりに、捕獲面上の各立体角点における共通の電子プラズマ波を駆動するビーム群の強度和を強度重み付きで球面平均した駆動強度 <code>I_drive</code> を使う。</p>
+      <p>光線が厚さ \(dr\) の球殻に滞在する時間は \(dr/(v|\mu|)\) である。\(v\) は光線の速度、\(\mu\) は光線方向と動径方向のなす角の余弦である。そのため、転回点から離れた幾何光学の強度は、各光線の \(P_i/(4\pi\bar r_s^2|\mu_i|)\) の和となる。この強度は \(vW\) に対応し、\(W\) は光線のエネルギー密度である。真空光速 \(c\) を使う \(cW\) とは規格化が異なる。転回点では \(|\mu_i|\) が 0 に近づき、この式は発散する。波動解は有限であり、転回点付近でエアリー関数（Airy function）によって変化する領域の幅がエアリー尺度である。各光線の転回点自身の尺度を使って発散を制限する（文献 [12] の式 (13), (20)–(21)、Kravtsov と Orlov [13]、pp. 70–73, 118、Michel [14] の式 (3.15), (3.40)）。</p>
       $$
       \begin{aligned}
       M_s&=\frac{\sum_iP_i/\max(|\mu_i|,\mu_{c,i})}{\sum_iP_i},\\
@@ -288,8 +290,8 @@
       \ell_{A,i}=(k_0^2Q'_i)^{-1/3}.
       \end{aligned}
       $$
-      <p>ここで \(M_s\) は駆動係数、\(i\) は交差光線の添字、\(P_i\) は交差点のパワー、\(\mu_i\) は交差点での動径方向余弦、\(\mu_{c,i}\) はその絶対値の下限である。\(k\) はチャネルの添字、\(\varepsilon_k=1-f_k\)、\(f_k\) は <code>capture_nc_fraction</code>、\(k_0=2\pi/\lambda_{\rm cm}\) は真空波数 [cm⁻¹]、\(\lambda_{\rm cm}\) はレーザー波長 [cm] である。\(r_i\) は交差半径 [cm]、\(s_i=d\hat n/dr\) は光線追跡が使う規格化密度 \(\hat n\) の、その半径を含む区間の勾配 [cm⁻¹]、\(Q'_i\) は密度勾配と球面の曲率を含む係数 [cm⁻¹]、\(\ell_{A,i}\) は旋回点のエアリー尺度 [cm] である。曲率項は \(1-\mu_i^2>0\) のときだけ加える。交差パワーの和が 0 なら \(M_s=0\)、\(Q'_i=0\) なら \(\mu_{c,i}=0\) とする。交差パワーの和が正で、すべての光線が動径方向の場合は厳密に \(M_s=1\) である。文献 [12] に印刷された密度スケール長と動径分布の式 (21) は波動解の最大値を下回るため、そのまま使わず旋回点自身の尺度を使う。</p>
-      <p>上の式は球（<code>Mesh.geometry_1d="spherical"</code>）の形である。円筒（<code>"cylindrical"</code>）では、\(4\pi\bar r_s^2\) が単位長さあたりの \(2\pi\bar r_s\) に、曲率項の \(1-\mu_i^2\) が軸方向の成分を除いた \(\max\{0,\,1-\mu_i^2-V^2/(1-\hat n(r_i))\}\) になる。\(V^2\) は光線の軸方向の保存量である。平板（<code>"planar"</code>）では、面積は単位面積あたりの 1 で、曲率項はない。\(1-\hat n(r_i)\le0\) でも曲率項は加えない。</p>
+      <p>ここで \(M_s\) は駆動係数、\(i\) は交差光線の添字、\(P_i\) は交差点のパワー、\(\mu_i\) は交差点での動径方向余弦、\(\mu_{c,i}\) はその絶対値の下限である。\(k\) はチャネルの添字、\(\varepsilon_k=1-f_k\)、\(f_k\) は <code>capture_nc_fraction</code>、\(k_0=2\pi/\lambda_{\rm cm}\) は真空波数 [cm⁻¹]、\(\lambda_{\rm cm}\) はレーザー波長 [cm] である。\(r_i\) は交差半径 [cm]、\(s_i=d\hat n/dr\) は光線追跡が使う規格化密度 \(\hat n\) の、その半径を含む区間の勾配 [cm⁻¹]、\(Q'_i\) は転回点での有効な径方向勾配（密度勾配と球面の曲率項の和）[cm⁻¹]、\(\ell_{A,i}\) は転回点のエアリー尺度 [cm] である。曲率項は \(1-\mu_i^2>0\) のときだけ加える。交差パワーの和が 0 なら \(M_s=0\)、\(Q'_i=0\) なら \(\mu_{c,i}=0\) とする。交差パワーの和が正で、すべての光線が動径方向の場合は厳密に \(M_s=1\) である。文献 [12] の式 (21)（密度スケール長と動径分布を用いた表現）は波動解の最大値を下回るため、そのまま使わず転回点自身の尺度を使う。</p>
+      <p>上の式は球（<code>Mesh.geometry_1d="spherical"</code>）の形である。円筒（<code>"cylindrical"</code>）では、\(4\pi\bar r_s^2\) が単位長さあたりの \(2\pi\bar r_s\) に、曲率項の \(1-\mu_i^2\) が軸方向の成分を除いた \(\max\{0,\,1-\mu_i^2-V^2/(1-\hat n(r_i))\}\) になる。\(V^2\) は光線の軸方向の保存量である。平面（<code>"planar"</code>）では、面積は単位面積あたりの 1 で、曲率項はない。\(1-\hat n(r_i)\le0\) でも曲率項は加えない。</p>
       <p>規格化指標 \(g\) は、強度と閾値の比であり、エネルギー群の添字とは別の量である。TPD には Simon ら [8] の型の閾値、SRS には全波長で絶対閾値を使う（文献 [1] の式 (3)、[12] の式 (25)、Gong ら [15] の式 (4)）。</p>
       $$
       \begin{aligned}
@@ -307,7 +309,7 @@
       \end{aligned}
       $$
       <p>ここで \(\eta_{eq}\) は平衡効率、\(\eta_{\rm hard}\) はチャネル個別の上限 <code>eta_hard_cap</code>、\(\eta_\infty\) は漸近効率 <code>eta_inf</code>、\(a_k\) は飽和形状係数 <code>shape_coefficient</code>、\(g\) は規格化指標である。</p>
-      <p>電子温度 \(T_e\) と密度スケール長 \(L_n\) は、駆動面とは別に <code>eval_nc_fraction</code> で指定する評価面で求める。TPD の既定は捕獲面、SRS の既定は \(n_c/4\) であり、SRS の model モードの捕獲面 \(0.20n_c\) とは異なる。最外の密度ブラケットで温度を線形内挿し、近傍セルの対数密度を重み付き最小二乗で当てはめる。密度スケール長の逆数に指数移動平均を掛ける。時定数は <code>eta_model.ln_filter_tau_s</code>（既定 5 ps）で指定する。式への入力は密度スケール長 10〜1000 µm、電子温度 0.5〜10 keV、強度 \(10^{13}\)〜\(2\times10^{16}\) W/cm² に制限する。</p>
+      <p>電子温度 \(T_e\) と密度スケール長 \(L_n\) は、駆動面とは別に <code>eval_nc_fraction</code> で指定する評価面で求める。TPD の既定は捕獲面、SRS の既定は \(n_c/4\) であり、SRS の model モードの捕獲面 \(0.20n_c\) とは異なる。評価面の密度を挟む最外の隣接セル対で温度を線形補間し、近傍セルの対数密度を重み付き最小二乗で当てはめる。密度スケール長の逆数に指数移動平均を掛ける。時定数は <code>eta_model.ln_filter_tau_s</code>（既定 5 ps）で指定する。式への入力は密度スケール長 10〜1000 µm、電子温度 0.5〜10 keV、強度 \(10^{13}\)〜\(2\times10^{16}\) W/cm² に制限する。</p>
       <p>時間更新には厳密な指数緩和を使う。</p>
       $$
       \eta^{n+1}=\eta^n+\left[1-\exp(-\Delta t/\tau)\right]
@@ -322,13 +324,13 @@
         <li>チャネル個別の上限 — <code>eta_hard_cap</code>（0.03 と 0.125）。平衡効率はこの値を超えない。</li>
         <li>\(\tau\) — TPD では \(1\,\mathrm{ps}/(0.05g+0.06)\) を 3〜10 ps に制限した値（<code>relaxation_model="vu2012"</code>。制限は <code>relaxation_tau_min_s</code> と <code>relaxation_tau_max_s</code>）、SRS では定数 <code>relaxation_tau_s</code>（既定 6 ps、<code>relaxation_model="fixed"</code>）である。SRS のチャネルに <code>"vu2012"</code> を指定すると、エラーになる。</li>
       </ul>
-      <p>SRS の別の閾値処方として、Rosenberg ら [5, 6] に基づく \(C_B=8\times2377\times0.351^{2/3}/995\simeq9.5097\) を <code>threshold_multiplier</code> に指定できる。\(C_B\) はこの処方の閾値倍率である。較正に使われた強度は吸収を含む DRACO の \(n_c/4\) の強度であり、本モデルが読む捕獲面の強度とは同じ観測量ではない。</p>
-      <p>強度の計測は 1 時間刻み遅れである。初期の η は 0、最初の時間刻みは交差パワーの計測にあて、次の時間刻みから非零の η への発展が可能になる。前の時間刻みに交差がない場合、評価面がない場合、当てはめが縮退する場合、電子温度が非正の場合は、固定の <code>relaxation_tau_s</code> で 0 へ緩和する。レーザー消灯中は前の計測を消去し、η を凍結する。再点灯の最初の時間刻みは入力無効として 0 へ緩和し、その後に再成長する。局所条件に応じて η を変えはするが、解像されたプラズマ波、非線形な LPI の飽和、運動論的な電子生成を解いているわけではない。</p>
+      <p>SRS の別の閾値処方として、Rosenberg ら [5, 6] による NIF 351 nm 実験の経験的閾値スケーリングを上の絶対閾値式に対する倍率へ換算した \(C_B=8\times2377\times0.351^{2/3}/995\simeq9.5097\)（0.351 は波長 [µm]、995 は上式の絶対閾値係数であり、閾値を約 9.5 倍に引き上げる）を <code>threshold_multiplier</code> に指定できる。\(C_B\) はこの処方の閾値倍率である。ただし、較正に使われたのは吸収を含む DRACO の \(n_c/4\) での強度であり、本モデルが読む捕獲面の強度とは同じ観測量ではないため、\(C_B\) を適用する際は対象の条件に対する感度を確認する必要がある。</p>
+      <p>強度の計測は 1 時間刻み遅れである（現刻みの光線追跡で得た強度から次刻みの η を更新することで、1 時間刻み内での光線追跡と効率クロージャの反復を省いている）。初期の η は 0、最初の時間刻みは交差パワーの計測にあて、次の時間刻みから非零の η への発展が可能になる。前の時間刻みに交差がない場合、評価面がない場合、当てはめが縮退する場合、電子温度が非正の場合は、固定の <code>relaxation_tau_s</code> で 0 へ緩和する。レーザー消灯中は前の計測を消去し、η を凍結する。再点灯の最初の時間刻みは入力無効として 0 へ緩和し、その後に再成長する。局所条件に応じて η を変えはするが、解像されたプラズマ波、非線形な不安定性の飽和、運動論的な電子生成を解いているわけではない。</p>
     </section>
 
     <section aria-labelledby="controls">
       <h2 id="controls">namelist による制御</h2>
-      <p>表は<a href="../../use/namelist.html#terms-deck">デッキ</a>でキーを省略したときのパーサーの既定値を示す。Studio は 1D デッキで機能を有効にすると <code>Laser.hot_electron</code> を出力する。スカラーまたはチャネルの生成源の指定、角度の設定、レーザーの減耗、源項の制限を出力し、モデルモードのチャネルでは効率クロージャの係数も出力する。<code>spectrum</code>、<code>stopping_model</code>、<a href="../../use/namelist.html#hot-electron-transport">1D 輸送と境界の設定</a>、および重なりと照射の 4 キーはパーサーに委ねる。平面円錐では書き出したデッキに必須の <code>planar_inner_face</code> を追記する。<code>sources</code> は<a href="#terms-channel">スカラーの簡易指定</a>のキーと併用できない。</p>
+      <p>表は<a href="../../use/namelist.html#terms-deck">デッキ</a>でキーを省略したときのパーサーの既定値を示す。Studio は 1D デッキで機能を有効にすると <code>Laser.hot_electron</code> を出力する。スカラーまたはチャネルの生成源の指定、角度の設定、レーザーの減耗、源項の制限を出力し、モデルモードのチャネルでは効率クロージャの係数も出力する。<code>spectrum</code>、<code>stopping_model</code>、<a href="../../use/namelist.html#hot-electron-transport">1D 輸送と境界の設定</a>、および重なりと照射の 4 キー（<code>tpd_overlap_mode</code>、<code>srs_overlap_mode</code>、<code>illumination_metric</code>、<code>common_wave_delta_theta_deg</code>）はパーサーに委ねる。平面円錐では書き出したデッキに必須の <code>planar_inner_face</code> を追記する。<code>sources</code> は<a href="#terms-channel">スカラーの簡易指定</a>のキーと併用できない。</p>
       <table class="quick-facts">
         <thead>
           <tr><th>キー / モード</th><th>既定値</th><th>用途</th></tr>
@@ -352,7 +354,7 @@
           <tr><th><code>explicit_source_limit</code></th><td><code>0.2</code></td><td><code>"hot_electron"</code> の時間刻み制限に使う \(f_E\)。</td></tr>
           <tr><th><code>eta_model.eta_total_cap</code></th><td><code>-1</code></td><td><code>eta_mode="model"</code> のチャネル効率の合計上限。<code>-1</code> は合計上限なし。有効範囲は <code>-1</code> または <code>(0, 0.5]</code>。正値を指定し、合計が超えた場合だけ各チャネルを比例して縮小する。</td></tr>
           <tr><th><code>eta_model.ln_filter_tau_s</code></th><td><code>5.0e-12</code></td><td><code>eta_mode="model"</code> で、\(1/L_n\) に掛ける指数フィルタの時定数 [s]。</td></tr>
-          <tr><th><code>tpd_overlap_mode</code></th><td><code>"single_beam"</code></td><td><code>eta_mode="model"</code> の TPD の駆動強度の求め方。<code>"single_beam"</code> は内向き交差の全光線の重なり強度を使う。<code>"common_wave_cluster"</code> は、共通の軸に対して極角の差が <code>common_wave_delta_theta_deg</code> 以内にあるビームを、1 つの電子プラズマ波を共通に駆動するビームの集まりとみなし、その強度の和から求める。<code>Laser.port_configuration.ports</code> と <code>common_wave_delta_theta_deg</code> が必要で、<code>Laser.cbet.geometry_mode="port_section"</code> のときだけ働く。</td></tr>
+          <tr><th><code>tpd_overlap_mode</code></th><td><code>"single_beam"</code></td><td><code>eta_mode="model"</code> の TPD の駆動強度の求め方。<code>"single_beam"</code> は内向き交差の全光線の重なり強度を使う。<code>"common_wave_cluster"</code> は、共通の軸に対して極角の差が <code>common_wave_delta_theta_deg</code> 以内にあるビームを、1 つの電子プラズマ波を共通に駆動するビーム群とみなし、捕獲面上で強度重み付き球面平均した駆動強度 <code>I_drive</code> を使う。<code>Laser.port_configuration.ports</code> と <code>common_wave_delta_theta_deg</code> が必要で、<code>Laser.cbet.geometry_mode="port_section"</code> のときだけ働く。</td></tr>
           <tr><th><code>srs_overlap_mode</code></th><td><code>"per_beam_class"</code></td><td>現在の唯一の値。SRS は全経路で、TPD の <code>"single_beam"</code> と同じ内向き交差の全光線の重なり強度を使う。ビーム別・クラス別の駆動はなく、値の名前はデッキ互換性のため保持する。</td></tr>
           <tr><th><code>illumination_metric</code></th><td><code>"fixed"</code></td><td>照射面積の係数 \(f_{\rm illum}\) を選ぶ。<code>port_section</code> 経路では <code>"equivalent_area"</code> が捕獲面で \(f_{\rm illum}^{(2)}=(\int I\,d\Omega)^2/(4\pi\int I^2 d\Omega)\) を評価する。SRS にも適用する。\(I\) は面上の強度、\(d\Omega\) は立体角要素である。表がない場合や評価が無効な場合は、効率への入力を無効とする。他の経路では \(f_{\rm illum}=1\) を使う。<code>"equivalent_area"</code> の指定には <code>eta_mode="model"</code> と空でない <code>Laser.port_configuration.ports</code> が必要である。<code>common_wave_cluster</code> の TPD は <code>I_drive</code> を使う。</td></tr>
           <tr><th><code>common_wave_delta_theta_deg</code></th><td>なし</td><td><code>tpd_overlap_mode="common_wave_cluster"</code> で必須の角度の幅 [deg]（範囲は 0 より大きく 90 以下）。普遍的な既定値はなく、較正して使う。</td></tr>
@@ -364,11 +366,11 @@
       <h2 id="verification-limits">検証と適用上の制限</h2>
       <p><a href="hot-electrons-standard-problems.html">ホット電子の輸送の解析解による検証</a>では、球殻の連続減速、移動する球面メッシュでの時間依存の再流入、逸出を伴う平面での時間依存の再流入を解析解と比較する。登録済みの標準問題の試験は、観測した収束次数が 0.9 以上であることを要求し、エネルギー台帳と未解決エネルギーを検査する。</p>
       <ul>
-        <li>スペクトルの試験は、受理範囲の端に近い窓を含め、群重みが正であり、代表エネルギーが群の範囲内にあることを検査する。1D の試験は、減速の解析解、弦が横切るセルの順序、生成源を集約したビンの数とセル、角度節点の数と一部の重み、および低温材料の参照データに対する束縛電子込みの停止能と飛程も検査する。GPU の停止能の試験は、ホスト値とデバイス値が有限であり、ホスト値が正であることを要求する。</li>
-        <li>輸送の試験は、反射方向の符号、セル通過計算の収束、有限・無限の時間予算での方向の下限、および停止係数と散乱係数を検査する。放出の試験は、抽出した弦ごとの行数とエネルギー、両方の再利用規則での強制完了、および無損失周回のエネルギー収支を検査する。</li>
-        <li>動径レーザーの試験は、チャネル別のエネルギーの項目数、初回の駆動強度が 0 でその後に変換効率が所定の下限に達すること、および密度を下げて捕獲が起きなくなったときの捕獲の有効性、パワー、方向余弦の絶対値の逆数の診断値を検査する。捕獲の再開後とレーザー停止時にも、方向余弦の絶対値の逆数の診断値を検査する。</li>
+        <li>スペクトルの試験は、受理範囲の端に近い窓を含め、群重みが正であり代表エネルギーが各群の範囲内に収まることを検証する。1D の試験ではさらに、減速の解析解、弦が横切るセルの順序、生成源を集約したビンの数と所属セル、角度節点の数と一部の重み、低温材料の参照データに対する束縛電子込みの阻止能と飛程を検証する。GPU の阻止能の試験では、ホスト値とデバイス値が有限であり、ホスト値が正であることを確認する。</li>
+        <li>1D 輸送の試験は、反射方向の符号、セル通過計算の収束、有限・無限の時間予算における方向の下限の扱い、および阻止係数と散乱係数を検証する。放出の試験は、抽出した弦ごとの行数とエネルギー、両方の再利用規則における強制完了、および無損失周回のエネルギー収支を検証する。</li>
+        <li>動径レーザーの試験は、チャネル別エネルギーの項目数と、初回の駆動強度が 0 となった後に変換効率が所定の下限へ立ち上がることを検証する。さらに、密度を下げて捕獲が止まったときの捕獲フラグ・パワー・方向余弦の絶対値の逆数の診断値に加え、捕獲の再開後とレーザー停止時における同じ逆数診断値も確認する。</li>
       </ul>
-      <p>1D では平均余弦で弦方向の飛程短縮を、シース境界で再流入を表す。弦の内部での横方向の広がり、電子の縮退（degeneracy）、および自己無撞着なシース電場はモデルの対象外である。自由電子だけを使う場合、低温の部分電離物質で停止能を過小評価し得る。スペクトル温度は較正入力である。変換効率は指定するか、縮約した生成クロージャから求める。</p>
+      <p>1D では平均余弦で弦方向の飛程短縮を、シース境界で再流入を表す。弦の内部での横方向の広がり、電子の縮退（degeneracy）、および自己無撞着なシース電場はモデルの対象外である。自由電子だけを使う場合、低温の部分電離物質で阻止能を過小評価し得る。スペクトル温度は較正入力である。変換効率は指定するか、縮約した生成クロージャから求める。</p>
     </section>
 
     <section aria-labelledby="references">
@@ -386,8 +388,8 @@
         <li>A. A. Solodov et al., "Hot-electron preheat and mitigation in polar-direct-drive experiments at the National Ignition Facility," Phys. Rev. E 106, 055204 (2022). <a href="https://doi.org/10.1103/PhysRevE.106.055204">doi:10.1103/PhysRevE.106.055204</a></li>
         <li>D. Barlow et al., "Role of hot electrons in shock ignition constrained by experiment at the National Ignition Facility," Phys. Plasmas 29, 082704 (2022). <a href="https://doi.org/10.1063/5.0097080">doi:10.1063/5.0097080</a></li>
         <li>A. Derriey, J.-L. Feugeas, P. Nicolaï, and V. Tikhonchuk, "Methods for calculating the laser intensity in plasma using the geometrical optics approach: Applications to laser-driven fusion," J. Comput. Phys. 569, 115477 (2027). <a href="https://doi.org/10.1016/j.jcp.2026.115477">doi:10.1016/j.jcp.2026.115477</a></li>
-        <li>Yu. A. Kravtsov and Yu. I. Orlov, Caustics, Catastrophes and Wave Fields (Springer, Berlin, 1993). <a href="https://doi.org/10.1007/978-3-642-59887-6">doi:10.1007/978-3-642-59887-6</a></li>
-        <li>P. Michel, Introduction to Laser-Plasma Interactions (Springer, Cham, 2023). <a href="https://doi.org/10.1007/978-3-031-23424-8">doi:10.1007/978-3-031-23424-8</a></li>
+        <li>Yu. A. Kravtsov and Yu. I. Orlov, <i>Caustics, Catastrophes and Wave Fields</i> (Springer, Berlin, 1993). <a href="https://doi.org/10.1007/978-3-642-59887-6">doi:10.1007/978-3-642-59887-6</a></li>
+        <li>P. Michel, <i>Introduction to Laser-Plasma Interactions</i> (Springer, Cham, 2023). <a href="https://doi.org/10.1007/978-3-031-23424-8">doi:10.1007/978-3-031-23424-8</a></li>
         <li>T. Gong et al., "Confirmation of hot electron preheat with a Cu foam sphere on GEKKO-LFEX laser facility," Phys. Plasmas 24, 112709 (2017). <a href="https://doi.org/10.1063/1.4999975">doi:10.1063/1.4999975</a></li>
         <li>A. A. Solodov and R. Betti, "Stopping power and range of energetic electrons in dense plasmas of fast-ignition fusion targets," Phys. Plasmas 15, 042707 (2008). <a href="https://doi.org/10.1063/1.2903890">doi:10.1063/1.2903890</a></li>
       </ol>

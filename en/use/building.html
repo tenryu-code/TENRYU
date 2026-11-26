@@ -21,17 +21,18 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">At a glance</h3>
       <ul>
-        <li>Install a CUDA 12.x toolkit, CMake 3.27 or newer, Ninja, and the Boost headers, and use an NVIDIA GPU (exercised hardware is sm_80+).</li>
-        <li>The standard workflow configures <code>build/</code> with <code>cmake</code>, then compiles it with <code>ninja -C build</code>.</li>
-        <li>Use the complete CTest suite, a targeted <code>-R</code> selection, or a named <code>tenryu verify</code> case according to the scope of the check.</li>
-        <li>MPI is OFF by default. Configure with <code>-DTENRYU_ENABLE_MPI=ON</code> for an executable that runs on several ranks (a rank is one MPI process).</li>
+        <li><strong>Required tools and GPU:</strong> Install a CUDA 12.x toolkit, CMake 3.27 or newer, Ninja, and the Boost headers, and use an NVIDIA GPU (exercised hardware is sm_80+).</li>
+        <li><strong>Standard build workflow:</strong> The standard workflow configures <code>build/</code> with <code>cmake</code>, then compiles it with <code>ninja -C build</code>.</li>
+        <li><strong>Three test tiers:</strong> Use the complete CTest suite, a targeted <code>-R</code> selection, or a named <code>tenryu verify</code> case according to the scope of the check.</li>
+        <li><strong>MPI option:</strong> MPI is OFF by default. Configure with <code>-DTENRYU_ENABLE_MPI=ON</code> for an executable that runs on several ranks (a rank is one MPI process).</li>
       </ul>
     </aside>
 
     <section aria-labelledby="prerequisites">
       <h2 id="prerequisites">Prerequisites</h2>
       <p>Build on a system where the NVIDIA driver and CUDA compiler are available and CMake can discover the selected dependencies. HDF5 and Python support are enabled by default in the top-level CMake configuration; MPI is disabled by default. An optional feature also requires its development package to be visible during configuration; after enabling or disabling one, configure again, then build. The complete requirement picture — supported GPU generations, compilers, minimum library versions, CMake option defaults, and pre-flight check commands — is on <a href="requirements.html">System requirements</a>; the table below restates the essentials.</p>
-      <p><strong>About networking.</strong> The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically by CMake's FetchContent at configure time when missing. On offline machines, preinstall them or run the first configure where the network is available. CUDA, the Boost headers, HDF5, Python, MPI, and Hypre are never auto-fetched.</p>
+      <h3>About networking</h3>
+      <p>The small test, logging, CLI, and Python-binding dependencies (Catch2, spdlog, CLI11, pybind11) are fetched automatically by CMake's FetchContent at configure time when missing. On offline machines, preinstall them or run the first configure where the network is available. CUDA, the Boost headers, HDF5, Python, MPI, and Hypre are never auto-fetched.</p>
       <table class="quick-facts">
         <thead><tr><th>Component</th><th>Requirement</th><th>Role</th></tr></thead>
         <tbody>

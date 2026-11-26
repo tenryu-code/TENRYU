@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>1D Hydrodynamics Verification with Standard Problems — TENRYU documentation</title>
+  <title>1D Hydrodynamics Verification with Standard Problems — TENRYU Documentation</title>
   <link rel="stylesheet" href="../../../style.css">
   <link rel="icon" href="../../../favicon.ico" sizes="32x32">
   <link rel="icon" href="../../../favicon.svg" type="image/svg+xml">
@@ -15,17 +15,17 @@
   <div id="sidebar"></div>
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
-    <h1>1D Hydrodynamics Verification with Standard Problems<span class="badge">reference</span></h1>
+    <h1>1D Hydrodynamics Verification with Standard Problems <span class="badge">reference</span></h1>
 
     <section aria-labelledby="abstract">
       <h2 id="abstract">Abstract</h2>
-      <p class="abstract">We compared 1D Lagrangian hydrodynamics on a staggered grid with exact ideal-gas solutions. The runs used <a href="time-integration.html">RK2-Average time integration</a> and <a href="artificial-viscosity.html#csw98-1d">CSW98 (Caramana–Shashkov–Whalen 1998) limited Kuropatenko artificial viscosity</a>, with conduction, radiation, and laser physics disabled. The planar Sod shock tube and spherical Noh implosion each used 200, 400, and 800 cells. Kidder’s isentropic compression of a sphere used 72, 144, and 288 cells. The observed orders were 0.97 for Sod (minimum 0.90), 0.99 for Noh (minimum 0.77), and 1.98–2.00 for Kidder density, pressure, and outer radius (minimum 1.7). In every run, each cell’s mass was bitwise unchanged, and the accumulated absolute energy residual was at most 3.1 × 10<sup>−12</sup> of the largest total energy (limit 10<sup>−6</sup>).</p>
+      <p class="abstract">1D Lagrangian hydrodynamics on a staggered grid is compared with exact ideal-gas solutions. The runs used <a href="time-integration.html">RK2-Average time integration</a> and <a href="artificial-viscosity.html#csw98-1d">CSW98 (Caramana–Shashkov–Whalen 1998) limited Kuropatenko artificial viscosity</a>, with conduction, radiation, and laser physics disabled. The planar Sod shock tube and spherical Noh implosion each used 200, 400, and 800 cells. Kidder's isentropic compression of a sphere used 72, 144, and 288 cells. The observed orders were 0.97 for Sod (minimum 0.90), 0.99 for Noh (minimum 0.77), and 1.98–2.00 for Kidder density, pressure, and outer radius (minimum 1.7). In every run, each cell's mass was bitwise unchanged, and the accumulated absolute energy residual was at most 3.1 × 10<sup>−12</sup> of the largest total energy (limit 10<sup>−6</sup>).</p>
     </section>
 
     <section aria-labelledby="introduction">
       <h2 id="introduction">Introduction</h2>
       <p>The Sod problem tests the planar three-wave structure of a rarefaction fan, a contact discontinuity, and a weak shock. In the spherical Noh problem, inward flow stagnates at the center and produces an infinitely strong shock that travels outward. Gas behind the shock is at rest, and a wall-heating error appears near the center [1]. In the Kidder problem, a time-dependent boundary pressure drives shock-free spherical compression [2]. The smooth solution tests second-order convergence under joint refinement of space and time, spherical geometric terms, and boundary pressure work.</p>
-      <p>The runs used one NVIDIA GeForce RTX 4090 on November 21, 2026. The GPU was otherwise idle, and NVIDIA Multi-Process Service (MPS) was disabled. Wall times ranged from 2.4 to 20.2 s, and all runs met the criteria. The repository’s <code>tools/site_figures/<wbr>data/<wbr>hydro1d_standard_problems/<wbr>README.md</code> records the run conditions and how the data were extracted.</p>
+      <p>The runs used one NVIDIA GeForce RTX 4090 on November 21, 2026. The GPU was otherwise idle, and NVIDIA Multi-Process Service (MPS) was disabled. Wall times ranged from 2.4 to 20.2 s, and all runs met the criteria. The repository's <code>tools/site_figures/<wbr>data/<wbr>hydro1d_standard_problems/<wbr>README.md</code> records the run conditions and how the data were extracted.</p>
     </section>
 
     <section aria-labelledby="setup">
@@ -72,7 +72,7 @@
       \end{aligned}
       $$
       <p>In the exact Noh solution [1, p. 104], \(R_s\) is the shock radius, \(u_0\) the initial velocity, \(t\) time, and \(r\) radius. The symbols \(\rho\), \(u\), \(e\), and \(p\) denote density, radial velocity, specific internal energy, and pressure, respectively. The states are in cgs units. The upstream density expression uses an initial density of 1 g/cm³. The initial velocity is −1 cm/s. The shock radius at the end time is 0.2 cm.</p>
-      <p>Kidder’s exact solution is homologous compression. The radii of all fluid elements shrink in the same proportion, and the density and pressure evolve as follows [2, p. 54, Eqs. (2.2), (2.5), (2.7)].</p>
+      <p>Kidder's exact solution is homologous compression. The radii of all fluid elements shrink in the same proportion, and the density and pressure evolve as follows [2, p. 54, Eqs. (2.2), (2.5), (2.7)].</p>
       $$
       r=r_0 h(t),\qquad \rho=\rho_0(r_0)/h(t)^3,\qquad p=p_0(r_0)/h(t)^{3\gamma}.
       $$
@@ -84,7 +84,7 @@
       \qquad t_0=\sqrt{\frac{\rho_c}{5\beta p_c}}.
       \end{aligned}
       $$
-      <p>The first line is Kidder’s equation of motion [2, Eq. (2.8)]. \(h\) is the radial scale factor, \(\ddot h\) its second time derivative, \(\gamma\) the specific heat ratio, \(r_0\) the initial radius, and \(\rho_0\) and \(p_0\) the initial density and pressure. \(dp_0/dr_0\) is the radial derivative of the initial pressure. Substituting the <a href="#setup">initial profiles</a> gives the second line. The central initial pressure \(p_c\), central initial density \(\rho_c\), and coefficient \(\beta\) give a collapse time \(t_0\) of 7.67 × 10<sup>−7</sup> s.</p>
+      <p>The first line is Kidder's equation of motion [2, Eq. (2.8)]. \(h\) is the radial scale factor, \(\ddot h\) its second time derivative, \(\gamma\) the specific heat ratio, \(r_0\) the initial radius, and \(\rho_0\) and \(p_0\) the initial density and pressure. \(dp_0/dr_0\) is the radial derivative of the initial pressure. Substituting the <a href="#setup">initial profiles</a> gives the second line. The central initial pressure \(p_c\), central initial density \(\rho_c\), and coefficient \(\beta\) give a collapse time \(t_0\) of 7.67 × 10<sup>−7</sup> s.</p>
       $$
       h(t)=\sqrt{1-(t/t_0)^2},\qquad u_b=-\frac{R_0 t}{t_0^2 h(t)}.
       $$
@@ -112,8 +112,8 @@
       q_{\rm shock}=\frac{\ln(E_{200}/E_{800})}{\ln 4},\qquad q_{\rm Kidder}=\log_2(E_{\rm coarse}/E_{\rm fine}).
       $$
       <p>\(q_{\rm shock}\) is the observed order for Sod or Noh, and \(E_{200}\) and \(E_{800}\) are their density errors at 200 and 800 cells. \(q_{\rm Kidder}\) is the order for an adjacent pair of Kidder meshes. \(E_{\rm coarse}\) and \(E_{\rm fine}\) are the coarse- and fine-mesh errors for the same quantity, whether density, pressure, or outer radius.</p>
-      <p>Discontinuities often reduce the observed convergence order to one or below, even for methods of higher formal order [4, §8.3.3.4]. The Sod minimum of 0.90 is 10% below first order, using the agreement band for observed and formal orders in the grid convergence index procedure as a guide [4, §8.6.2, Table 8.1]. The spherical Noh minimum is 0.77. Burnett et al. [5, Table 3, Eq. (65)] report L1 orders for Los Alamos National Laboratory’s FLAG code of 0.900 for the ideal gas and 0.771–1.045 for Noble–Abel gases. The Kidder minimum is 1.7. Burton et al. [6, Table 3 and the Kidder ball section] report orders of 1.75–2.86 for the radii of the isentropic shell and L1 density and pressure orders for the ball of 1.89–1.92 with one scheme and 1.11–1.19 with another. The criteria specify lower bounds, so observed orders above the formal order pass.</p>
-      <p>Every run must reach the prescribed end time, preserve each cell’s mass bit for bit, and meet the <a href="#ledger">energy conservation criterion</a>. The tests also require exactly zero initial internal energy for Noh and a fixed center node for Noh and Kidder.</p>
+      <p>Discontinuities often reduce the observed convergence order to one or below, even for methods of higher formal order [4, §8.3.3.4]. The Sod minimum of 0.90 is 10% below first order, using the agreement band for observed and formal orders in the grid convergence index procedure as a guide [4, §8.6.2, Table 8.1]. The spherical Noh minimum is 0.77. Burnett et al. [5, Table 3, Eq. (65)] report L1 orders for Los Alamos National Laboratory's FLAG code of 0.900 for the ideal gas and 0.771–1.045 for Noble–Abel gases. The Kidder minimum is 1.7. Burton et al. [6, Table 3 and the Kidder ball section] report orders of 1.75–2.86 for the radii of the isentropic shell and L1 density and pressure orders for the ball of 1.89–1.92 with one scheme and 1.11–1.19 with another. The criteria specify lower bounds, so observed orders above the formal order pass.</p>
+      <p>Every run must reach the prescribed end time, preserve each cell's mass bit for bit, and meet the <a href="#ledger">energy conservation criterion</a>. The tests also require exactly zero initial internal energy for Noh and a fixed center node for Noh and Kidder.</p>
     </section>
 
     <section aria-labelledby="results">
@@ -153,7 +153,7 @@
       $$
       r_l\simeq 1,\qquad r_r\simeq 1,\qquad \psi\simeq 1,\qquad Q=\rho W(1-\psi)|\Delta u|\simeq 0.
       $$
-      <p>\(r_l\) and \(r_r\) are the inner and outer neighbors’ velocity gradients divided by the gradient of the cell in question. \(\psi\) is the limiter, \(Q\) is the artificial viscous stress, \(\rho\) is density, \(W\) is the Kuropatenko wave speed, and \(\Delta u\) is the velocity difference between the cell’s nodes.</p>
+      <p>\(r_l\) and \(r_r\) are the inner and outer neighbors' velocity gradients divided by the gradient of the cell in question. \(\psi\) is the limiter, \(Q\) is the artificial viscous stress, \(\rho\) is density, \(W\) is the Kuropatenko wave speed, and \(\Delta u\) is the velocity difference between the cell's nodes.</p>
     </section>
 
     <section aria-labelledby="convergence">
@@ -174,7 +174,7 @@
       <p>\(r\) is the residual of one call, \(E_{\rm before}\) and \(E_{\rm after}\) are the total energies before and after it (kinetic plus internal), \(\Delta E_{\rm ext}\) is the net external energy input to the hydrodynamic update, and \(E_{\max}\) is the largest total energy among the values before and after each hydrodynamics call. The sum includes every hydrodynamics call in the run.</p>
       <p>External contributions in 1D include boundary pressure work, work at velocity-constrained nodes, energy added by floors, and radiation pressure work. Only the Kidder boundary pressure work contributes in these runs, and the energy added by floors is zero in every run.</p>
       <p>The Kidder total energy increases from 1.010 × 10<sup>13</sup> erg initially to 6.577 × 10<sup>13</sup> erg. The accumulated boundary pressure work of 5.568 × 10<sup>13</sup> erg accounts for the increase. All three meshes agree to four significant digits for these values. Sod and Noh have zero cumulative external input and constant total energies of 1.3171 × 10<sup>12</sup> erg/cm² and 2.0944 erg, respectively. The Noh energy is the kinetic energy of a 1 cm sphere with a uniform inward speed of 1 cm/s (about 2π/3 erg), minus the contribution the fixed center node would carry if it moved.</p>
-      <p>The measured residual ratios range from 9.5 × 10<sup>−14</sup> to 3.1 × 10<sup>−12</sup>, or about 10<sup>−16</sup> per call, at the level of double-precision rounding (<a href="#fig-energy">Figure F</a>). The limit of 10<sup>−6</sup> is 50 times below the smallest estimated defect that mismatched force and work would leave in these runs (5 × 10<sup>−5</sup> \(E_{\max}\)), and more than 100 times above the estimated accumulated rounding error (8 × 10<sup>−9</sup> \(E_{\max}\) or less). Both are analytical estimates from the run conditions and were not measured.</p>
+      <p>The measured residual ratios range from 9.5 × 10<sup>−14</sup> to 3.1 × 10<sup>−12</sup>, or about 10<sup>−16</sup> per call, at the level of double-precision rounding (<a href="#fig-energy">Figure F</a>). To catch compatibility defects reliably while avoiding false failures from accumulated double-precision rounding, the limit of 10<sup>−6</sup> is set 50 times below the smallest estimated defect that mismatched force and work would leave in these runs (5 × 10<sup>−5</sup> \(E_{\max}\)), and more than 100 times above the estimated accumulated rounding error (8 × 10<sup>−9</sup> \(E_{\max}\) or less). Both are analytical estimates from the run conditions and were not measured.</p>
       <figure id="fig-energy">
         <img src="../../../assets/hydro1d-standard-problems-energy-en.png" width="900" height="350" style="max-width:100%;height:auto" alt="Energy residual ratio against hydrodynamics calls. Sod uses blue circles, Noh vermilion squares, and Kidder green triangles. The black horizontal line is the limit, and the dashed gray line is the double-precision roundoff guide.">
         <figcaption>Figure F. Energy residual ratio for each run against the number of hydrodynamics calls (twice the step count). Blue circles are Sod, vermilion squares are Noh, and green triangles are Kidder. The black horizontal line is the acceptance limit of 10<sup>−6</sup>. The gray dashed guide multiplies the call count \(n\) by the double-precision unit roundoff of 2<sup>−53</sup>. Both axes are logarithmic.</figcaption>
@@ -204,12 +204,12 @@ TENRYU_KIDDER_DIAG_NR=72 ./build/tenryu verify kidder</code></pre>
     <section aria-labelledby="references">
       <h2 id="references">References</h2>
       <ol class="references">
-        <li>W. F. Noh, “Errors for calculations of strong shocks using an artificial viscosity and an artificial heat flux,” J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
-        <li>R. E. Kidder, “Theory of homogeneous isentropic compression and its application to laser fusion,” Nucl. Fusion 14, 53–60 (1974). <a href="https://doi.org/10.1088/0029-5515/14/1/008">doi:10.1088/0029-5515/14/1/008</a></li>
-        <li>A. E. Mattsson and W. J. Rider, “Artificial viscosity: back to the basics,” Int. J. Numer. Methods Fluids 77, 400–417 (2015). <a href="https://doi.org/10.1002/fld.3981">doi:10.1002/fld.3981</a></li>
+        <li>W. F. Noh, "Errors for calculations of strong shocks using an artificial viscosity and an artificial heat flux," J. Comput. Phys. 72, 78–120 (1987). <a href="https://doi.org/10.1016/0021-9991(87)90074-X">doi:10.1016/0021-9991(87)90074-X</a></li>
+        <li>R. E. Kidder, "Theory of homogeneous isentropic compression and its application to laser fusion," Nucl. Fusion 14, 53–60 (1974). <a href="https://doi.org/10.1088/0029-5515/14/1/008">doi:10.1088/0029-5515/14/1/008</a></li>
+        <li>A. E. Mattsson and W. J. Rider, "Artificial viscosity: back to the basics," Int. J. Numer. Methods Fluids 77, 400–417 (2015). <a href="https://doi.org/10.1002/fld.3981">doi:10.1002/fld.3981</a></li>
         <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
-        <li>S. C. Burnett, K. G. Honnell, S. D. Ramsey, and R. L. Singleton Jr., “Verification Studies for the Noh Problem Using Nonideal Equations of State and Finite Strength Shocks,” J. Verif. Valid. Uncert. Quantif. 3, 021002 (2018). <a href="https://doi.org/10.1115/1.4041195">doi:10.1115/1.4041195</a></li>
-        <li>D. E. Burton, N. R. Morgan, T. C. Carney, and M. A. Kenamond, “Reduction of dissipation in Lagrange cell-centered hydrodynamics (CCH) through corner gradient reconstruction (CGR),” J. Comput. Phys. 299, 229–280 (2015). <a href="https://doi.org/10.1016/j.jcp.2015.06.041">doi:10.1016/j.jcp.2015.06.041</a></li>
+        <li>S. C. Burnett, K. G. Honnell, S. D. Ramsey, and R. L. Singleton Jr., "Verification Studies for the Noh Problem Using Nonideal Equations of State and Finite Strength Shocks," J. Verif. Valid. Uncert. Quantif. 3, 021002 (2018). <a href="https://doi.org/10.1115/1.4041195">doi:10.1115/1.4041195</a></li>
+        <li>D. E. Burton, N. R. Morgan, T. C. Carney, and M. A. Kenamond, "Reduction of dissipation in Lagrange cell-centered hydrodynamics (CCH) through corner gradient reconstruction (CGR)," J. Comput. Phys. 299, 229–280 (2015). <a href="https://doi.org/10.1016/j.jcp.2015.06.041">doi:10.1016/j.jcp.2015.06.041</a></li>
       </ol>
     </section>
 

@@ -20,7 +20,7 @@
 
     <section aria-labelledby="snapshots">
       <h2 id="snapshots">スナップショットのデータセット</h2>
-      <p>ルート属性は <code>t</code>（時刻 [s]）、<code>dt</code>（Δt [s]）、<code>cycle</code> と <code>step</code>（どちらもステップ番号）、<code>geometry</code>（<code>"1D_SPH"</code>|<code>"2D_RZ"</code>）、<code>nr</code>・<code>nz</code>（<code>Mesh.nr</code> と、2D の <code>Mesh.nz</code>。1D の <code>nz</code> は 1）、<code>n_cells</code>、<code>n_nodes</code>、<code>n_groups</code>、<code>n_materials</code>、<code>two_temperature</code>（常に 1）、<code>schema_version</code> である。再開が元の run の厳密な継続でないとき（たとえば、<code>Numerics.ale.band_ale</code> の状態を保存した補助ファイル、すなわちチェックポイントの名前に <code>.band-state</code> を付けたファイルが無いチェックポイントから再開したとき）は、その印を文字列のルート属性 <code>restart_provenance</code>（例: <code>RESTART_WITHOUT_BAND_STATE</code>）に書く。<code>geometry</code> は 1D では平面・円筒でも <code>"1D_SPH"</code> なので、1D のファイルは座標系を表す <code>geometry_1d</code>（<code>"spherical"</code>|<code>"cylindrical"</code>|<code>"planar"</code>）も持つ。1D では配列は 1 次元フラット、<code>mesh/x_z</code>・<code>v_z</code> は省略される。以下、グループごとに列挙する（「optional」は生成条件付き）。</p>
+      <p>ルート属性は <code>t</code>（時刻 [s]）、<code>dt</code>（Δt [s]）、<code>cycle</code> と <code>step</code>（どちらもステップ番号）、<code>geometry</code>（<code>"1D_SPH"</code>|<code>"2D_RZ"</code>）、<code>nr</code>・<code>nz</code>（<code>Mesh.nr</code> と、2D の <code>Mesh.nz</code>。1D の <code>nz</code> は 1）、<code>n_cells</code>、<code>n_nodes</code>、<code>n_groups</code>、<code>n_materials</code>、<code>two_temperature</code>（常に 1）、<code>schema_version</code> である。再開が元の run の厳密な継続でないとき（たとえば、<code>Numerics.ale.band_ale</code> の状態を保存した補助ファイル、すなわちチェックポイントの名前に <code>.band-state</code> を付けたファイルが無いチェックポイントから再開したとき）は、その印を文字列のルート属性 <code>restart_provenance</code>（例：<code>RESTART_WITHOUT_BAND_STATE</code>）に書く。<code>geometry</code> は 1D では平面・円筒でも <code>"1D_SPH"</code> なので、1D のファイルは座標系を表す <code>geometry_1d</code>（<code>"spherical"</code>|<code>"cylindrical"</code>|<code>"planar"</code>）も持つ。1D では配列は 1 次元フラット、<code>mesh/x_z</code>・<code>v_z</code> は省略される。以下、グループごとに列挙する（「optional」は生成条件付き）。</p>
 
       <h3>metadata/ — 来歴</h3>
       <table class="quick-facts">
@@ -39,7 +39,7 @@
           <tr><th><code>x_r</code>, <code>x_z</code></th><td>節点座標 [cm]。<code>x_z</code> は 2D のみ。</td></tr>
           <tr><th><code>v_r</code>, <code>v_z</code></th><td>節点速度 [cm/s]。<code>v_z</code> は 2D のみ。</td></tr>
           <tr><th><code>cell_material_id</code></th><td>セルの代表材料インデックス（多材料セルは体積分率最大、同率なら小さい方）。</td></tr>
-          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュ（multiblock mesh）の接続関係（mesh topology。v2: 3 ブロック、v3: half-butterfly 5 ブロック — block/seam 表と CSR（compressed sparse row、圧縮行格納）形式の接続関係、v4: 五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
+          <tr><th><code>topology/v2/</code>・<code>v3/</code>・<code>v4/</code></th><td>optional。マルチブロックメッシュ（multiblock mesh）の接続関係（mesh topology。v2：3 ブロック、v3：half-butterfly 5 ブロック — block/seam 表と CSR（compressed sparse row、圧縮行格納）形式の接続関係、v4：五角形帯の <code>cell_nverts</code> と <code>corner_stride</code> 属性）。単一ブロックでは省略。構成の詳細は <a href="../../physics/mesh/2d.html">2D メッシュ</a>参照。</td></tr>
         </tbody>
       </table>
 
@@ -78,9 +78,9 @@
           <tr><th><code>energy_density</code></th><td>群別輻射エネルギー密度 E_g [erg/cm³]（[N_cell, G]）。</td></tr>
           <tr><th><code>rad_dep</code>, <code>rad_emit</code></th><td>当該ステップ累積の吸収・放出 [erg]（群別）。</td></tr>
           <tr><th><code>deposited_power</code></th><td>吸収パワー密度 [erg/cm³/s]（= rad_dep/(VΔt)、可視化用）。</td></tr>
-          <tr><th><code>fleck_factor</code></th><td>2D の FLD（flux-limited diffusion、流束制限拡散）のみ。セルの Fleck 因子（Fleck factor）。診断はグレイ（gray）の G=1 のときだけ有効である。</td></tr>
+          <tr><th><code>fleck_factor</code></th><td>2D の FLD（flux-limited diffusion、流束制限拡散）のみ。セルの Fleck 係数（Fleck factor）。診断はグレイ（gray）の G=1 のときだけ有効である。</td></tr>
           <tr><th><code>sn_tau_R</code>, <code>sn_reduced_flux</code>, <code>sn_ap_alpha</code></th><td>2D の S<sub>N</sub>（discrete ordinates、離散座標法）のみ。面の流束を S<sub>N</sub> と拡散で混ぜる漸近保存（asymptotic-preserving、AP）処理の診断（光学的厚さ（optical depth）・換算流束（reduced flux）・混合の重みの各プロキシ）。</td></tr>
-          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断: <code>diag_rad_</code> に続く <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>。再開の状態復元には使われない。</td></tr>
+          <tr><th><code>diag_*</code>（12 種）</th><td>1D S<sub>N</sub> の出力専用診断。<code>diag_rad_</code> に続く <code>E_pre</code>/<wbr><code>E_post</code>/<wbr><code>emission_at_Tn</code>/<wbr><code>emission_at_Tnp1</code>/<wbr><code>absorption</code> と、<code>diag_</code> に続く <code>clip_energy</code>/<wbr><code>clip_full_deficit</code>/<wbr><code>chi_opacity</code>/<wbr><code>F_first_moment</code>/<wbr><code>E_star_flux</code>/<wbr><code>stream_theta</code>/<wbr><code>ap_alpha_face</code>。再開の状態復元には使われない。</td></tr>
         </tbody>
       </table>
 
@@ -94,7 +94,7 @@
           <tr><th><code>ray_density</code></th><td>光線の初期配置密度 [1/cm³]。</td></tr>
           <tr><th><code>A_Q_r_shells</code>, <code>A_Q_z_shells</code></th><td>2D の単一ブロックのメッシュのみ（マルチブロックのメッシュには書かない）。セル列（<code>A_Q_r_shells</code> は r 添字を固定した z 方向のセルの列、<code>A_Q_z_shells</code> は z 添字を固定した r 方向のセルの列。データセット名の shells はこの列を指し、カプセルのシェルではない）ごとの沈着非対称度 \((q_{max}-q_{min})/(q_{max}+q_{min})\)。q は各セルにそのステップで沈着したレーザーエネルギー [erg]。</td></tr>
           <tr><th><code>mesh/</code></th><td><code>ray_output_trajectory=True</code> の非 skip ステップ（= 光線追跡（ray tracing）を実行したステップ。<code>Laser.raytrace_skip</code> の間引き再利用ステップでは出力されない）のみ。レーザー専用の独立格子 LaserMesh（流体メッシュとは別の 2D RZ 構造格子 — <a href="../../physics/laser/index.html">レーザー</a>参照）の節点座標・\(\hat n_e\)（電子密度の臨界密度（critical density）に対する比）・T_e・Z̄・密度勾配・<code>n_crit</code>。</td></tr>
-          <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。光線の初期位置・方向・パワー（1D: R0/Z0/vR0/vZ0、2D: x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
+          <tr><th><code>rays/</code></th><td><code>ray_output_count&gt;0</code> の非 skip ステップのみ。光線の初期位置・方向・パワー（1D：R0/Z0/vR0/vZ0、2D：x0/y0/z0/vx0/vy0/vz0）とビーム ID。</td></tr>
           <tr><th><code>rays/trajectory/</code></th><td><code>ray_output_trajectory=True</code> 時。CSR 形式の軌跡（offsets・step_count・位置列・残存パワー列）。可視化で光線を重ねて描くときの元データ。</td></tr>
         </tbody>
       </table>

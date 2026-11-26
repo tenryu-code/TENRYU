@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TENRYU Studio (GUI) — TENRYU ドキュメント</title>
+  <title>TENRYU Studio（GUI） — TENRYU ドキュメント</title>
   <link rel="stylesheet" href="../../style.css">
   <link rel="icon" href="../../favicon.ico" sizes="32x32">
   <link rel="icon" href="../../favicon.svg" type="image/svg+xml">
@@ -15,8 +15,8 @@
   <div id="sidebar"></div>
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
-    <h1>TENRYU Studio (GUI) <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU Studio は、TENRYU の入力である<a href="namelist.html#terms-deck">デッキ（deck）</a>、すなわち Python の namelist 形式のファイルを、フォームから作成する macOS のデスクトップアプリである。入力に応じてデッキをその場で生成し、検証（validate）、保存、SSH で接続した計算サーバーでの実行までを、ひとつの画面で扱える。保存したデッキにはフォームの状態も埋め込まれるため、コードと GUI のあいだを行き来しながら設定を育てられる。Studio に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
+    <h1>TENRYU Studio（GUI） <span class="badge">reference</span></h1>
+    <p class="abstract">TENRYU Studio は、TENRYU の入力である<a href="namelist.html#terms-deck">デッキ（deck）</a>、すなわち Python の namelist 形式のファイルを、フォームから作成する macOS のデスクトップアプリである。入力に応じてデッキをその場で生成し、検証（validate）、保存、SSH で接続した計算サーバーでの実行までを、1 つの画面で扱える。保存したデッキにはフォームの状態も埋め込まれるため、コードと GUI のあいだを行き来しながら設定を育てられる。Studio に固有の用語は<a href="#terms">用語の節</a>で説明する。</p>
 
     <div class="button-row">
       <a class="button" href="../../gui/manual/index_ja.html">日本語 GUI マニュアル</a>
@@ -27,10 +27,10 @@
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
       <ul>
-        <li>中央のフォームを編集すると、右のペインにある Python のデッキがその場で更新される。</li>
-        <li>保存または実行の前に、フォームの検証と、ヘッダーの「validate 実行」によるサーバー上の <code>tenryu validate</code> で入力を確かめる（<a href="#terms-validate">検証</a>）。</li>
-        <li><code>TENRYU-GUI-STATE</code> のコメントを残しておけば、保存済みのデッキからフォーム全体を復元できる（<a href="#terms-gui-state">定義</a>）。</li>
-        <li>1D のプリセットのうち空白を除く 11 個は、RTX 4090 で終了時刻まで計算し、2 倍細かいメッシュの計算と比べて確かめた構成である。計算の日付は、<a href="../physics/lpi/cbet.html">CBET</a>（交差ビームエネルギー転送、cross-beam energy transfer）のプリセットが 2026-10-05、ほかが 2026-10-01 で、2 倍細かいメッシュとの比較は、CBET のプリセットだけが 0.5 ns までである。この比較の結果は、カードの「検証の run」に載る（<a href="#terms-preset">定義</a>）。</li>
+        <li><strong>リアルタイムのデッキ生成：</strong>中央のフォームを編集すると、右のペインにある Python のデッキがその場で更新される。</li>
+        <li><strong>2 段階の検証：</strong>保存または実行の前に、フォームの検証と、ヘッダーの「validate 実行」によるサーバー上の <code>tenryu validate</code> で入力を確かめる（<a href="#terms-validate">検証</a>）。</li>
+        <li><strong>フォーム状態の埋め込み：</strong><code>TENRYU-GUI-STATE</code> のコメントを残しておけば、保存済みのデッキからフォーム全体を復元できる（<a href="#terms-gui-state">定義</a>）。</li>
+        <li><strong>1D プリセットの検証済み構成：</strong>1D のプリセットのうち空白を除く 11 個は、RTX 4090 で終了時刻まで計算し、2 倍細かいメッシュの計算と比べて確かめた構成である。計算の日付は、<a href="../physics/lpi/cbet.html">CBET</a>（交差ビームエネルギー転送、cross-beam energy transfer）のプリセットが 2026-10-05、ほかが 2026-10-01 で、2 倍細かいメッシュとの比較は、CBET のプリセットだけが 0.5 ns までである。この比較の結果は、カードの「検証の run」に載る（<a href="#terms-preset">定義</a>）。</li>
       </ul>
     </aside>
 
@@ -60,7 +60,8 @@ npm run tauri build</code></pre>
       <h3 id="terms-preset">プリセットと検証の run</h3>
       <p><strong>プリセット（preset）</strong>は、フォームのすべての値をまとめて設定するひな形である。「プリセット」の画面にカードとして並び、1D のタブに 12 個（基本が 6 個、オプションのカーネルが 6 個）、2D のタブに 5 個ある。カードの「このプリセットを適用」を押すと確認が出て、「破棄して適用」を押すと、現在のフォームの内容がすべて破棄されて置き換わり、画面は「基本設定」へ移る。1D のカードは、題、バッジ、説明、「使うカーネル」、「検証の run」を表示する。バッジは 3 種で、<a href="#terms-geometry">メッシュの作り方</a>、必要な物性表（material table）、計算の重さを表し、該当するものだけが付く。表示は、「推薦メッシュ」または「層ごとの指定」、「物性表が必要: …」、「計算が重い (GPU 1 枚で数時間)」である。プリセットは、フォームを一から埋めずに、目的に近い設定から始めるために使う。</p>
       <p id="terms-verification-run"><strong>検証の run（verification run）</strong>は、プリセットのカードにある結果の欄「検証の run」である。プリセットのデッキを終了時刻まで計算し、同じ条件を 2 倍細かいメッシュで計算した結果と比べた量の差を書く。2 倍細かいメッシュは、Studio の「収束確認用の組」が作るデッキのメッシュである。SNB のプリセットでは、代わりに、プリセットのメッシュのすべてのセルを 2 つに分けたメッシュである。比べる量はプリセットごとに違い（吸収エネルギー、アブレーション圧（ablation pressure）、アブレーションした質量、停滞（stagnation）の時刻、最大密度など）、差が小さいほど、そのメッシュで量が収束している。空白のカードと 2D のカードには付かない。Studio の「収束確認用の組」は、フォームのデッキから、以下のようにメッシュを細かくしたデッキを作り、ケース名の末尾に <code>_fine</code> を付ける。出力ディレクトリが指定されていれば、その末尾にも <code>_fine</code> を付ける。同じ確かめを自分のデッキで行うための機能である。</p>
-      <p>細かくする方法は、メッシュの作り方（<a href="#terms-geometry">下の「ジオメトリー」の項</a>）ごとに次のとおりである。「一様」では、等幅のままセル数を 2 倍にし、元の各セルを等幅の 2 つに分ける。「graded（区間と質量の重み）」では、区間（segment）を手動で指定した場合は各区間のセル数を 2 倍にし、それ以外では総セル数と領域ごとに上書き指定したセル数をそれぞれ 2 倍にする。同じ区間と重みを使ってセルを配置し直す。「層ごとの指定」では、各層のセル数を 2 倍にする。等幅（equal width）・等質量（equal mass）の層では、元の各セルをそれぞれ等幅・等質量の 2 つに分ける。等比（geometric）の層では、隣り合うセルの幅の比をその平方根にし、細かい側（最小のセルのある側）の端のセルの幅を半分にして、配置し直す。「節点座標の取り込み」では、平面・円筒・球対称の幾何に応じて各セルの体積を 2 等分する位置に節点を加える。セル内の密度が一様なら、それぞれの質量は元の半分である。「推薦メッシュ（レーザー条件から自動）」と「宣言型の指定（zoning_intent）」では、目標セル数を 2 倍にし、設定されているセルの測度（measure）の上下限を帯（band）ごとにも全体でも半分にし、設定されている最小セル幅を半分にし、設定されている区間ごとの最小セル数を 2 倍にする。推薦の根拠にした経験的上限（<code>empirical</code>）は変えない。推薦メッシュは、編集済みの印を付けた宣言型の指定に変わる。この宣言からメッシュを生成し直し、目標の配分に対するセル数の不足が最大の区間からセルを割り当てる。そのため、各区間のセル数は元の 2 倍になるとは限らず、一般には元の各セルを 2 つに分けたメッシュにはならない。</p>
+      <p>細かくする方法は、メッシュの作り方（<a href="#terms-geometry">下の「ジオメトリー」の項</a>）ごとに次のとおりである。「一様」では、等幅のままセル数を 2 倍にし、元の各セルを等幅の 2 つに分ける。「graded（区間と質量の重み）」では、区間（segment）を手動で指定した場合は各区間のセル数を 2 倍にし、それ以外では総セル数と領域ごとに上書き指定したセル数をそれぞれ 2 倍にする。同じ区間と重みを使ってセルを配置し直す。「層ごとの指定」では、各層のセル数を 2 倍にする。等幅（equal width）・等質量（equal mass）の層では、元の各セルをそれぞれ等幅・等質量の 2 つに分ける。等比（geometric）の層では、隣り合うセルの幅の比をその平方根にし、細かい側（最小のセルのある側）の端のセルの幅を半分にして、配置し直す。</p>
+      <p>「節点座標の取り込み」では、平面・円筒・球対称の幾何に応じて各セルの体積を 2 等分する位置に節点を加える。セル内の密度が一様なら、それぞれの質量は元の半分である。「推薦メッシュ（レーザー条件から自動）」と「宣言型の指定（zoning_intent）」では、目標セル数を 2 倍にし、設定されているセルの測度（measure）の上下限を帯（band）ごとにも全体でも半分にし、設定されている最小セル幅を半分にし、設定されている区間ごとの最小セル数を 2 倍にする。推薦の根拠にした経験的上限（<code>empirical</code>）は変えない。推薦メッシュは、編集済みの印を付けた宣言型の指定に変わる。この宣言からメッシュを生成し直し、目標の配分に対するセル数の不足が最大の区間からセルを割り当てる。そのため、各区間のセル数は元の 2 倍になるとは限らず、一般には元の各セルを 2 つに分けたメッシュにはならない。</p>
 
       <h3 id="terms-geometry">ジオメトリーとメッシュの作り方</h3>
       <p><strong>ジオメトリー（Geometry）</strong>は、左のナビゲーションのタブの名前である。このタブは、namelist の <code>Mesh</code> ブロックのメッシュ（<code>r_min</code>、<code>r_max</code>、メッシュの作り方、セル数）と、<code>Geometry</code> ブロックの初期条件（材料の領域ごとの外径、密度、電子温度、イオン温度）の両方を編集する。1D では、最後の領域の外側を真空にするスイッチと、コロナ層（ramp）の設定もここにある。1D の幾何（球対称、円筒、平面。<code>Mesh.geometry_1d</code>）は、このタブではなく「基本設定」で選ぶ。タブの名前は <code>Geometry</code> ブロックと同じだが、ブロックより広い範囲を扱う。</p>
@@ -69,7 +70,7 @@ npm run tauri build</code></pre>
       <h3 id="terms-recommended-mesh">推薦メッシュと層ごとの指定</h3>
       <p><strong>推薦メッシュ（recommended mesh）</strong>は、レーザー照射の 1D のデッキについて、メッシュ推薦ツールが作り、サーバーのソルバーで検証したメッシュである。ツールは <code>tools/assist/assist.py recommend-mesh</code> で、Claude Code のスキル <code>tenryu-mesh-1d</code> が使うものと同じである。Studio は、「推薦メッシュを作る (サーバー)」を押すと、選んだサーバーでこのツールを実行し、結果をフォームに入れる。</p>
       <p>ツールは、まずフォームから、標的の層（半径、密度、材料）、レーザーの波長と波形、終了時刻、温度モデル、輻射と熱伝導の設定を読み、サーバーの <code>tenryu validate --mesh-preview</code> に読ませて、ソルバーが標的をどう見るかを得る。次に、メッシュの収束を測った計算の結果（同梱の参照表 <code>tools/assist/data/mesh_convergence_reference.json</code>）から、表面のセルの面密度（areal density）の上限を決める。その上限を満たす <code>zoning_intent</code>（セル数と、セルの測度（measure）を等分配する宣言）と、上限をソルバーに課す <code>resolution_requirement</code>（<code>apply="enforce"</code> と、推薦の根拠にした経験的上限 <code>empirical</code>）を組み、サーバーの <code>tenryu</code> で検証してから返す。検証を通らなかった推薦は、フォームに入れない。</p>
-      <p>推薦メッシュが要る理由は、レーザー照射の計算では、表面のセルの大きさが吸収とアブレーションの結果を左右するからである。ソルバーは、アブレーションの規則と衝撃波（shock wave）の規則から、セルの大きさの上限を分解能要求（resolution requirement）として計算する。参照表は、表面のセルの面密度を 2 倍ずつ細かくした 9 段階の計算（\(3.2\times10^{-5}\) g/cm² から \(1.25\times10^{-7}\) g/cm² まで）について、最も細かい計算との差が、吸収エネルギー 3 %、アブレーション圧 5 %、アブレーションした質量 10 %、ブレークアウト（shock breakout）の時刻 2 % の許容に収まる最も粗い面密度を、条件ごとに記録したものである。推薦は、この表の範囲にある条件に対して作る。範囲の外では、較正した先験的（a priori）な上限を使って「extrapolation」の印を付ける。印が付いたときは、表面のセルの質量を半分にした組で収束を確かめること。</p>
+      <p>推薦メッシュが要る理由は、レーザー照射の計算では、表面のセルの大きさが吸収とアブレーションの結果を左右するからである。ソルバーは、アブレーションの規則と衝撃波（shock wave）の規則から、セルの大きさの上限を分解能要求（resolution requirement）として計算する。参照表は、表面のセルの面密度を 2 倍ずつ細かくした 9 段階の計算（\(3.2\times10^{-5}\) g/cm² から \(1.25\times10^{-7}\) g/cm² まで）について、最も細かい計算との差が、吸収エネルギー 3%、アブレーション圧 5%、アブレーションした質量 10%、ブレークアウト（shock breakout）の時刻 2% の許容に収まる最も粗い面密度を、条件ごとに記録したものである。推薦は、この表の範囲にある条件に対して作る。範囲の外では、較正した先験的（a priori）な上限を使って「extrapolation」の印を付ける。印が付いたときは、表面のセルの質量を半分にした組で収束を確かめること。</p>
       <p>推薦メッシュは、レーザー照射の 1D のデッキにだけ作れる（分解能要求がレーザーの条件から決まるため）。推薦ツールは表面がそのままの標的を前提にするので、物質のコロナ層（ramp）とは併用できず、レーザーのゴーストコロナ（ghost corona。Studio の表示は「合成コロナ」。<a href="../physics/mesh/1d.html">1D メッシュ</a>）を使う。作ったあとに標的、駆動、物理の条件を変えると、Studio は条件が変わったことを表示するので、作り直す。サーバーには、tenryu のバイナリの上の階層に TENRYU のチェックアウト（<code>tools/assist</code>）と、python3（3.9 以上）が要る。</p>
       <p><strong>層ごとの指定（per-layer table）</strong>は、層（材料の領域、コロナ層、外側の真空）ごとにセル数と並べ方を決めるメッシュの作り方である。並べ方は「等幅」「等質量」「等比」の 3 つである。等比のときは、隣のセルとの幅の比、端のセルの幅、隣の層の端のセルと質量をそろえる指定のいずれかで比を決め、細かくする側（外側、内側、両端）を選ぶ。Studio が節点を計算して <code>explicit_nodes</code> としてデッキに書くので、画面に表示する格子がそのまま計算に使われる。新しい層の既定は、40 セル、等質量、幅の比 1.1、端のセルの幅 \(10^{-5}\) cm（0.1 µm）、細かくする側は外側である。どの駆動（レーザー、輻射温度、圧力）にも使える。プリセットのうち、レーザー照射の 6 個は、その条件で作った推薦メッシュを保存しており、輻射温度か圧力で駆動する 5 個は、この層ごとの指定を使う。</p>
 
@@ -119,11 +120,11 @@ npm run tauri build</code></pre>
       <h2 id="presets">実行まで確認済みの 1D プリセット</h2>
       <p>「プリセット」の 1D タブには、基本の 6 つ（空白を含む）と、オプションのカーネルを使う 6 つのプリセットがある。空白を除く 11 個は、単に検証を通しただけの例ではなく、RTX 4090 で終了時刻まで実際に計算し（CBET のものは 2026-10-05、ほかは 2026-10-01）、同じ条件を 2 倍細かいメッシュで計算した結果と比べて確かめた構成である（CBET のものは細かいメッシュの計算が重いため 0.5 ns まで比べた）。各カードには使うカーネル、メッシュの作り方（<a href="#terms-recommended-mesh">推薦メッシュか層ごとの指定か</a>）、必要な物性表、計算の重さ、そして「検証の run」の結果が出る。空白のカードには「検証の run」の結果が付かない。</p>
       <ul>
-        <li><strong>基本:</strong> 空白、圧力で駆動する衝撃波（Rankine–Hugoniot の厳密な値と比べられる）、輻射熱波（radiative heat wave、Marshak wave）、平面の箔のレーザー照射、<a href="../verification/index.html#gxii">GXII</a> 級（激光 XII 号、GEKKO XII）の球殻の直接照射（direct drive）爆縮、間接照射（indirect drive）の爆縮（輻射温度で駆動）。</li>
-        <li><strong>オプションのカーネル:</strong> 輻射駆動の平面箔（<a href="../physics/radiation/sn.html">S<sub>N</sub> 輸送</a>。離散座標法、discrete ordinates）、非局所電子熱伝導（nonlocal electron heat conduction。<a href="../physics/conduction/snb.html#snb">SNB</a>、Schurtz–Nicolaï–Busquet モデル）、<a href="../physics/lpi/cbet.html">CBET</a>と<a href="../physics/lpi/hot-electrons.html">ホット電子</a>（hot electron）の直接照射、核燃焼する exploding pusher、<a href="../physics/eos-opacity/eos.html#eos-models">物性表</a>と多群輻射（multigroup radiation）、<a href="#cold-equilibrium">低温平衡</a>の 2 層の標的。このうち CBET のカードの題は「CBET と高速電子の直接照射」で、ホット電子を「高速電子」と表示する。</li>
-        <li><strong>既知の問題:</strong> 計算結果と一緒にカードに書いてある — 球の Marshak 駆動（輻射温度による駆動）で細かいメッシュの外側の境界のセルが加速し続けること、物性表の箔での値の<a href="../overview/numerics-foundations.html#floors-safety">クランプ（clamp）</a>、圧力で駆動する衝撃波の後ろの密度の 0.6 % の差。CBET のプリセットは RTX 4090 で 2.6 時間かかり、この条件ではホット電子のしきい値に届かない（TPD の<a href="#tpd-threshold">しきい値の指標</a>の最大 0.79）。</li>
+        <li><strong>基本：</strong>空白、圧力で駆動する衝撃波（Rankine–Hugoniot の厳密な値と比べられる）、輻射熱波（radiative heat wave、Marshak wave）、平面の箔のレーザー照射、<a href="../verification/index.html#gxii">GXII</a> 級（激光 XII 号、GEKKO XII）の球殻の直接照射（direct drive）爆縮、間接照射（indirect drive）の爆縮（輻射温度で駆動）。</li>
+        <li><strong>オプションのカーネル：</strong>輻射駆動の平面箔（<a href="../physics/radiation/sn.html">S<sub>N</sub> 輸送</a>。離散座標法、discrete ordinates）、非局所電子熱伝導（nonlocal electron heat conduction。<a href="../physics/conduction/snb.html#snb">SNB</a>、Schurtz–Nicolaï–Busquet モデル）、<a href="../physics/lpi/cbet.html">CBET</a>と<a href="../physics/lpi/hot-electrons.html">ホット電子</a>（hot electron）の直接照射、核燃焼する exploding pusher、<a href="../physics/eos-opacity/eos.html#eos-models">物性表</a>と多群輻射（multigroup radiation）、<a href="#cold-equilibrium">低温平衡</a>の 2 層の標的。このうち CBET のカードの題は「CBET と高速電子の直接照射」で、ホット電子を「高速電子」と表示する。</li>
+        <li><strong>既知の問題：</strong>計算結果と一緒にカードに書いてある。球の Marshak 駆動（輻射温度による駆動）で細かいメッシュの外側の境界のセルが加速し続けること、物性表の箔での値の<a href="../overview/numerics-foundations.html#floors-safety">クランプ（clamp）</a>、圧力で駆動する衝撃波の後ろの密度の 0.6% の差である。CBET のプリセットは RTX 4090 で 2.6 時間かかり、この条件ではホット電子のしきい値に届かない（TPD の<a href="#tpd-threshold">しきい値の指標</a>の最大 0.79）。</li>
       </ul>
-      <p>プリセットの数値条件と計算結果は<a href="examples.html">「例題とプリセット」のページ</a>にまとめてある。吸収率の数字が条件によって違う理由は<a href="examples.html#absorption-numbers">同じページの注記</a>にある。条件を変えるときは、まず変更していないプリセットを基準となる短い実行として保存し、そのあとで入力をひとつずつ変えていくと、吸収、圧縮、出力の間隔の差を追いやすくなる。</p>
+      <p>プリセットの数値条件と計算結果は<a href="examples.html">「例題とプリセット」の頁</a>にまとめてある。吸収率の数字が条件によって違う理由は<a href="examples.html#absorption-numbers">同じ頁の注記</a>にある。条件を変えるときは、まず変更していないプリセットを基準となる短い実行として保存し、そのあとで入力を 1 つずつ変えていくと、吸収、圧縮、出力の間隔の差を追いやすくなる。</p>
 
       <h3 id="cold-equilibrium">低温平衡</h3>
       <p>低温平衡は、<code>Numerics.hydro.T_start_inactive_cells="cold_equilibrium"</code> が選ぶ、状態方程式（equation of state）の構成則である。電子温度が <code>Numerics.hydro.T_start_eV</code> 以下の冷たい状態で、表の状態方程式に補正を加え、各材料の参照状態を力学平衡に置く。参照状態は、密度、電子温度、イオン温度、全圧、体積弾性率（bulk modulus）で、材料のキー <code>eos.cold_reference</code>（<code>rho_gcc</code>、<code>Te0_eV</code>、<code>Ti0_eV</code>、<code>P0_dyn_cm2</code>、<code>bulk_modulus_dyn_cm2</code>）に書く。表の極低温側（平坦な cold curve、張力、スピノーダル（spinodal））に依らずに、冷たい固体や液体の層を初期状態で静止させ、衝撃波が来るまで界面を動かさないために使う。</p>

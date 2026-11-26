@@ -24,8 +24,11 @@
 
     <section aria-labelledby="models">
       <h2 id="models">2 つのモデル</h2>
-      <p><strong>多群 FLD。</strong> 多群の流束制限拡散は、光子のエネルギーを光子エネルギー群（photon-energy group。光子のエネルギー範囲を区切った各区間）に分け、Fleck 線形化によって物質との硬い（stiff。時定数が時間刻みよりはるかに短い）放出・吸収を陰的（implicit）に連成する。Fleck 係数 \(f\) は、吸収のうち物質のエネルギーを実際に変える割合で、残りの \(1-f\) は、吸収した輻射が同じステップ内で再放出される、散乱に似た過程（実効散乱、effective scattering）として扱う（<a href="fld.html#groups-fleck">群構造と Fleck 線形化</a>）。1D では群を一括処理する三重対角（tridiagonal）の系を解く。2D RZ では、<a href="fld.html#diffusion-solvers">節点局所の演算子</a>（node-local operator。各セルの辺を中点で 2 つの半辺に分け、節点ごとに、その節点側の半辺の値を消去して得る、セル中心の値どうしを結ぶ対称な演算子）から群ごとの保存型有限体積（conservative finite-volume）の系を CSR（compressed sparse row）形式の疎行列として構成し、共役勾配法（conjugate gradient method、CG）で解く。前処理（preconditioner）は既定では集約多重格子（aggregation multigrid）で、集約の条件を満たさない格子では対角前処理である。光学的に厚い（optically thick）領域では拡散極限（diffusion limit）を回復し、Levermore–Pomraning の流束制限関数（flux limiter）が薄い領域での輸送を抑える。</p>
-      <p><strong>\(S_N\) 輸送。</strong> 離散座標法の輸送は、光子エネルギー群ごとに有限個の方向（離散座標、ordinate）を追跡し、方向別の輻射強度（specific intensity）からセルのエネルギーと面の流束を構成する。\(S_N\) の \(N\) は角度求積の次数を表す整数で、<code>Radiation.sn_transport.n_angles</code>（許容値は 2、4、8、16、32。既定は 16）で与える。1D の円筒だけは、このキーに \(n=2L^2\)（レベル数 \(L\) は 2 以上 32 以下の整数。8、18、32、…）を与える。波面（wavefront。上流の処理が済めば同時に処理できるセルの集まり）に沿う掃引に源反復（source iteration）を組み合わせる。物質との連成は、2D RZ と 1D の線形特性法（linear characteristic scheme）ではピカール反復（Picard iteration）で、1D の既定の<a href="sn.html#ld-1d">線形不連続法</a>（linear discontinuous scheme）では節点の電子温度についてのニュートン法（Newton's method）で解く。角度の情報を保持するため、拡散のクロージャでは表せない自由飛行（free streaming）、影（shadowing）、異方性（anisotropy）を扱える。</p>
+      <h3>多群 FLD</h3>
+      <p>多群の流束制限拡散は、光子のエネルギーを光子エネルギー群（photon-energy group。光子のエネルギー範囲を区切った各区間）に分け、Fleck 線形化によって物質との硬い（stiff。時定数が時間刻みよりはるかに短い）放出・吸収を陰的（implicit）に連成する。Fleck 係数 \(f\) は、吸収のうち物質のエネルギーを実際に変える割合で、残りの \(1-f\) は、吸収した輻射が同じステップ内で再放出される、散乱に似た過程（実効散乱、effective scattering）として扱う（<a href="fld.html#groups-fleck">群構造と Fleck 線形化</a>）。光学的に厚い（optically thick）領域では拡散極限（diffusion limit）を回復し、Levermore–Pomraning の流束制限関数（flux limiter）が薄い領域での輸送を抑える。</p>
+      <p>空間離散化と線形ソルバは次元で異なる。1D では群を一括処理する三重対角（tridiagonal）の系を解く。2D RZ では、<a href="fld.html#diffusion-solvers">節点局所の演算子</a>（node-local operator）から群ごとの保存型有限体積（conservative finite-volume）の系を CSR（compressed sparse row）形式の疎行列として構成し、共役勾配法（conjugate gradient method、CG）で解く。この演算子は、各セルの辺を中点で 2 つの半辺に分け、節点ごとにその節点側の半辺の値を消去して得る、セル中心の値どうしを結ぶ対称な演算子である。前処理（preconditioner）は既定では集約多重格子（aggregation multigrid）で、集約の条件を満たさない格子では対角前処理である。</p>
+      <h3>\(S_N\) 輸送</h3>
+      <p>離散座標法の輸送は、光子エネルギー群ごとに有限個の方向（離散座標、ordinate）を追跡し、方向別の輻射強度（specific intensity）からセルのエネルギーと面の流束を構成する。\(S_N\) の \(N\) は角度求積の次数を表す整数で、<code>Radiation.sn_transport.n_angles</code>（許容値は 2、4、8、16、32。既定は 16）で与える。1D の円筒だけは、このキーに \(n=2L^2\)（レベル数 \(L\) は 2 以上 32 以下の整数。8、18、32、…）を与える。波面（wavefront。上流の処理が済めば同時に処理できるセルの集まり）に沿う掃引に源反復（source iteration）を組み合わせる。物質との連成は、2D RZ と 1D の線形特性法（linear characteristic scheme）ではピカール反復（Picard iteration）で、1D の既定の<a href="sn.html#ld-1d">線形不連続法</a>（linear discontinuous scheme）では節点の電子温度についてのニュートン法（Newton's method）で解く。角度の情報を保持するため、拡散のクロージャでは表せない自由飛行（free streaming）、影（shadowing）、異方性（anisotropy）を扱える。</p>
     </section>
 
     <section aria-labelledby="comparison">
@@ -37,7 +40,7 @@
         <tbody>
           <tr><th>角度の扱い</th><td>スカラーのエネルギーと、制限付きの拡散流束（角度の分布は、流束制限関数というクロージャで与える）。</td><td>離散的な方向 \(\{\boldsymbol\mu_m,w_m\}\)（\(\boldsymbol\mu_m\) は方向余弦、\(w_m\) は求積の重み）。1D の球・平面はガウス–ルジャンドル求積（Gauss–Legendre quadrature）で、実運用の既定は \(S_{16}\)。1D の円筒と 2D RZ は直積型の求積（product quadrature）である。2D RZ の方向は、軸方向の方向余弦 \(\mu_z\) についての \(N\) 点のガウス–ルジャンドル求積と、方位角の半周を \(N/2\) 等分した中点との直積で、方向数は \(N^2/2\) になる。</td></tr>
           <tr><th>有効な領域</th><td>光学的に厚く、ほぼ等方な輻射場。</td><td>光学的に薄い（optically thin）自由飛行、方向性のある照射、影、レイ効果（ray effect）まで扱える。</td></tr>
-          <tr><th>物質との連成</th><td>Fleck 線形化と、外側反復（outer iteration。物質の温度と輻射場の連成を収束させる反復）およびセル局所のニュートン法による物質の更新。</td><td>Fleck の実効散乱を使わない（\(f=1\)）。吸収と放出には、群ごとのプランク平均（Planck mean）の吸収不透明度（opacity）\(\sigma^{PA}\) と放出不透明度 \(\sigma^{PE}\) を、そのまま使う。2D RZ と 1D の線形特性法は、源反復と外側のピカール反復で連成を解き、各セルの物質温度は<a href="sn.html#matter-coupling">能動集合によるニュートン法</a>（active-set Newton method。セルごとに、物質のエネルギー収支の式をニュートン法で解く。群の輻射エネルギーは 0 以上とし、この制約に掛かった群（能動集合）は 0 に固定して扱う）で求める。1D の既定の線形不連続法は、節点の電子温度についてのニュートン法で連成を解く。</td></tr>
+          <tr><th>物質との連成</th><td>Fleck 線形化と、外側反復（outer iteration。物質の温度と輻射場の連成を収束させる反復）およびセル局所のニュートン法による物質の更新。</td><td>Fleck の実効散乱を使わない（\(f=1\)）。吸収と放出には、群ごとのプランク平均（Planck mean）の吸収不透明度（opacity）\(\sigma^{PA}\) と放出不透明度 \(\sigma^{PE}\) を、そのまま使う。2D RZ と 1D の線形特性法は、源反復と外側のピカール反復で連成を解き、各セルの物質温度は<a href="sn.html#matter-coupling">能動集合のニュートン法</a>（active-set Newton method。セルごとに物質のエネルギー収支をニュートン法で解き、非負制約に掛かった群の輻射エネルギーを 0 に固定して扱う方式）で求める。1D の既定の線形不連続法は、節点の電子温度についてのニュートン法で連成を解く。</td></tr>
           <tr><th>計算量とソルバ</th><td>群ごとに 1 回の拡散求解：1D は一括処理の三重対角、2D RZ は節点局所の演算子の疎行列を、集約多重格子（既定。集約の条件を満たさない格子では対角前処理）で前処理した共役勾配法で解く。</td><td>計算量はおよそ、セル数 × 群数 × 方向数 × 反復数。角度と面の作業領域も必要である。</td></tr>
           <tr><th>幾何</th><td>1D（球・円筒・平面）&amp; 2D RZ。</td><td>1D（球・平面はガウス–ルジャンドル、円筒は \(n=2L^2\) 本の直積型の求積）&amp; 2D RZ。</td></tr>
           <tr><th>迷ったときは</th><td>輻射爆縮（radiation-driven implosion）における実運用の既定である（<a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）の基準回帰試験、golden-reference regression test）。</td><td>S<sub>8</sub>、S<sub>16</sub>、S<sub>32</sub> と次数を上げた一連の計算で、着目量の収束を確認する。</td></tr>
@@ -72,7 +75,7 @@
           <tr><th><code>Radiation.compute_T_range_eV</code></th><td><code>[]</code></td><td><code>"log_uniform"</code> による群の生成に使う温度の範囲。</td></tr>
         </tbody>
       </table>
-      <p>FLD の面種別は <code>Radiation.multigroup_diffusion.boundary</code> の下に、\(S_N\) の面種別は <code>Radiation.sn_transport.boundary</code> の下に置く。面種別を最上位の <code>Radiation.boundary</code> に置くことはなく、そこに置くのは Marshak の <code>marshak_Tr_eV</code>/<code>marshak_Tr</code> だけである。</p>
+      <p>FLD の面種別は <code>Radiation.multigroup_diffusion.boundary</code> の下に、\(S_N\) の面種別は <code>Radiation.sn_transport.boundary</code> の下に置く。面種別を最上位の <code>Radiation.boundary</code> に置くことはなく、そこに置くのは Marshak の <code>marshak_Tr_eV</code> と <code>marshak_Tr</code> だけである。</p>
     </section>
 
     <div id="page-footer"></div>
