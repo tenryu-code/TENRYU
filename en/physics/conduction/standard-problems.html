@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>1D heat-conduction verification against analytic solutions — TENRYU Documentation</title>
+  <link rel="stylesheet" href="../../../style.css">
+  <link rel="icon" href="../../../favicon.ico" sizes="32x32">
+  <link rel="icon" href="../../../favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="../../../apple-touch-icon.png">
+  <script src="../../../theme.js"></script>
+</head>
+<body>
+  <div id="topbar"></div>
+  <div id="sidebar"></div>
+  <main>
+    <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
+    <h1>1D heat-conduction verification against analytic solutions <span class="badge">reference</span></h1>
+
+    <section aria-labelledby="abstract">
+      <h2 id="abstract">Abstract</h2>
+      <p class="abstract">Three standard problems with closed-form analytic solutions verify the one-dimensional electron heat-conduction solver (second-order Runge–Kutta–Legendre super-time-stepping with per-stage coefficient evaluation and width-weighted harmonic Kirchhoff-secant face conductivity). In the linearized two-material contact (DT–Au–DT), the solver attains second-order spatial convergence across a material interface with a 4:1 cell-width ratio, with observed orders of 2.06 and 2.05. Planar and spherical Barenblatt–Pattle instantaneous heat sources test nonlinear heat-front propagation at time steps up to 800 times the explicit stability limit; all three problems pass. The planar heat source shows observed orders of 1.24 and 1.31, and its fine-mesh error of 3.21 × 10<sup>−4</sup> lies roughly two orders of magnitude below the 0.0322 theoretical lower bound of step-start coefficient freezing. The spherical heat source shows observed orders of 1.38 and 2.81, passing the 0.75 threshold, but the wide spread between the two values indicates that the three-mesh sequence has not yet entered the asymptotic regime.</p>
+    </section>
+
+    <section aria-labelledby="introduction">
+      <h2 id="introduction">Introduction</h2>
+      <p>By default, 1D electron heat conduction discretizes the <a href="local.html">local Spitzer–Härm (SH) conductivity and harmonic flux limiter</a> with a <a href="discretization.html">conservative finite-volume operator</a> and advances it in time with <a href="time-integration.html">second-order Runge–Kutta–Legendre (RKL2) super-time-stepping (STS)</a> [1, pp. 600–602]. Across a material interface separating cells of unequal width, flux continuity relies on the width-weighted harmonic face prefactor and the Kirchhoff secant [2, p. 27, Eqs. (28)–(29)]. On a steep nonlinear heat front advancing several cells per step, whether conductivities and flux limiters are frozen at step entry or re-evaluated at each stage directly governs how far the front can travel [10, p. 111, Eqs. (29)–(31); 14, p. 46, §8.7].</p>
+      <p>Three tests isolate these two requirements: a linearized two-material contact problem and planar and spherical Barenblatt–Pattle instantaneous heat sources [5, p. 408, Eqs. (3)–(6)]. The two-material contact tests second-order accuracy across a DT–Au interface with a 4:1 cell-width jump. The planar and spherical heat sources advance a finite-speed \(T^{5/2}\) thermal wave at large explicit stability ratios; in particular, the planar source separates per-stage coefficient evaluation from step-start coefficient freezing through a rigorous error lower bound.</p>
+    </section>
+
+    <section aria-labelledby="setup">
+      <h2 id="setup">Setup</h2>
+      <p>All three problems use a one-temperature (1T) ideal gas (adiabatic index \(\gamma=5/3\)) with fixed ionization \(\bar Z\), disable hydrodynamics, radiation transport, laser deposition, and nuclear burn, and run electron conduction alone through the normal 1D driver. The Spitzer–Härm conductivity uses TENRYU's standard form including the Epperlein–Short \(Z\)-dependent correction \(\xi(Z)\) [3, p. 977; 4, p. 3092]. The volumetric heat capacity of the 1T ideal gas is \(\rho c_v=\rho(1+\bar Z)k_B/[(\gamma-1)Am_p]\), where \(\rho\) is mass density, \(c_v\) is specific heat, \(A\) is atomic mass number, \(m_p\) = 1.6726219 × 10<sup>−24</sup> g is the proton mass, and \(k_B\) = 1.6022 × 10<sup>−12</sup> erg/eV converts eV to erg.</p>
+      <table class="quick-facts">
+        <caption>Table 1. Common settings for the three standard problems.</caption>
+        <thead><tr><th scope="col">Setting</th><th scope="col">Value</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Temperature model and EOS</th><td>One-temperature (<code>1T</code>) ideal gas (\(\gamma=5/3\)) with fixed ionization (<code>zbar.model="fixed"</code>); hydrodynamics, radiation, laser, and burn disabled</td></tr>
+          <tr><th scope="row">Electron conduction solver</th><td>Default 1D STS (<code>solver="sts"</code>, RKL2 with per-stage coefficients), <code>face_kappa_policy="kirchhoff_same_material"</code>, <code>f_lim=0.06</code></td></tr>
+          <tr><th scope="row">STS control keys</th><td><code>cfl_cond=0.25</code>, <code>sts_max_stages=40</code>, <code>sts_subcycle_eta=0.9</code>, <code>sts_bound_margin=0.1</code>, <code>sts_bound_retries_max=4</code></td></tr>
+          <tr><th scope="row">Boundaries and stepping</th><td>Zero heat flux (adiabatic) at both ends; normal 1D driver with constant target time step to \(t_{\rm end}\)</td></tr>
+        </tbody>
+      </table>
+      <p>The two-material contact places a warm gold (Au) slab at \(T_0(1+\varepsilon)\) (\(\varepsilon\) = 10<sup>−6</sup>) between two deuterium–tritium (DT) slabs at \(T_0\) = 100 eV. Cell widths satisfy \(w_{\rm DT}/w_{\rm Au}=4\) to match the density ratio \(\rho_{\rm Au}/\rho_{\rm DT}=4\) (equal cell masses), isolating the width-weighted harmonic average across the conductivity ratio \(\kappa_{\rm DT}/\kappa_{\rm Au}\) ≈ 10.80. With coarse DT width \(h_0\) = 2 × 10<sup>−3</sup> cm, the DT diffusion length is \(\ell_{\rm DT}=16h_0\) = 0.032 cm, fixing the end time \(t_{\rm end}=\ell_{\rm DT}^2/(4\alpha_{\rm DT})\) = 5.72818 × 10<sup>−7</sup> s and the Au diffusion length \(\ell_{\rm Au}\) = 8.5597 × 10<sup>−3</sup> cm. Each outer DT slab spans 0.192 cm (6 \(\ell_{\rm DT}\), 96·2<sup>k</sup> cells) and the central Au slab spans 0.103 cm (206·2<sup>k</sup> cells; total domain 0.487 cm), keeping outer boundary tails at \(\operatorname{erfc}(6)\) ≈ 2 × 10<sup>−17</sup>, below double-precision round-off. Grids run at levels \(k\) = 1, 2, 3 with diffusive refinement \(\Delta t_k=t_{\rm end}/(16\cdot 4^k)\) (\(\Delta t\propto h^2\)).</p>
+      <p>The planar and spherical Barenblatt–Pattle heat sources use high-density 1T DT (\(\rho\) = 10<sup>7</sup> g/cm<sup>3</sup>, \(A\) = 2.5, \(\bar Z\) = 1, electron density \(n_e\) = 2.3915 × 10<sup>30</sup> cm<sup>−3</sup>). At this density the Coulomb logarithm is pinned at its floor \(\ln\Lambda\) = 2 for all \(T\) ≤ 4.3 × 10<sup>5</sup> eV, reducing conductivity to the exact power law \(\kappa=\kappa_0 T^{5/2}\) with \(\kappa_0\) = 1.53 × 10<sup>9</sup> erg/(s cm eV<sup>7/2</sup>). For initial front radius \(r_0\) = 1 cm and peak temperature \(T_{c0}\) = 10<sup>4</sup> eV, the reference diffusivity is \(D_0=\kappa_0 T_{c0}^{5/2}/(\rho c_v)\) = 1.33104 cm<sup>2</sup>/s. The initial discrete state takes the analytic cell averages floored at \(T_{\rm floor}\) = 10<sup>−3</sup> eV, and \(c_{v,e}\) is pre-filled with the 1T ideal-gas specific heat so step 1 uses the full 1T heat capacity. Grids run at levels \(k\) = 0, 1, 2 with uniform cell width \(h_k=r_0/(16\cdot 2^k)\) and linear time-step refinement \(\Delta t_k\propto h_k\), which keeps the initial instantaneous front-CFL number \(C_f=\dot r_f(0)\Delta t_k/h_k\) constant across meshes [10, p. 111, Eqs. (29)–(31)].</p>
+      <table class="quick-facts">
+        <caption>Table 2. Problem setups, material constants, and mesh/step sequences (ordered from coarse to fine).</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Geometry and domain</th><th scope="col">Material, density, properties</th><th scope="col">Time scale and final state</th><th scope="col">Refinement and grids (cells / steps)</th></tr></thead>
+        <tbody>
+          <tr>
+            <th scope="row">Two-material contact (DT–Au–DT)</th>
+            <td>Planar, [0, 0.487] cm (contacts at \(x_L\) = 0.192 cm, \(x_R\) = 0.295 cm, \(w_{\rm DT}/w_{\rm Au}=4\))</td>
+            <td>DT: \(A\) = 2.5, \(\bar Z\) = 1, \(\rho\) = 0.25 g/cm<sup>3</sup>, \(\ln\Lambda\) = 2.3826, \(\kappa_{\rm DT}\) = 1.2843 × 10<sup>14</sup> erg/(s cm eV), \(\alpha_{\rm DT}\) = 446.91 cm<sup>2</sup>/s.<br>Au: \(A\) = 197, \(\bar Z\) = 50, \(\rho\) = 1.0 g/cm<sup>3</sup>, \(\ln\Lambda\) = 2.0, \(\kappa_{\rm Au}\) = 1.1895 × 10<sup>13</sup> erg/(s cm eV), \(\alpha_{\rm Au}\) = 31.977 cm<sup>2</sup>/s</td>
+            <td>\(T_0\) = 100 eV, \(\varepsilon\) = 10<sup>−6</sup>, \(t_{\rm end}\) = 5.72818 × 10<sup>−7</sup> s, interface fraction \(\theta\) = 0.25719</td>
+            <td>\(\Delta t\propto h^2\) (\(k\) = 1, 2, 3)<br>796 / 64<br>1,592 / 256<br>3,184 / 1,024</td>
+          </tr>
+          <tr>
+            <th scope="row">Planar heat source</th>
+            <td>Planar, [0, 4] cm (centered at \(x=2r_0\) = 2 cm, \(r=|x-2r_0|\))</td>
+            <td>DT: \(A\) = 2.5, \(\bar Z\) = 1, \(\rho\) = 10<sup>7</sup> g/cm<sup>3</sup>, \(\ln\Lambda\) = 2, \(\kappa_0\) = 1.53 × 10<sup>9</sup> erg/(s cm eV<sup>7/2</sup>), \(\rho c_v\) = 1.1495 × 10<sup>19</sup> erg/(cm<sup>3</sup> eV)</td>
+            <td>\(t_0\) = 0.208692 s, \(t_{\rm end}\) = (135/32)\(t_0\) = 0.880420 s, \(r_f\) = 1.44364 cm, \(T_c\) = 6926.93 eV, initial \(C_f\) = 2.5</td>
+            <td>\(\Delta t\propto h\) (\(k\) = 0, 1, 2)<br>64 / 6<br>128 / 12<br>256 / 24</td>
+          </tr>
+          <tr>
+            <th scope="row">Spherical heat source</th>
+            <td>Spherical, [0, 1.5] cm (centered at \(r\) = 0)</td>
+            <td>Same high-density DT as the planar heat source (\(\ln\Lambda\) = 2, \(D_0\) = 1.33104 cm<sup>2</sup>/s)</td>
+            <td>\(t_0\) = 0.0988542 s, \(t_{\rm end}\) = 5\(t_0\) = 0.494271 s, \(r_f\) = 1.20757 cm, \(T_c\) = 5678.95 eV, initial \(C_f\) = 1.404</td>
+            <td>\(\Delta t\propto h\) (\(k\) = 0, 1, 2)<br>24 / 6<br>48 / 12<br>96 / 24</td>
+          </tr>
+        </tbody>
+      </table>
+      <figure id="fig-analytic">
+        <img src="../../../assets/conduction1d-standard-problems-analytic-en.png" width="880" height="350" style="max-width:100%;height:auto" alt="Analytic initial and final temperature profiles of the three problems, showing the DT–Au–DT contact layer and the step-start reach radius against the final front radii of the planar and spherical heat sources.">
+        <figcaption>Figure A. Analytic solutions of the three problems. Gray dashed curves show the initial profiles (\(t\) = 0) and colored solid curves show the final profiles (\(t=t_{\rm end}\)). Left: normalized perturbation \((T-T_0)/(\varepsilon T_0)\) in the two-material contact, with shading and dotted lines marking the Au slab [0.192, 0.295] cm. Middle and right: planar and spherical Barenblatt–Pattle temperatures \(T_P\) (keV). Dark blue dashed lines mark the nominal one-cell-per-step reach radius \(r_*\) = 1.375 cm (ignoring tiny floor-temperature leakage). In the planar problem the final front \(r_f\) = 1.444 cm passes \(r_*\) (shaded tail), separating per-stage from step-start coefficient evaluation; in the spherical problem \(r_f\) = 1.208 cm stays inside \(r_*\).</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="analytic">
+      <h2 id="analytic">Analytic solutions</h2>
+
+      <h3 id="analytic-contact">Two-material contact (DT–Au–DT)</h3>
+      <p>For perturbation amplitude \(\varepsilon\) = 10<sup>−6</sup>, the conductivity \(\kappa_m\) and thermal diffusivity \(\alpha_m=\kappa_m/(\rho c_v)_m\) of each material are constant to order \(\varepsilon\) around \(T_0\) = 100 eV. Enforcing continuity of temperature and heat flux at contacts \(x_L\) and \(x_R\) gives the analytic solution \(T_{\rm ex}(x,t)\):</p>
+      $$ \begin{aligned}
+        \theta &= \frac{\kappa_{\rm Au}\sqrt{\alpha_{\rm DT}}}{\kappa_{\rm Au}\sqrt{\alpha_{\rm DT}}+\kappa_{\rm DT}\sqrt{\alpha_{\rm Au}}},
+        \qquad \ell_{\rm DT}=2\sqrt{\alpha_{\rm DT}t},
+        \qquad \ell_{\rm Au}=2\sqrt{\alpha_{\rm Au}t},\\
+        \frac{T_{\rm ex}(x,t)-T_0}{\varepsilon T_0} &=
+        \begin{cases}
+          \theta\,\operatorname{erfc}\!\left(\dfrac{x_L-x}{\ell_{\rm DT}}\right) & (x\le x_L),\\[8pt]
+          1-(1-\theta)\left[\operatorname{erfc}\!\left(\dfrac{x-x_L}{\ell_{\rm Au}}\right)
+            +\operatorname{erfc}\!\left(\dfrac{x_R-x}{\ell_{\rm Au}}\right)\right] & (x_L\lt x\lt x_R),\\[8pt]
+          \theta\,\operatorname{erfc}\!\left(\dfrac{x-x_R}{\ell_{\rm DT}}\right) & (x\ge x_R).
+        \end{cases}
+      \end{aligned} $$
+      <p>Here \(\theta\) = 0.25719 is the dimensionless interface temperature, \(\ell_{\rm DT}\) and \(\ell_{\rm Au}\) are the thermal diffusion lengths at time \(t\), and \(\operatorname{erfc}\) is the complementary error function. Because the Au slab exceeds 12 \(\ell_{\rm Au}\) in thickness and each DT slab spans 6 \(\ell_{\rm DT}\), cross-interface interaction and outer-boundary reflections are of order \(\operatorname{erfc}(6)\) ≈ 2 × 10<sup>−17</sup>, while nonlinear departures from \(\kappa\propto T^{5/2}\) are \(O(\varepsilon)\).</p>
+
+      <h3 id="analytic-barenblatt">Planar and spherical Barenblatt–Pattle heat sources</h3>
+      <p>For constant \(\rho c_v\) and power-law conductivity \(\kappa=\kappa_0 T^n\) (\(n\) = 5/2), the \(d\)-dimensional symmetric nonlinear diffusion equation \(\partial T/\partial t=r^{1-d}\partial_r[r^{d-1}D(T)\partial_r T]\) with \(D(T)=\kappa_0 T^n/(\rho c_v)\) admits the compactly supported Barenblatt–Pattle similarity solution [5, p. 408, Eqs. (3)–(6)]:</p>
+      $$ \begin{aligned}
+        t_0 &= \frac{r_0^2\,n}{2D_0(dn+2)},\qquad
+        \tau = 1+\frac{t}{t_0},\qquad
+        \beta = \frac{1}{dn+2},\\
+        r_f(t) &= r_0\,\tau^{\beta},\qquad
+        T_c(t) = T_{c0}\,\tau^{-d\beta},\qquad
+        T_P(r,t) = T_c(t)\left[1-\frac{r^2}{r_f(t)^2}\right]_+^{1/n}.
+      \end{aligned} $$
+      <p>Here \(d\) = 1 is planar and \(d\) = 3 is spherical, \([\cdot]_+=\max(\cdot,0)\), \(t_0\) is the reference time scale, \(\tau\) is the dimensionless time, \(\beta\) is the similarity exponent (2/9 in planar and 2/19 in spherical geometry), \(r_f(t)\) is the front radius, and \(T_c(t)\) is the central temperature. Because \(n\) = 5/2 &gt; 1, the temperature behaves as \((r_f-r)^{2/5}\) as \(r\to r_f^-\); its gradient \(\partial_r T_P\) diverges at the front while the heat flux \(-\kappa_0 T_P^{5/2}\partial_r T_P\) vanishes continuously [5, p. 408].</p>
+      <p>To represent this nonsmooth front without point-sampling bias, the reference uses exact cell volume averages \(\bar T_{P,i}=V_i^{-1}\int_{{\rm cell}\,i}T_P\,\mathrm dV\) computed with 16-point Gauss–Legendre quadrature. On the front cell and its inner neighbor, the substitution \(1-r^2/r_f^2=z^5\) removes the \((r_f-r)^{2/5}\) singularity and integrates the smooth integrand \(z^6(1-z^5)^{\pm 1/2}\). Comparing 8-point and 16-point quadrature gives the reference quadrature error estimate \(s_{{\rm ref},k}\), normalized by total analytic heat \(Q_k=\sum_i V_i\bar T_{P,i}\). On every recorded mesh, \(s_{{\rm ref},k}\) ≤ 9.45 × 10<sup>−14</sup>, more than ten orders of magnitude below the measured error.</p>
+      <p>Imposing the temperature floor \(T_{\rm floor}\) = 10<sup>−3</sup> eV in the cold exterior introduces a small initial model discrepancy \(E_{F,{\rm initial}}\) = 1.22 × 10<sup>−7</sup> (planar) and 3.68 × 10<sup>−7</sup> (spherical). At \(\rho\) = 10<sup>7</sup> g/cm<sup>3</sup>, the free-streaming cap \(q_{\max}\) far exceeds the diffusive flux, so the flux limiter remains inactive (degenerate flux-limited diffusion itself satisfies \(L_1\) contraction [12, pp. 1152–1153, Eqs. (3), (7); 13, p. 375, Thm. 4.5]).</p>
+    </section>
+
+    <section aria-labelledby="comparison">
+      <h2 id="comparison">Quantities compared and acceptance criteria</h2>
+      <p>In the two-material contact problem, the error is the cell-width-weighted \(L_1\) difference against pointwise analytic temperatures at cell midpoints \(x_i=(x_{i-1/2}+x_{i+1/2})/2\), normalized by the perturbation amplitude \(\varepsilon T_0\) and total domain width \(\sum_i w_i\). In the planar and spherical heat sources, following the volume-weighted \(L_1\) error convention [6, p. 10, §6.3, Table 1] (which evaluates cell-center values) while avoiding front-sampling bias, the error is the volume-weighted \(L_1\) difference against exact cell averages \(\bar T_{P,i}\), normalized by total analytic heat \(Q_k=\sum_i V_i\bar T_{P,i}\):</p>
+      $$ \begin{aligned}
+        E_k &= \frac{\sum_i w_i\,|T_i-T_{\rm ex}(x_i,t_{\rm end})|}{\varepsilon T_0\sum_i w_i} && \text{(two-material contact)},\\
+        E_{F,k} &= \frac{\sum_i V_i\,|T_i-\bar T_{P,i}(t_{\rm end})|}{Q_k},
+        \qquad Q_k = \sum_i V_i\,\bar T_{P,i}(t_{\rm end}) && \text{(planar and spherical sources)}.
+      \end{aligned} $$
+      <p>Here \(w_i\) and \(V_i\) are the width and volume of cell \(i\) (\(V_i=w_i\) in planar geometry, \(V_i=\frac{4\pi}{3}(r_{i+1/2}^3-r_{i-1/2}^3)\) in spherical geometry), and \(T_i\) is the numerical temperature at \(t_{\rm end}\). For the heat sources, \(E_{F,k}\) is also split at half the analytic front radius into an inner share \(E_{F,{\rm inner}}\) (cell-center radius \(r_i\lt r_f/2\)) and an outer share \(E_{F,{\rm outer}}\) (\(r_i\ge r_f/2\)) to separate the smooth core from the outer half containing the front.</p>
+      $$ p_{k,k+1} = \log_2\!\left(\frac{E_k}{E_{k+1}}\right) . $$
+      <p>Observed convergence orders \(p_{k,k+1}\) are computed from consecutive meshes whose cell widths differ by a factor of two [7, pp. 200–201, §5.5.3.2, Eq. (5.35)]. For the two-material contact, the second-order spatial scheme with \(\Delta t\propto h^2\) targets order 2, and both observed orders \(p_{1,2}\) and \(p_{2,3}\) must lie in [1.8, 2.2] (a 10% band around formal order [7, p. 201, Table 5.3]; published discontinuous-coefficient rough-grid diffusion benchmarks report 1.88–1.99 [8, p. 403, Table III] and 1.89–2.12 [9, p. 145, Table III]). The contact sequence starts at \(k\) = 1 rather than \(k\) = 0 (398 cells, 16 steps) because on \(k\) = 0 the second-order temporal error of RKL2 contributes about 22% of the total error and decays as \(O(h^4)\) under \(\Delta t\propto h^2\), pushing the coarse-pair order to 2.231 above the unchanged [1.8, 2.2] band.</p>
+      <p>For the planar and spherical heat sources, the singular front gradient and linear time-step refinement \(\Delta t\propto h\) reduce the global convergence rate of a second-order spatial scheme toward first order [7, p. 182, §5.3.1; 11, pp. 73, 75, Table 4]. Acceptance requires both observed orders \(p_0=p_{0,1}\) and \(p_1=p_{1,2}\) to be at least 0.75. This lower bound of 0.75 is developer-chosen and has no literature source, because no published study combines cell-averaged \(L_1\) error, fixed front-CFL refinement, and RKL2 super-time-stepping.</p>
+
+      <h3 id="step-start-separation">Why the planar heat source separates per-stage from step-start coefficients</h3>
+      <p>In the planar heat source, the initial instantaneous front-CFL number is \(C_f\) = 2.5 cells/step (decreasing to 0.692 at \(t_{\rm end}\); because the front decelerates, the actual analytic advance during step 1 is about 2.01, 2.22, and 2.35 cells on the coarse, middle, and fine meshes). When coefficients are frozen at step start, cold cells at \(T_{\rm floor}\) ahead of the front have negligible conductivity \(\kappa\propto T_{\rm floor}^{5/2}\), so aside from tiny floor-temperature leakage, heat enters at most one new cell per step. With \(N_k=6\cdot 2^k\) steps and cell width \(h_k=r_0/(16\cdot 2^k)\), this nominal one-cell-per-step reach radius is \(r_*=r_0+N_k h_k\) = 1.375 cm on every mesh.</p>
+      <p>Because the final analytic front reaches \(r_f\) = 1.44364 cm beyond \(r_*\), on the finest mesh (\(k\) = 2, 256 cells) the cells whose inner face lies at or beyond \(r_*\) carry analytic heat \(M_2\) = 263.548 cm·eV over volume \(V_*\) = 1.25 cm, while the final volume-integrated numerical heat is \(S_2\) = 16351.531 cm·eV (equal to the floored initial total heat by energy conservation) and the analytic total heat is \(Q_2\) = 16351.529 cm·eV. The test evaluates the triangle-inequality lower bound directly from the run's final \(S_2\); in the recorded run this gives</p>
+      $$ E_{F,{\rm step\text{-}start}} \ge \frac{S_2-Q_2}{Q_2} + \frac{2(M_2-T_{\rm floor}V_*)}{Q_2} - 2\times 10^{-11} = 0.0322353 , $$
+      <p>where 2 × 10<sup>−11</sup> bounds the tiny floor-temperature leakage, and this lower bound is evaluated on the finest planar mesh (\(k\) = 2, 256 cells) only. In contrast, under the production cap of 820 \(\Delta t_{\rm exp}\) per step, the spherical heat source has \(r_*\) = 1.375 cm outside its final front \(r_f\) = 1.20757 cm, so it does not separate the two policies. The planar heat source therefore directly tests that per-stage coefficient re-evaluation advances the front past the one-cell-per-step nominal reach \(r_*\), reaching stability ratios up to \(R\) ≈ 800 (just below the 820 production cap).</p>
+
+      <table class="quick-facts">
+        <caption>Table 3. Verdict evaluation order for the two heat-source tests. The first matching condition determines the verdict.</caption>
+        <thead><tr><th scope="col">Step</th><th scope="col">Condition</th><th scope="col">Verdict</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">1</th><td>Verify on all three meshes that \(t_{\rm end}\) is reached with the target time step and step count and zero driver retries; then verify the 1D RKL2 per-stage execution record (<code>[stage]</code> line).</td><td><code>FAIL ladder_<wbr>not_<wbr>run</code> or <code>FAIL path_<wbr>not_<wbr>reached</code> if violated</td></tr>
+          <tr><th scope="row">2</th><td>Verify on all three meshes that \(E_{F,k}\gt 0\) and that \(E_{F,k}\), \(Q_k\), \(s_{{\rm ref},k}\), ledger residuals, observed orders, and (in planar geometry) \(E_{M,k}\) and the finest-mesh (\(k\) = 2) reach bound are finite.</td><td><code>FAIL error_<wbr>not_<wbr>finite</code> if violated</td></tr>
+          <tr><th scope="row">3</th><td>Check invariants: energy-ledger residual ≤ 10<sup>−9</sup>, planar mirror asymmetry \(E_{M,k}\le 0.02 E_{F,k}\), and planar \(k\) = 2 error \(E_{F,2}\) &lt; reach lower bound computed from final \(S_2\) (0.0322353 in the recorded run).</td><td><code>FAIL ledger_<wbr>above_<wbr>tolerance</code>, <code>FAIL orientation_<wbr>above_<wbr>tolerance</code>, or <code>FAIL step_<wbr>start_<wbr>reach</code> if violated</td></tr>
+          <tr><th scope="row">4</th><td>On any mesh, the reference quadrature error estimate \(s_{{\rm ref},k}\) exceeds 1% of the measured error \(E_{F,k}\).</td><td><code>BLOCKED reference_<wbr>error_<wbr>above_<wbr>level</code></td></tr>
+          <tr><th scope="row">5</th><td>On any mesh, \(E_{F,k}\) falls below the coded model-error threshold (1.27 × 10<sup>−5</sup> planar, 3.75 × 10<sup>−5</sup> spherical).</td><td><code>BLOCKED model_<wbr>error_<wbr>above_<wbr>level</code></td></tr>
+          <tr><th scope="row">6</th><td>Either observed order \(p_0\) or \(p_1\) is zero or negative.</td><td><code>FAIL order_<wbr>not_<wbr>convergent</code></td></tr>
+          <tr><th scope="row">7</th><td>Both observed orders are below 0.75.</td><td><code>FAIL order_<wbr>below_<wbr>band</code></td></tr>
+          <tr><th scope="row">8</th><td>Pass if both observed orders are at least 0.75; block as non-asymptotic if one is at least 0.75 and the other is below 0.75.</td><td><code>PASS order_<wbr>in_<wbr>band</code> or <code>BLOCKED order_<wbr>not_<wbr>asymptotic</code></td></tr>
+        </tbody>
+      </table>
+      <p>Floor energy injection and clamp counts are recorded as diagnostics (both zero on every recorded mesh) rather than verdict branches in Table 3. The heat-source tests also intentionally omit a rounding-floor pass branch: the fine-mesh errors (about 3 × 10<sup>−4</sup>) lie 11 orders of magnitude above double-precision round-off, and the initial floor model discrepancy (recorded values 1.22 × 10<sup>−7</sup> planar and 3.68 × 10<sup>−7</sup> spherical; step 5 compares against coded constants 1.27 × 10<sup>−5</sup> and 3.75 × 10<sup>−5</sup>, roughly 100 times those initial discrepancies) dominates long before round-off. The two-material contact test directly asserts that \(p_{1,2}\) and \(p_{2,3}\) both lie in [1.8, 2.2], relative energy change ≤ 10<sup>−10</sup>, maximum mirror asymmetry ≤ 10<sup>−3</sup> \(\varepsilon T_0\) = 10<sup>−7</sup> eV, and zero clamps.</p>
+    </section>
+
+    <section aria-labelledby="results">
+      <h2 id="results">Results</h2>
+      <p>The recorded runs executed on November 27, 2026 at 21:44 JST on one NVIDIA RTX PRO 6000 Blackwell Max-Q GPU with CUDA Multi-Process Service enabled. Run metadata and printed output excerpts are archived under <code>tools/site_figures/<wbr>data/<wbr>conduction1d_standard_problems/</code>.</p>
+      <table class="quick-facts">
+        <caption>Table 4. Measured errors, energy residuals, symmetry, clamp counts, and RKL2 stages and subcycles on each mesh. Dashes mark unmeasured quantities (two-material contact counts are each grid's first-call <code>[stage]</code> record; heat-source counts are per-step history ranges).</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Cells / steps</th><th scope="col">Normalized \(L_1\) error</th><th scope="col">Inner / outer error</th><th scope="col">Energy residual</th><th scope="col">Mirror asymmetry</th><th scope="col">Clamps</th><th scope="col">RKL2 stages (subcycles)</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Two-material contact (DT–Au–DT)</th><td>796 / 64</td><td>6.65437 × 10<sup>−6</sup></td><td>—</td><td>1.31379 × 10<sup>−16</sup></td><td>4.26326 × 10<sup>−14</sup> eV</td><td>0</td><td>11 (1)</td></tr>
+          <tr><th scope="row">Two-material contact (DT–Au–DT)</th><td>1,592 / 256</td><td>1.59937 × 10<sup>−6</sup></td><td>—</td><td>0</td><td>4.26326 × 10<sup>−14</sup> eV</td><td>0</td><td>11 (1)</td></tr>
+          <tr><th scope="row">Two-material contact (DT–Au–DT)</th><td>3,184 / 1,024</td><td>3.86846 × 10<sup>−7</sup></td><td>—</td><td>1.31379 × 10<sup>−16</sup></td><td>5.68434 × 10<sup>−14</sup> eV</td><td>0</td><td>11 (1)</td></tr>
+          <tr><th scope="row">Planar heat source</th><td>64 / 6</td><td>1.88529 × 10<sup>−3</sup></td><td>8.155 × 10<sup>−4</sup> / 1.070 × 10<sup>−3</sup></td><td>0</td><td>0</td><td>0</td><td>19–29 (1)</td></tr>
+          <tr><th scope="row">Planar heat source</th><td>128 / 12</td><td>7.97028 × 10<sup>−4</sup></td><td>1.360 × 10<sup>−4</sup> / 6.611 × 10<sup>−4</sup></td><td>1.78522 × 10<sup>−16</sup></td><td>0</td><td>0</td><td>27–58 (1–2)</td></tr>
+          <tr><th scope="row">Planar heat source</th><td>256 / 24</td><td>3.21163 × 10<sup>−4</sup></td><td>1.381 × 10<sup>−5</sup> / 3.074 × 10<sup>−4</sup></td><td>1.78522 × 10<sup>−16</sup></td><td>0</td><td>0</td><td>37–99 (1–3)</td></tr>
+          <tr><th scope="row">Spherical heat source</th><td>24 / 6</td><td>5.58578 × 10<sup>−3</sup></td><td>9.776 × 10<sup>−4</sup> / 4.608 × 10<sup>−3</sup></td><td>2.15936 × 10<sup>−16</sup></td><td>—</td><td>0</td><td>15–27 (1)</td></tr>
+          <tr><th scope="row">Spherical heat source</th><td>48 / 12</td><td>2.14017 × 10<sup>−3</sup></td><td>1.826 × 10<sup>−4</sup> / 1.958 × 10<sup>−3</sup></td><td>2.15936 × 10<sup>−16</sup></td><td>—</td><td>0</td><td>19–37 (1)</td></tr>
+          <tr><th scope="row">Spherical heat source</th><td>96 / 24</td><td>3.04768 × 10<sup>−4</sup></td><td>2.705 × 10<sup>−5</sup> / 2.777 × 10<sup>−4</sup></td><td>2.15936 × 10<sup>−16</sup></td><td>—</td><td>0</td><td>27–74 (1–2)</td></tr>
+        </tbody>
+      </table>
+      <p>In the two-material contact, \(\Delta t\propto h^2\) and the small perturbation \(\varepsilon\) = 10<sup>−6</sup> keep the stability ratio \(R=\Delta t/\Delta t_p\) ≈ 22.5 (governed by the face-conductance bound of the Au cell adjacent to the DT–Au interface) nearly constant across grids and steps, and the first-call <code>[stage]</code> line recorded on each grid reports 11 RKL2 stages and 1 subcycle. In the nonlinear heat sources, \(\Delta t\propto h\) doubles the initial stability ratio on each refinement (reaching about 800 on the 256-cell planar grid and about 674 under the face-conductance bound — about 449 on the driver's cell estimate — on the 96-cell spherical grid), so early steps need more RKL2 stages and subcycles. As the wave expands and cools, \(T^{5/2}\) drops and the per-step stage and subcycle counts recorded in history decrease monotonically (Figure B), with zero driver full-step retries on any mesh (<code>retried=0</code>).</p>
+      <figure id="fig-stages">
+        <img src="../../../assets/conduction1d-standard-problems-stages-en.png" width="880" height="340" style="max-width:100%;height:auto" alt="Executed RKL2 stages per step versus normalized time for the planar and spherical heat sources across three grid levels.">
+        <figcaption>Figure B. History-recorded RKL2 stages per step (cumulative planned stages across started attempts) versus normalized step-end time \(t/t_{\rm end}\) (accumulated from recorded per-step time steps) for the planar (left) and spherical (right) heat sources. Blue dotted lines show the coarse meshes, vermilion dashed lines the middle meshes, and green solid lines the fine meshes. Filled markers denote 1 subcycle, open markers denote 2 subcycles, and dark-edged diamonds denote 3 subcycles. As the front cools, stiffness relaxes and the fine-mesh subcycle count steps down from 3 to 2 to 1 (planar) and from 2 to 1 (spherical). The contact problem does not emit per-step stage history (each grid's first-call <code>[stage]</code> line records 11 stages and 1 subcycle) and is omitted from the figure.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="convergence">
+      <h2 id="convergence">Convergence</h2>
+      <table class="quick-facts">
+        <caption>Table 5. Observed convergence orders and verdicts.</caption>
+        <thead><tr><th scope="col">Problem</th><th scope="col">Measure</th><th scope="col">Coarse to middle</th><th scope="col">Middle to fine</th><th scope="col">Acceptance criterion</th><th scope="col">Verdict</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Two-material contact (DT–Au–DT)</th><td>\(E_k\)</td><td>2.05679</td><td>2.04768</td><td>[1.8, 2.2]</td><td><code>PASS</code></td></tr>
+          <tr><th scope="row">Planar heat source</th><td>\(E_{F,k}\)</td><td>1.24209</td><td>1.31132</td><td>≥ 0.75 (developer-chosen)</td><td><code>PASS order_in_band</code></td></tr>
+          <tr><th scope="row">Spherical heat source</th><td>\(E_{F,k}\)</td><td>1.38403</td><td>2.81194</td><td>≥ 0.75 (developer-chosen)</td><td><code>PASS order_in_band</code></td></tr>
+        </tbody>
+      </table>
+      <p>The two-material contact gives observed orders of 2.05679 and 2.04768, centered cleanly in [1.8, 2.2]. Across the 4:1 cell-width jump and 10.8:1 conductivity jump, the width-weighted harmonic Kirchhoff face conductivity and RKL2 time integrator preserve full second-order accuracy.</p>
+      <p>The planar heat source gives observed orders of 1.24209 and 1.31132, well above the 0.75 floor. As Table 4 shows, the smooth inner-core share \(E_{F,{\rm inner}}\) (\(r_i\lt r_f/2\)) drops rapidly from 8.16 × 10<sup>−4</sup> to 1.38 × 10<sup>−5</sup>, leaving the outer-half share \(E_{F,{\rm outer}}\) (\(r_i\ge r_f/2\)) = 3.07 × 10<sup>−4</sup> responsible for 95.7% of the fine-mesh error. The fine-mesh error of 3.21163 × 10<sup>−4</sup> lies roughly 100 times below the step-start lower bound of 0.0322353 (Figure C), confirming that per-stage coefficient re-evaluation advances the front well beyond the one-cell-per-step nominal reach \(r_*\). On the 256-cell mesh, the final peak temperature is 6927.01 eV (analytic 6926.93 eV), and both discrete fronts (outer face of the outermost cell with \(T_i\gt 10^{-3}T_c(t_{\rm end})\)) reach 1.453125 cm (analytic 1.44364 cm, within one cell width \(h_2\) = 0.015625 cm).</p>
+      <p>In the spherical heat source, both observed orders (1.38403 and 2.81194) clear the 0.75 threshold, but the large jump between them indicates that the three-mesh sequence has not yet reached the asymptotic regime. In the recorded runs, the discrete front (outer face of the outermost cell with \(T_i\gt 10^{-3}T_c(t_{\rm end})\)) lands at the same cell face radius of 1.21875 cm on both the 48-cell and 96-cell meshes (analytic 1.20757 cm), while the outer-half error \(E_{F,{\rm outer}}\) (\(r_i\ge r_f/2\)) drops sharply from 1.958 × 10<sup>−3</sup> to 2.777 × 10<sup>−4</sup> on the 96-cell mesh, producing the elevated apparent second order of 2.81. A fourth refinement level (\(k\) = 3, 192 cells) is not run because its initial driver cell-estimate stability ratio would reach roughly 898 (twice the \(k\) = 2 value of 449), exceeding the production driver's single-step cap of 820 \(\Delta t_{\rm exp}\) (while the internal face-bounded ratio reaches roughly 1,350).</p>
+      <figure id="fig-convergence">
+        <img src="../../../assets/conduction1d-standard-problems-convergence-en.png" width="880" height="370" style="max-width:100%;height:auto" alt="Log–log plot of normalized L1 errors versus cell count for the three problems, with the 256-cell planar step-start lower bound and slopes −1 and −2.">
+        <figcaption>Figure C. Normalized \(L_1\) errors versus cell count on logarithmic axes. Blue circles show the two-material contact, vermilion squares show the planar heat source, and green triangles show the spherical heat source. The dark blue dashed line marks the step-start lower bound (0.0322) evaluated on the finest planar mesh (256 cells). Gray dotted lines indicate slopes −1 and −2.</figcaption>
+      </figure>
+    </section>
+
+    <section aria-labelledby="conservation">
+      <h2 id="conservation">Energy conservation and symmetry</h2>
+      <p>Because the 1D electron conduction operator adds each interior face heat flow to its two adjacent cells with opposite signs in identical arithmetic order, total thermal energy is conserved to round-off regardless of the RKL2 stage or subcycle count whenever no temperature-floor clamp activates. Across all nine recorded runs in Table 4, temperature-floor clamps and floor energy injections were identically zero, and the relative energy residual (relative total-energy change in the contact problem; maximum ledger residual in the heat sources) remained at most 2.16 × 10<sup>−16</sup>, more than six orders of magnitude below the tolerances (10<sup>−10</sup> for contact and 10<sup>−9</sup> for the heat sources).</p>
+      <p>Both symmetric planar problems also verify mirror symmetry. In the two-material contact, the maximum mirror temperature difference \(\max_i|T_i-T_{N-1-i}|\) stays at or below 5.68 × 10<sup>−14</sup> eV on all three meshes (tolerance 10<sup>−3</sup> \(\varepsilon T_0\) = 10<sup>−7</sup> eV). In the planar heat source, the normalized mirror asymmetry \(E_M=Q_k^{-1}\sum_i V_i|T_i-T_{N-1-i}|\) is identically zero on all three meshes.</p>
+    </section>
+
+    <section aria-labelledby="limitations">
+      <h2 id="limitations">Limitations</h2>
+      <p>These three problems verify pure 1D planar and spherical electron conduction on a single MPI rank with a one-temperature constant-\(c_v\) ideal gas, the default face policy (<code>face_kappa_policy="kirchhoff_same_material"</code>), and the default 1D RKL2 super-time-stepping solver (<code>solver="sts"</code>). The following regimes and options are not judged by these tests:</p>
+      <ul>
+        <li><strong>Multiple MPI ranks:</strong> all runs use one rank; domain decomposition and halo exchange are left to separate parallel tests.</li>
+        <li><strong>Per-material conservation path:</strong> the mixed-cell per-material energy path (<code>per_material_conservation_enabled</code>) is not exercised.</li>
+        <li><strong>Harmonic face policy:</strong> <code>face_kappa_policy="harmonic"</code> is not run in these standard problems.</li>
+        <li><strong>Strongly flux-limited regime:</strong> the tiny contact perturbation and the high density (\(\rho\) = 10<sup>7</sup> g/cm<sup>3</sup>) of the heat sources keep \(|q|\ll q_{\max}\) everywhere.</li>
+        <li><strong>Varying Coulomb logarithm and temperature-dependent specific heat:</strong> the heat sources pin \(\ln\Lambda\) = 2, and all three problems use constant-\(c_v\) 1T ideal gas rather than tabulated EOS.</li>
+        <li><strong>Other solvers, geometries, and couplings:</strong> the 1D implicit solver (<code>solver="implicit"</code>), SNB nonlocal transport, ion conduction, cylindrical geometry, coupling with hydrodynamics or radiation, and 2D RZ are outside this page's scope.</li>
+        <li><strong>Rounding-error limit:</strong> as noted above, convergence termination by floating-point round-off is intentionally not tested here.</li>
+      </ul>
+    </section>
+
+    <section aria-labelledby="run-tests">
+      <h2 id="run-tests">Running the tests</h2>
+      <p>From a build directory of a revision that includes both test sources (the recorded revision is listed in <code>tools/site_figures/<wbr>data/<wbr>conduction1d_standard_problems/<wbr>README.md</code>), run the two CUDA test executables with a CUDA device available. The two-material contact source is <code>tests/verification/<wbr>test_conduction_face_contact_1d.cu</code> (1 test case, 33 assertions), and the planar and spherical heat-source test source is <code>tests/verification/<wbr>test_conduction_sts_standard_problems_1d.cu</code> (2 test cases, 2 assertions).</p>
+      <pre><code>./test_conduction_face_contact_1d
+./test_conduction_sts_standard_problems_1d</code></pre>
+      <p>Both executables passed all assertions in the recorded runs.</p>
+    </section>
+
+    <section aria-labelledby="references">
+      <h2 id="references">References</h2>
+      <ol class="references">
+        <li>C. D. Meyer, D. S. Balsara, and T. D. Aslam, "A stabilized Runge–Kutta–Legendre method for explicit super-time-stepping of parabolic and mixed equations," J. Comput. Phys. 257, 594–626 (2014). <a href="https://doi.org/10.1016/j.jcp.2013.08.021">doi:10.1016/j.jcp.2013.08.021</a></li>
+        <li>J. E. Morel, R. M. Roberts, and M. J. Shashkov, "A Local Support-Operators Diffusion Discretization Scheme for Quadrilateral r-z Meshes," J. Comput. Phys. 144, 17–51 (1998). <a href="https://doi.org/10.1006/jcph.1998.5981">doi:10.1006/jcph.1998.5981</a></li>
+        <li>L. Spitzer, Jr. and R. Härm, "Transport Phenomena in a Completely Ionized Gas," Phys. Rev. 89, 977–981 (1953). <a href="https://doi.org/10.1103/PhysRev.89.977">doi:10.1103/PhysRev.89.977</a></li>
+        <li>E. M. Epperlein and R. W. Short, "A Practical Nonlocal Model for Electron Heat Transport in Laser Plasmas," Phys. Fluids B 3, 3092–3098 (1991). <a href="https://doi.org/10.1063/1.859789">doi:10.1063/1.859789</a></li>
+        <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>W. Zhang, L. Howell, A. Almgren, A. Burrows, and J. Bell, "CASTRO: A New Compressible Astrophysical Solver. II. Gray Radiation Hydrodynamics," Astrophys. J. Suppl. Ser. 196, 20 (2011). <a href="https://doi.org/10.1088/0067-0049/196/2/20">doi:10.1088/0067-0049/196/2/20</a></li>
+        <li>W. L. Oberkampf and C. J. Roy, <i>Verification and Validation in Scientific Computing</i> (Cambridge University Press, 2010). <a href="https://doi.org/10.1017/CBO9780511760396">doi:10.1017/CBO9780511760396</a></li>
+        <li>M. Shashkov and S. Steinberg, "Solving Diffusion Equations with Rough Coefficients in Rough Grids," J. Comput. Phys. 129, 383–405 (1996). <a href="https://doi.org/10.1006/jcph.1996.0257">doi:10.1006/jcph.1996.0257</a></li>
+        <li>J. Hyman, M. Shashkov, and S. Steinberg, "The Numerical Solution of Diffusion Problems in Strongly Heterogeneous Non-isotropic Materials," J. Comput. Phys. 132, 130–148 (1997). <a href="https://doi.org/10.1006/jcph.1996.5633">doi:10.1006/jcph.1996.5633</a></li>
+        <li>J. W. Bates, D. A. Knoll, W. J. Rider, R. B. Lowrie, and V. A. Mousseau, "On Consistent Time-Integration Methods for Radiation Hydrodynamics in the Equilibrium Diffusion Limit: Low-Energy-Density Regime," J. Comput. Phys. 167, 99–130 (2001). <a href="https://doi.org/10.1006/jcph.2000.6661">doi:10.1006/jcph.2000.6661</a></li>
+        <li>L. H. Howell and J. A. Greenough, "Radiation diffusion for multi-fluid Eulerian hydrodynamics with adaptive mesh refinement," J. Comput. Phys. 184, 53–78 (2003). <a href="https://doi.org/10.1016/S0021-9991(02)00015-3">doi:10.1016/S0021-9991(02)00015-3</a></li>
+        <li>V. Caselles, "An existence and uniqueness result for flux limited diffusion equations," Discrete Contin. Dyn. Syst. 31, 1151–1195 (2011). <a href="https://doi.org/10.3934/dcds.2011.31.1151">doi:10.3934/dcds.2011.31.1151</a></li>
+        <li>F. Andreu, V. Caselles, and J. M. Mazón, "The Cauchy problem for a strongly degenerate quasilinear equation," J. Eur. Math. Soc. 7, 361–393 (2005). <a href="https://doi.org/10.4171/JEMS/32">doi:10.4171/JEMS/32</a></li>
+        <li>M. Gittings, R. Weaver, M. Clover, T. Betlach, N. Byrne, R. Coker, E. Dendy, R. Hueckstaedt, K. New, W. R. Oakes, D. Ranta, and R. Stefan, "The RAGE radiation-hydrodynamic code," Comput. Sci. Discov. 1, 015005 (2008). <a href="https://doi.org/10.1088/1749-4699/1/1/015005">doi:10.1088/1749-4699/1/1/015005</a></li>
+      </ol>
+    </section>
+
+    <div id="page-footer"></div>
+  </main>
+  <script>window.MathJax = { tex: { inlineMath: [["\\(", "\\)"]], displayMath: [["$$", "$$"], ["\\[", "\\]"]] } };</script>
+  <script defer src="../../../math-tips.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="../../../nav.js" data-page="conduction-standard-problems" data-root="../../"></script>
+</body>
+</html>

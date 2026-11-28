@@ -32,7 +32,7 @@
       \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
       $$
       <p>Here \(\kappa_0\) is the Spitzer prefactor in cgs + eV units, \(\xi(\bar Z)\) is the Z-dependent correction detailed in the list below, \(\ln\Lambda\) is the Coulomb logarithm, and \(\mathbf q_{SH}\) is the resulting unlimited heat flux.</p>
-      <p>In 1D the local model applies the flux limit per face; 1D SNB applies no flux limiter. The face electron density and temperature — each the arithmetic average of the adjacent cells — and the thermal speed at that temperature build \(q_{max}\), and the harmonic composition described in the <a href="index.html#mechanism">physical mechanism section of the overview page</a> caps the flux (\(k_B\) is the eV→erg conversion constant <code>eV_to_erg</code>, as everywhere in the cgs + eV system):</p>
+      <p>In 1D the local model applies the flux limit per face; 1D SNB applies no flux limiter. The face electron density is computed from the arithmetic means of the adjacent cells' mass densities and mean ionizations together with the harmonic mean of their effective mass numbers, and the face temperature is the arithmetic mean of the adjacent cell temperatures (using the floored stage-input temperatures in 1D electron STS); these and the thermal speed at that temperature build \(q_{max}\), and the harmonic composition described in the <a href="index.html#mechanism">physical mechanism section of the overview page</a> caps the flux (\(k_B\) is the eV→erg conversion constant <code>eV_to_erg</code>, as everywhere in the cgs + eV system):</p>
       $$
       v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
       q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad

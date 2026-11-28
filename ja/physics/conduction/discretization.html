@@ -24,14 +24,14 @@
 
       <h3 id="terms-face-kappa">面の伝導率の作り方</h3>
       <p><strong>面の伝導率の作り方（face-κ policy）</strong>は、1D で、隣り合う 2 つのセルの κ から、その境にある面の熱伝導率 \(\kappa_f\) を決める規則である。キーは <code>Numerics.conduction.face_kappa_policy</code> で、値は <code>"kirchhoff_same_material"</code>（既定）と <code>"harmonic"</code> である。</p>
-      <p>\(\kappa\propto T^{5/2}\) は、急峻な熱波面（thermal wave front）を横切る温度区間で何桁も変わる。そのため \(\kappa_f\) の作り方が、波面の進み方を左右する。<code>"harmonic"</code> は、左右のセルの κ の調和平均（harmonic mean）\(2\kappa_L\kappa_R/(\kappa_L+\kappa_R)\) を \(\kappa_f\) とする。調和平均は小さい方の κ に引かれるので、波面の前方では \(\kappa_f\) が過小になり、波面が格子に固着しがちである。片側の κ が 0 なら \(\kappa_f\) も 0 で、熱は通らない。</p>
-      <p><code>"kirchhoff_same_material"</code> は、左右の温度 \(T_L\)、\(T_R\) の区間で \(T^{5/2}\) を厳密に積分した割線（secant）を使う。Kirchhoff 変換（Kirchhoff transformation）に基づく面平均である。</p>
+      <p>\(\kappa\propto T^{5/2}\) は、急峻な熱波面（thermal wave front）を横切る温度区間で何桁も変わる。そのため \(\kappa_f\) の作り方が、波面の進み方を左右する。<code>"harmonic"</code> は、左右のセル幅 \(w_L,w_R\) で重み付けした調和平均（width-weighted harmonic mean）\((w_L+w_R)/(w_L/\kappa_L+w_R/\kappa_R)\)（等間隔格子では \(2\kappa_L\kappa_R/(\kappa_L+\kappa_R)\)）を \(\kappa_f\) とする。調和平均は小さい方の κ に引かれるので、波面の前方では \(\kappa_f\) が過小になり、波面が格子に固着しがちである。片側の κ が正でない、またはボイドのときは \(\kappa_f=0\) で、熱は通らない。</p>
+      <p><code>"kirchhoff_same_material"</code> は、左右の温度 \(T_L\)、\(T_R\) の区間で \(T^{5/2}\) を厳密に積分した割線（secant）に、左右の基底係数の幅重み付き調和平均を掛ける。Kirchhoff 変換（Kirchhoff transformation）に基づく面平均である。</p>
       $$
       \kappa_f=\tilde\kappa_f\,\frac27\,\frac{T_R^{7/2}-T_L^{7/2}}{T_R-T_L},\qquad
-      \tilde\kappa_f=\frac{2\tilde\kappa_L\tilde\kappa_R}{\tilde\kappa_L+\tilde\kappa_R},\qquad
+      \tilde\kappa_f=\frac{w_L+w_R}{w_L/\tilde\kappa_L+w_R/\tilde\kappa_R},\qquad
       \tilde\kappa=\frac{\kappa}{T^{5/2}}.
       $$
-      <p>ここで \(\tilde\kappa\) は、セルの κ から取り出した Spitzer 前置因子である。左右の \(\tilde\kappa\) の比が 0.1 と 10 のあいだにあるときだけ、この割線を使う。比がこの範囲の外にあるとき（物質界面や、テーブル由来の \(\tilde\kappa\) の大きな跳び）と、κ か \(T\) が正でないとき（ボイド）は、調和平均にする。\(\kappa_f\) は、流束制限に使う SH の推定値、実際の流束、既定のときの \(\Delta t_{exp}\)（<a href="time-integration.html#sts">手順 3</a>）に、同じ値を使う。</p>
+      <p>ここで \(\tilde\kappa\) は、セルの κ から取り出した Spitzer 前置因子、\(w_L,w_R\) は面を挟む左右セルの幅である。1D では物質界面を含む両側が有効なすべての面にこの割線式を適用する（値の名前 <code>"kirchhoff_same_material"</code> は互換性のため維持している）。\(|T_R-T_L|/T_m\lt 10^{-4}\)（\(T_m=(T_L+T_R)/2\)）では桁落ちを避けるため中点展開の 2 次近似を用い、片側がボイドまたは \(\rho c_v\le0\) か κ が正でないときは \(\kappa_f=0\) とする。\(\kappa_f\) は、流束制限に使う SH の推定値、実際の流束、および 1D の \(\Delta t_{exp}\) の面コンダクタンス上界（<a href="time-integration.html#sts">手順 3</a>）に共通して用い、1D の電子 STS では各 RKL2 段で評価し直す。</p>
       <p>2D RZ は節点局所の演算子（次項）を使い、面の \(\kappa_f\) を作らない。このキーは、演算子の各対に、2 つのセルの温度による割線（上の式の \(\tfrac27(T_R^{7/2}-T_L^{7/2})/(T_R-T_L)\)）を掛けるかどうかだけを選ぶ。<code>"kirchhoff_same_material"</code> では掛け、<code>"harmonic"</code> では掛けない。SNB の 2D RZ は割線を使わない。</p>
 
       <h3 id="terms-node-local">節点局所の演算子</h3>
@@ -52,7 +52,7 @@
 
     <section aria-labelledby="faces-materials">
       <h2 id="faces-materials">面の伝導率、材料別の保存モード、ボイド</h2>
-      <p>1D の面の κ の作り方（定義と式は<a href="#terms-face-kappa">用語の節</a>）は、既定の <code>kirchhoff_same_material</code> では、同じ材料の滑らかな Spitzer 面に限って Kirchhoff 割線を使う。単純な両端評価では急峻な熱波面の前面で面 κ が過小になり、波面が格子に固着しがちだが、割線はこの傾向を弱める。物質界面、ボイド、セルの伝導率から抽出した Spitzer 前置因子（\(\kappa_c/T_c^{5/2}\)）がテーブル由来で大きく跳ぶ箇所では、調和平均にする。<code>harmonic</code> も選べ、物質界面や伝導率の大きな跳びを保守的に扱う — 調和平均なので、片側の κ が 0 なら面の流束も 0 である。流束制限に使う SH の推定値と実際の流束は、必ず同じ面の κ を使う。</p>
+      <p>1D の面の κ の作り方（定義と式は<a href="#terms-face-kappa">用語の節</a>）は、既定の <code>kirchhoff_same_material</code> では、物質界面を含む両側が有効なすべての面に幅重み付き調和平均の基底係数と Kirchhoff 割線の積を使う。単純な両端評価では急峻な熱波面の前面で面 κ が過小になり、波面が格子に固着しがちだが、割線はこの傾向を弱め、幅重み付けによってセル幅が異なる物質界面でも 2 次精度を保つ。<code>harmonic</code> も選べ、セル伝導率の幅重み付き調和平均を用いる — 調和平均なので、片側の κ が 0 なら面の流束も 0 である。流束制限に使う SH の推定値と実際の流束は必ず同じ面の κ を使い、1D の電子 STS では RKL2 の各段でこれらを評価し直す。</p>
       <p>2D RZ には面の κ がない。異なる伝導率のセルのあいだの熱流は、半辺での熱流の連続から決まり、調和平均は使わない。<code>face_kappa_policy</code> は、節点局所の演算子の各対に、その 2 つのセルの温度による割線を掛けるかどうかだけを選ぶ。</p>
       <p>1D の平面・円筒・球の演算子は保存型の有限体積で、幾何の違いは面積 \(A_f\) とセル体積 \(V_i\) にしか現れない。材料別の保存モード（定義は<a href="#terms-per-material">用語の節</a>、2D RZ のみ）では、セルごとに電子温度を 1 つだけ STS で進め、そのエネルギー変化を材料に配る。セルの伝導率は、材料 \(m\) ごとにその温度、密度、\(\bar Z\)、lnΛ から作った制限済みの熱伝導率 κ<sub>eff,m</sub> を、体積率 α<sub>m</sub> で重み付けて足した和 Σ<sub>m</sub>α<sub>m</sub>κ<sub>eff,m</sub> とする。</p>
       <p>全段を終えたあと、セル \(c\) の電子エネルギーの変化 \(\Delta E_c=(\rho c_vV)_c(T_c^{n+1}-T_c^n)\) を、次の規則で材料に配る。\(\Delta E_c&gt;0\) は、ステップ入口の材料の電子熱容量に比例して配り、各材料の温度が同じだけ上がるようにする。\(\Delta E_c&lt;0\) は、材料の電子エネルギーの、温度の床（floor。<code>Numerics.floors.Te</code>。<a href="../../overview/numerics-foundations.html#floors-safety">定義</a>）における状態からの余剰に比例して配る。余剰の合計が \(-\Delta E_c\) に足りないときは、全材料が床の状態になり、不足分は床で加えたエネルギーとして<a href="../../overview/numerics-foundations.html#energy-ledger">エネルギー台帳</a>（energy ledger）に載せる。余剰が足りるときは、材料の電子エネルギーの和の変化がセルの変化に丸め誤差の範囲で一致する。<code>mixed_cell_closure="pressure_relaxation"</code> のときは、伝導は材料を区別しないセルの係数で進み、エネルギーの材料への配分はドライバが混合セルの圧力緩和の規則で行う。</p>
@@ -67,7 +67,7 @@
           <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>面の κ の作り方。既定は、同一材料での Kirchhoff 割線。調和平均の <code>"harmonic"</code> も選べる。2D RZ では、節点局所の演算子の各対に割線を掛けるかどうかを選ぶ。</td></tr>
+          <tr><th><code>face_kappa_policy</code></th><td><code>"kirchhoff_same_material"</code></td><td>面の κ の作り方。1D の既定は、物質界面を含む有効面への幅重み付き調和平均の基底係数と Kirchhoff 割線の積。セル伝導率の幅重み付き調和平均 <code>"harmonic"</code> も選べる。2D RZ では、節点局所の演算子の各対に割線を掛けるかどうかを選ぶ。</td></tr>
         </tbody>
       </table>
 
@@ -76,7 +76,8 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
-        <li><strong>Kirchhoff 割線の検査：</strong>同一材料の急峻な面を対象に、次を検査する。Kirchhoff 割線と調和平均とで熱流と時間刻みがどう変わるかの比、流束制限が効いた状態での \(|q|\le q_{max}\) の成立、固定した係数の演算子に対する Gershgorin 円板（Gershgorin disc）の対角優位性の検査による時間刻みの保護（体積 0 のセルは除外）、物質界面での調和平均への正しい切り替え。</li>
+        <li><strong>Kirchhoff 割線と流束制限の検査：</strong>1D の面伝導率方針の検証（<code>test_conduction_face_kappa_policy_1d</code>）は、一様温度での不変性、急峻な面における Kirchhoff 割線による流束の固着解消、近接温度での有限性と保存性、および陰解法（<code>solver="implicit"</code>）が指定された <code>face_kappa_policy</code> を反映し 2 方針で異なる温度解を与え、Kirchhoff 割線側でエネルギーを保存することを検査する。別途、流束制限と方針の一貫性試験（<code>test_conduction_limiter_policy_consistency</code>）が、流束制限が効いた状態での \(|q|\le q_{max}\) の成立と、Gershgorin 上界による時間刻み保護（体積 0 のセルは除外）を検査する。</li>
+        <li><strong>不均一セル幅の物質界面（2 物質接触）：</strong><a href="standard-problems.html">1D 熱伝導の解析解による検証</a>の頁で、幅比 4 の DT–Au–DT 界面における空間 2 次収束（観測次数 2.06・2.05）を判定する。</li>
       </ul>
     </section>
 

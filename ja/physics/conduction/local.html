@@ -32,7 +32,7 @@
       \mathbf q_{SH}=-\kappa_{SH}\nabla T_e.
       $$
       <p>ここで \(\kappa_0\) は cgs + eV 単位系での Spitzer 前置係数、\(\xi(\bar Z)\) は下の箇条書きで詳述する Z 依存補正、\(\ln\Lambda\) はクーロン対数（Coulomb logarithm）、\(\mathbf q_{SH}\) が得られる制限前の熱流束である。</p>
-      <p>1D の局所モデルでは流束制限を面ごとに適用する。1D SNB は流束制限を適用しない。面の電子密度と温度（いずれも左右セルの算術平均）と、その温度から求めた熱速度から \(q_{max}\) を作り、<a href="index.html#mechanism">概要の頁の物理機構</a>で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
+      <p>1D の局所モデルでは流束制限を面ごとに適用する。1D SNB は流束制限を適用しない。面の電子数密度は左右セルの質量密度と平均電離度の算術平均および実効質量数の調和平均から求め、面の温度は左右セル温度の算術平均（1D の電子 STS では各段の床適用後の入力温度）として、その温度から求めた熱速度とともに \(q_{max}\) を作り、<a href="index.html#mechanism">概要の頁の物理機構</a>で述べた調和合成の形で制限する（\(k_B\) は cgs + eV 単位系の常として eV→erg の換算定数 <code>eV_to_erg</code> である）。</p>
       $$
       v_{th,e}=\sqrt{\frac{k_BT_e}{m_e}},\qquad
       q_{max}=f_{lim}n_ek_BT_ev_{th,e},\qquad

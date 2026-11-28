@@ -16,33 +16,35 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>時間積分</h1>
-    <p class="abstract">熱伝導の時間積分は、既定ではスーパータイムステッピング（super-time-stepping、STS）による陽解法である。高温のコロナでは熱拡散の陽的な安定限界（explicit stability limit）が大域の時間刻みよりはるかに小さいが、STS は長さの異なる段を組み合わせ、少ない段数で大域の時間刻みを進める。1D には後退オイラー法（backward Euler method）の三重対角系による陰解法（<code>solver="implicit"</code>）、2D RZ には離散最大値原理（discrete maximum principle）を満たす陰解法（<code>solver="dmp_implicit"</code>）がある。この頁は、STS の用語と手順、2 つの陰解法、時間積分のキーを述べる。</p>
+    <p class="abstract">熱伝導の時間積分は、既定ではスーパータイムステッピング（super-time-stepping、STS）による陽解法である。高温のコロナでは熱拡散の陽的な安定限界（explicit stability limit）が大域の時間刻みよりはるかに小さいが、STS は多段の陽的更新（1D は RKL2 の 3 項漸化式、2D RZ は長さの異なるチェビシェフ段など）により、少ない段数で大域の時間刻みを進める。1D には後退オイラー法（backward Euler method）の三重対角系による陰解法（<code>solver="implicit"</code>）、2D RZ には離散最大値原理（discrete maximum principle）を満たす陰解法（<code>solver="dmp_implicit"</code>）がある。この頁は、STS の用語と手順、2 つの陰解法、時間積分のキーを述べる。</p>
 
     <section aria-labelledby="terms">
       <h2 id="terms">この計算で使う用語</h2>
       <p>STS の時間刻みには、TENRYU の実装に固有の意味で使う語がある。大域ステップ、陽的な安定限界、部分ステップ、大ステップ、段である。これらをまとめて定義する。</p>
 
       <h3 id="terms-sts">STS の時間刻み</h3>
-      <p><strong>大域ステップ（global step）</strong>は、ドライバが外側の 1 ステップで進める時間刻み \(\Delta t\) である。決め方は<a href="../../overview/timestep.html#global-rule">時間刻み制御</a>の頁にある。熱伝導は、チェビシェフの段で 1 回の STS が覆える最大の区間 \(s_{max}(s_{max}+1)\Delta t_{exp}/2\)（既定では \(\Delta t_{exp}\) の 820 倍）を、大域ステップの上限として提案する（<a href="../../overview/timestep.html#conduction-dt">熱伝導の節</a>）。</p>
-      <p><strong>陽的な安定限界（explicit stability limit）\(\Delta t_{exp}\)</strong>は、熱拡散を前進オイラー法（forward Euler method）で陽的に進めるとき、更新が安定である刻みの目安である。κ が \(T_e^{5/2}\) に比例するので、コロナでは \(\Delta t_{exp}\) が \(\Delta t\) の数百分の 1 になる。1D ではセル幅と実効熱拡散率から、2D RZ では更新に使う演算子の Gershgorin の上界（Gershgorin bound）から求める（<a href="#sts">手順 3</a>）。安全係数（safety factor）\(C_{cond}\) はキー <code>Numerics.dt.cfl_cond</code>（既定 0.25、範囲 (0, 1]）である。\(\Delta t/\Delta t_{exp}\) が、STS の段数を決める。</p>
+      <p><strong>大域ステップ（global step）</strong>は、ドライバが外側の 1 ステップで進める時間刻み \(\Delta t\) である。決め方は<a href="../../overview/timestep.html#global-rule">時間刻み制御</a>の頁にある。熱伝導は、1D・2D RZ とも大域ステップの上限としてチェビシェフの段の式 \(s_{max}(s_{max}+1)\Delta t_{exp}/2\)（既定では \(\Delta t_{exp}\) の 820 倍）を提案する（<a href="../../overview/timestep.html#conduction-dt">熱伝導の節</a>）。ただし 1D のドライバが上限に使う \(\Delta t_{exp}\) はセル推定のみであり、1D の電子 STS は大域ステップを受け取ったあと、呼出しの内部で面コンダクタンス上界も加えた \(\Delta t_{exp}\) から RKL2 の段と副サイクルを計画して進める。</p>
+      <p><strong>陽的な安定限界（explicit stability limit）\(\Delta t_{exp}\)</strong>は、熱拡散を前進オイラー法（forward Euler method）で陽的に進めるとき、更新が安定である刻みの目安である。κ が \(T_e^{5/2}\) に比例するので、コロナでは \(\Delta t_{exp}\) が \(\Delta t\) の数百分の 1 になる。1D ではドライバの刻み候補および診断がセル幅と実効熱拡散率からのセル推定だけを使い、1D 電子 STS の呼出し内部ではセル推定と流束制限済みの面コンダクタンス上界の小さい方を取る。2D RZ では更新に使う演算子の Gershgorin の上界（Gershgorin bound）から求める（<a href="#sts">手順 3</a>）。安全係数（safety factor）\(C_{cond}\) はキー <code>Numerics.dt.cfl_cond</code>（既定 0.25、範囲 (0, 1]）である。\(\Delta t/\Delta t_{exp}\) が、STS の段数を決める。</p>
       <p><strong>部分ステップ（substep）</strong>は、STS を使わずに \(\Delta t\) を \(\Delta t_{exp}\) ごとの陽的な更新に分けるとしたときの、1 回の更新である。必要な数は \(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) で、GXII のコロナでは 130–340 になる。TENRYU は部分ステップを実行しない。\(N_{sub}\) は、STS の効果を見積もる比較の量である。</p>
-      <p><strong>大ステップ（superstep）</strong>は、STS が 1 回の段の列で進める区間 \(\Delta t_{sup}\) である。\(\Delta t\) が \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\) 以下のときは、大域ステップがそのまま 1 つの大ステップになる。これを超えるときは、\(\Delta t\) を等しい \(n_{sup}\) 個の大ステップに分ける。\(s_{max}\) は 1 つの大ステップの段数の上限（<code>sts_max_stages</code>、既定 40、範囲 1–200）、\(\eta\) は分割を判定する係数（<code>sts_subcycle_eta</code>、既定 0.9、範囲 (0, 1]）である。既定では、1 つの大ステップが \(\Delta t_{exp}\) の約 738 倍（\(0.9\times820\)）までを覆う。</p>
-      <p><strong>段（stage）</strong>は、大ステップの中の 1 回の前進オイラー更新である。1 つの大ステップは \(s\) 個の段から成り、\(j\) 番目の段の時間刻み \(\tau_j\) は段ごとに違う（式は<a href="#sts">手順 5</a>）。\(\tau_j\) の和は \(\Delta t_{sup}\) に等しい。長い段と短い段を組み合わせると、段の列の全体が安定である区間が \(s^2\) に比例して広がり、段数 \(s\) は \(\sqrt{2\Delta t_{sup}/\Delta t_{exp}}\) 程度で足りる。段の長さの分布は、段数と減衰（damping）\(\nu\)（<code>sts_damping</code>、既定 0.01、範囲 (0, 1)）で決まる。</p>
+      <p><strong>大ステップ（superstep）／副サイクル（subcycle）</strong>は、STS が 1 回の段の列で進める区間である。2D RZ のチェビシェフ段では、\(\Delta t\) が \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\) 以下のときは大域ステップがそのまま 1 つの大ステップ（\(\Delta t_{sup}\)）になり、これを超えるときは \(\Delta t\) を等しい \(n_{sup}\) 個の大ステップに分ける。\(s_{max}\) は 1 つの大ステップの段数の上限（<code>sts_max_stages</code>、既定 40、範囲 1–200）、\(\eta\) は分割を判定する係数（<code>sts_subcycle_eta</code>、既定 0.9、範囲 (0, 1]）である。既定の 2D RZ では、1 つの大ステップが \(\Delta t_{exp}\) の約 738 倍（\(0.9\times820\)）までを覆う。1D の電子 STS（RKL2）では、\(s_{max}\) 以下の最大の奇数 \(s_{cap}\)（既定 39）と安定倍率 \(c(s_{cap})=(s_{cap}^2+s_{cap}-2)/4\)（既定 389.5；\(s_{cap}\) = 1 のとき 1）を用い、\(\Delta t\) が \(\max(\eta,10^{-6})\,c(s_{cap})\Delta t_p\)（既定の初期値では約 350.55 \(\Delta t_{exp}\)）を超えるときに等しい \(n_{sub}\) 個の副サイクル（長さ \(\tau=\Delta t/n_{sub}\)）へ分ける。</p>
+      <p><strong>段（stage）</strong>は、大ステップ／副サイクルの中の 1 回の更新である。2D RZ のチェビシェフ段は \(s\) 回の前進オイラー更新から成り、\(j\) 番目の段の時間刻み \(\tau_j\) は段ごとに違い（式は<a href="#sts">手順 5</a>）、和が \(\Delta t_{sup}\) に等しい。段数 \(s\) は \(\sqrt{2\Delta t_{sup}/\Delta t_{exp}}\) 程度で足り、段の長さの分布は段数と減衰（damping）\(\nu\)（<code>sts_damping</code>、既定 0.01、範囲 (0, 1)）で決まる。1D の電子 STS はチェビシェフの段の長さ \(\tau_j\) も <code>sts_damping</code> も使わず、2 次の Runge–Kutta–Legendre（RKL2）法の 3 項漸化式 [3] で \(s\) 段（奇数 \(s\) ≥ 3、または \(\tau/\Delta t_p\) ≤ 1/2 のとき前進オイラー 1 段）を進め、各段で係数を評価し直す。</p>
     </section>
 
     <section aria-labelledby="sts">
       <h2 id="sts">スーパータイムステッピング</h2>
-      <p>Spitzer 伝導率は \(T_e^{5/2}\) に比例するため、大域ステップ \(\Delta t\) を陽的な安定限界 \(\Delta t_{exp}\) ごとの部分ステップで進めると、\(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) 回の CUDA カーネルの起動が必要になる。典型的な GXII のコロナ — <a href="index.html#mechanism">概要の頁の物理機構</a>と同じ \(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m の条件 — では \(N_{sub}\) は 130–340 に達する。STS は、長さの異なる段を組み合わせて安定区間を広げ、同じ区間を 17–27 段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で進める。これらの語は<a href="#terms-sts">用語の節</a>で定義する。手順は次のとおりである。</p>
+      <p>Spitzer 伝導率は \(T_e^{5/2}\) に比例するため、大域ステップ \(\Delta t\) を陽的な安定限界 \(\Delta t_{exp}\) ごとの部分ステップで進めると、\(N_{sub}=\lceil\Delta t/\Delta t_{exp}\rceil\) 回の CUDA カーネルの起動が必要になる。典型的な GXII のコロナ — <a href="index.html#mechanism">概要の頁の物理機構</a>と同じ \(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m の条件 — では \(N_{sub}\) は 130–340 に達する。STS は安定区間を \(O(s^2)\) で広げ、同じ区間を 2D RZ の既定のチェビシェフ段では 17–27 段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）、1D の RKL2 段では 23–37 段で進める。これらの語は<a href="#terms-sts">用語の節</a>で定義する。手順は次のとおりである。</p>
       <h3>1 回の熱伝導ステップの手順</h3>
       <ol>
-        <li><p><strong>すべての面の κ を作る。</strong>1D では、適用できる範囲で、同一材料の滑らかな Spitzer 面に <code>kirchhoff_same_material</code> を、物質界面・ボイド・テーブル値の大きな跳びには調和平均を使って、面の κ を評価する。2D RZ には面の κ がなく、セルの κ<sub>eff</sub> から節点局所の演算子を組む。演算子に入れる各セルの伝導率は、割線を使うときは入口の温度による κ<sub>eff</sub>/T<sub>e</sub><sup>5/2</sup>、使わないときは κ<sub>eff</sub> である。</p></li>
-        <li><p><strong>すべての面に流束制限を掛ける。</strong>1D では、同じ作り方の面の κ で面の SH 推定値を作り、\(q_{max}\) を評価して \(\theta=1/(1+|q_{raw}|/q_{max})\) を固定する。θ と面の κ の積が、そのステップで用いる制限済みの κ<sub>eff</sub> になる。2D RZ では、セルごとに \(\kappa_{eff}=\theta\kappa_{SH}\)（<a href="local.html#local-model">局所モデルの頁</a>）とし、これが制限済みの伝導率である。</p></li>
+        <li><p><strong>すべての面の κ を作る。</strong>1D では、両側が有効なすべての面（物質界面を含む）について、<code>kirchhoff_same_material</code> では基底係数の幅重み付き調和平均と Kirchhoff 割線の積を、<code>harmonic</code> ではセル伝導率の幅重み付き調和平均を評価する（<a href="discretization.html#terms-face-kappa">空間離散化の頁</a>）。1D の電子 STS では入口で一度評価して安定限界を求めるだけでなく、各 RKL2 段でもその段の入力温度 \(\widehat Y=\max(Y,T_{floor})\) からセルと面の κ を評価し直す。2D RZ には面の κ がなく、セルの κ<sub>eff</sub> から節点局所の演算子を組む。演算子に入れる各セルの伝導率は、割線を使うときは入口の温度による κ<sub>eff</sub>/T<sub>e</sub><sup>5/2</sup>、使わないときは κ<sub>eff</sub> である。</p></li>
+        <li><p><strong>すべての面に流束制限を掛ける。</strong>1D では、同じ作り方の面の κ で面の SH 推定値（元の温度差 \(Y_R-Y_L\) を使用）を作り、床を適用した面温度 \((\widehat Y_L+\widehat Y_R)/2\) から \(q_{max}\) を評価して制限係数 \(\lambda_f=1/(1+|q_{raw}|/q_{max})\) を求める。1D の電子 STS ではこの流束制限も各段で評価し直す。2D RZ では、セルごとに \(\kappa_{eff}=\theta\kappa_{SH}\)（<a href="local.html#local-model">局所モデルの頁</a>）とし、これが制限済みの伝導率である。</p></li>
         <li>
-          <p><strong>陽的な安定限界を求める。</strong>1D では、\(D_{eff}=\kappa_{eff}/(\rho c_v)\) を作り、最も厳しいセルの値を取る（\(\Delta l_c\) はセル幅）。</p>
+          <p><strong>陽的な安定限界を求める。</strong>1D では、両方の <code>face_kappa_policy</code> で、所有する活動セルについてセル推定と流束制限済みの面コンダクタンス上界の小さい方を取る（\(\Delta l_c\) はセル幅、\(C_c=(\rho c_vV)_c\) はセルの熱容量）。</p>
           $$
-          \Delta t_{exp}=C_{cond}\min_c\frac{(\Delta l_c)^2}{D_{eff,c}},\qquad C_{cond}=0.25\ \text{（既定）}.
+          \Delta t_{exp}=C_{cond}\min_c\!\left(\frac{(\Delta l_c)^2}{D_{eff,c}},\ \frac{2C_c}{g_c}\right),\qquad
+          g_c=\sum_{f\ \mathrm{open}}\lambda_fG_f,\qquad
+          C_{cond}=0.25\ \text{（既定）}.
           $$
-          <p>1D で既定の Kirchhoff 割線を使う面の κ（<code>face_kappa_policy</code>）では、セルごとにもう 1 つの値 \(2(\rho c_vV)_c/\sum_fG_f\) も作り（\(G_f=A_f\kappa_f/\Delta r_f\) はセルの 2 つの面のコンダクタンス、\(\kappa_f\) は流束制限の前の面の κ、\(\Delta r_f\) はセル中心の間隔）、小さい方を最小値に入れる。</p>
+          <p>ここで \(G_f=A_f\kappa_f/\Delta r_f\) は開いた面 \(f\) のコンダクタンス、\(\kappa_f\) は面の κ、\(\lambda_f\) は面の流束制限係数、\(\Delta r_f\) は隣接セル中心の間隔である（開いた面を持たないセルではセル推定のみが入る）。入口検査を通ったあと全ランクに開いた面が 1 つもないときは、入口温度を保ったまま段数 0 で即座に戻り、床のクランプもエネルギー記帳も行わない。</p>
           <p>2D RZ では、段が適用する演算子の Gershgorin の上界 \(\lambda_G\) から \(\Delta t_{exp}=4C_{cond}/\lambda_G\) とする。</p>
           $$
           \lambda_G=\max_c\frac{w_c\left|\sum_dG_{cd}+b_c\right|+\sum_dw_d\left|G_{cd}\right|}{(\rho c_vV)_c}.
@@ -50,14 +52,41 @@
           <p>ここで \(G_{cd}\) はセル \(c\) とそれに隣り合うセル \(d\) の対の係数、\(b_c\) は温度を保持した境界の半辺へのコンダクタンスの和（保持する境界がなければ 0）である。\(d\) の和には、ボイドのセルと \(\rho c_v\le0\) のセルを入れない。\(w\) は温度の重みで、Kirchhoff 割線を使うときは \(w_c=T_{e,c}^{5/2}\)（\(G_{cd}\) は \(\kappa_{eff}/T_e^{5/2}\) から組む）、使わないときは \(w_c=1\) である。段の演算子は行列 \(M^{-1}K\) で、\(M=\mathrm{diag}(\rho c_vV)\)、\(K_{cd}=-G_{cd}\)、\(K_{cc}=\sum_dG_{cd}+b_c\) である。Gershgorin の円板定理（Gershgorin circle theorem）により、\(\lambda_G\) は \(M^{-1}K\) のすべての固有値の上界であり、\(\Delta t_{exp}\) は、すべての固有値 \(\lambda\) について \(\lambda\Delta t_{exp}\le4C_{cond}\) が成り立つことを構成上保証する。割線を使うときの上界は、計算に使った温度での値なので、各段で確かめる（手順 6）。</p>
         </li>
         <li>
-          <p><strong>段数を決める。</strong>チェビシェフの安定区間は \(O(s^2)\) で広がる。1 つの大ステップが進める区間を \(\Delta t_{sup}\) とすると、段数は次のとおりである。</p>
+          <p><strong>段数と副サイクル数を決める。</strong>1D の電子 STS（RKL2）では、入口の計画上界 \(\lambda_{plan}\) と余裕 \(m_b\)（<code>sts_bound_margin</code>、既定 0.1）から基準刻み \(\Delta t_p\)、副サイクル数 \(n_{sub}\)、段数 \(s\) を次式で計画する。</p>
+          $$
+          \begin{aligned}
+          \lambda_{plan}&=\frac{4C_{cond}}{\Delta t_{exp}},\qquad
+          L=\lambda_{plan}(1+m_b),\qquad
+          k=\max\bigl(1,\,2C_{cond}(1+m_b)\bigr),\qquad
+          \Delta t_p=\frac{4C_{cond}}{k\lambda_{plan}},\\
+          c(s)&=\begin{cases}1 & (s=1),\\ (s^2+s-2)/4 & (\text{奇数 }s\ge3),\end{cases}\qquad
+          \Delta t_{cap}=\max(\eta,\,10^{-6})\,c(s_{cap})\Delta t_p,\\
+          n_{sub}&=\begin{cases}\lceil\Delta t/\Delta t_{cap}\rceil & (\Delta t\gt\Delta t_{cap}),\\ 1 & (\Delta t\le\Delta t_{cap}).\end{cases}
+          \end{aligned}
+          $$
+          <p>既定の \(C_{cond}\) = 0.25、\(m_b\) = 0.1 では \(k\) = 1、\(\Delta t_p=\Delta t_{exp}\) である。\(s_{cap}\) は <code>sts_max_stages</code> 以下の最大の奇数、\(\eta\) は <code>sts_subcycle_eta</code>（既定 0.9；段計画では下限 10<sup>−6</sup> で切る）であり、丸め後に \((\Delta t/n_{sub})/\Delta t_p\gt c(s_{cap})\) なら \(n_{sub}\) を 1 増やす。各副サイクル \(\tau=\Delta t/n_{sub}\) の比 \(R=\tau/\Delta t_p\) に対し、\(R\) ≤ 1/2（または \(s_{cap}\) ≤ 2）なら前進オイラー 1 段（\(s\) = 1）、それ以外は \(s^2+s-2\ge4R\) を満たす最小の奇数 \(s\) ≥ 3 を選ぶ。</p>
+          <p>2D RZ のチェビシェフ段では、安定区間が \(O(s^2)\) で広がる。1 つの大ステップが進める区間を \(\Delta t_{sup}\) とすると、段数は次のとおりである。</p>
           $$
           s=\min\!\left(s_{max},\ \max\!\left(1,\left\lceil\sqrt{2\Delta t_{sup}/\Delta t_{exp}}\right\rceil\right)\right).
           $$
           <p>ここで \(s_{max}\) は段数の上限（<code>sts_max_stages</code>、既定 40）である。\(\Delta t\) が \(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2\) を超えるときは、\(\Delta t\) を \(n_{sup}=\lceil\Delta t/(\eta\,s_{max}(s_{max}+1)\Delta t_{exp}/2)\rceil\) 個の等しい大ステップに分け、\(\Delta t_{sup}=\Delta t/n_{sup}\) とする。\(\eta\) は <code>sts_subcycle_eta</code>（既定 0.9）である。超えないときは \(n_{sup}=1\)、\(\Delta t_{sup}=\Delta t\) である。2D RZ で <code>sts_scheme</code> が RKL2 を選ぶときの段数と分割は、<a href="#controls">キーの表</a>の <code>sts_scheme</code> の行に記す。</p>
         </li>
         <li>
-          <p><strong>段の時間刻みを作る。</strong>既定の減衰 ν=0.01（チェビシェフの減衰パラメータ <code>sts_damping</code> — <a href="index.html#mechanism">概要の頁</a>の衝突周波数 \(\nu_{ei}\) や <a href="../lpi/cbet.html">CBET の頁</a>のイオン音波の減衰率 \(\nu_a\) とは別物）として次を作る。</p>
+          <p><strong>段の重みまたは時間刻みを作る。</strong>1D の電子 STS（RKL2）は段の時間刻み \(\tau_j\) を使わず、\(s\) と \(\tau\) から RKL2 の漸化式の重みを次式で作る [3]。</p>
+          $$
+          \begin{aligned}
+          b_0&=b_1=\frac13,\qquad
+          b_j=\frac{j^2+j-2}{2j(j+1)}\ \ (j\ge2),\qquad
+          a_j=1-b_j,\qquad
+          w_1=\frac{4}{s^2+s-2},\qquad
+          \tilde\mu_1=b_1w_1,\\
+          \mu_j&=\frac{(2j-1)b_j}{jb_{j-1}},\qquad
+          \nu_j=-\frac{(j-1)b_j}{jb_{j-2}},\qquad
+          \tilde\mu_j=\mu_jw_1,\qquad
+          \tilde\gamma_j=-a_{j-1}\tilde\mu_j\ \ (2\le j\le s).
+          \end{aligned}
+          $$
+          <p>2D RZ のチェビシェフ段では、既定の減衰 ν=0.01（チェビシェフの減衰パラメータ <code>sts_damping</code> — <a href="index.html#mechanism">概要の頁</a>の衝突周波数 \(\nu_{ei}\) や <a href="../lpi/cbet.html">CBET の頁</a>のイオン音波の減衰率 \(\nu_a\) とは別物）として次を作る。</p>
           $$
           \tau_j=\frac{\Delta t_{exp}}
           {\nu^2+(1-\nu^2)\cos^2\!\left(\frac{\pi(2j-1)}{4s+2}\right)},
@@ -66,12 +95,16 @@
           <p>その後、段の時間刻みの総和が大ステップの区間に一致する（\(\sum_j\tau_j=\Delta t_{sup}\)）よう、すべての τ<sub>j</sub> を一様に再スケールする。既定の構成では、再スケール前の総和が \(\Delta t_{sup}\) を上回るため、この再スケールは τ<sub>j</sub> を縮める方向に働く。</p>
         </li>
         <li>
-          <p><strong>係数を固定したまま全段を適用する。</strong>\(D_{eff}\)、κ<sub>eff</sub>（1D では面の κ）、ρc<sub>v</sub> は入口の \(T_e^n\) における値に固定し、段のあいだで更新するのは温度だけである。ただし 2D RZ の Kirchhoff 割線は、段の温度で評価する。ここで \(\mathcal M_{1D}\) は固定した係数での保存的な 1D 面流束発散演算子である。</p>
+          <p><strong>全段を適用し、受理を検査する。</strong>1D の電子 STS は、熱容量 \(\rho c_v\)、幾何、密度、電荷、質量をステップ入口の値に固定しつつ、各段で入力温度 \(Y_{j-1}\) から係数を評価し直した演算子 \(L_j\) を用いて RKL2 の増分 \(D_j\)（\(Y_j=Y_0+D_j\)、\(F_0=L_1(Y_0)\)、\(D_0=0\)）を進める（\(s\) = 1 では前進オイラー \(D_1=\tau F_0\)）。2D RZ は \(D_{eff}\)、κ<sub>eff</sub>、ρc<sub>v</sub> を入口の \(T_e^n\) における値に固定し（Kirchhoff 割線だけは段の温度で評価する）、チェビシェフ段を適用する。</p>
           $$
-          T_{e,j}=T_{e,j-1}+\frac{\tau_j}{\rho c_v}\mathcal M_{1D}(T_{e,j-1}),\qquad
-          T_{e,c,j}=T_{e,c,j-1}+\frac{\tau_j}{(\rho c_vV)_c}\sum_dG_{cd}S_{cd}\,(T_{e,d,j-1}-T_{e,c,j-1}).
+          \begin{aligned}
+          D_1&=\tilde\mu_1\tau F_0\quad(\text{1D RKL2}),\\
+          D_j&=(\mu_jD_{j-1}+\nu_jD_{j-2})+(\tilde\mu_j\tau L_j(Y_{j-1})+\tilde\gamma_j\tau F_0)\quad(2\le j\le s,\ \text{1D RKL2}),\\
+          T_{e,c,j}&=T_{e,c,j-1}+\frac{\tau_j}{(\rho c_vV)_c}\sum_dG_{cd}S_{cd}\,(T_{e,d,j-1}-T_{e,c,j-1})\quad(\text{2D RZ}).
+          \end{aligned}
           $$
-          <p>ここで \(G_{cd}=-(a_{cd}+a_{dc})/2\) は節点局所の演算子の行列 \(a\) から作る対の係数（\(G_{cd}=G_{dc}\)）、\(d\) は節点を共有する隣のセル（ボイドのセルと \(\rho c_v\le0\) のセルは除く）である。\(S_{cd}\) は 2 つのセルの温度による \(T^{5/2}\) の割線 \(\tfrac27(T_d^{7/2}-T_c^{7/2})/(T_d-T_c)\) で、<code>face_kappa_policy="harmonic"</code> では \(S_{cd}=1\) とする。1D は面の熱流を、隣り合う 2 つのセルに符号だけを反転して入れる。2D RZ の対の電力 \(G_{cd}S_{cd}(T_d-T_c)\) も、\(c\) と \(d\) で符号だけが違う。したがって、どちらの更新も保存的である（温度の床へのクランプ（clamp）が介入しないかぎり）。材料別の保存モードでも、固定したセルの係数に同じ更新を適用する。</p>
+          <p>ここで \(G_{cd}=-(a_{cd}+a_{dc})/2\) は節点局所の演算子の行列 \(a\) から作る対の係数（\(G_{cd}=G_{dc}\)）、\(d\) は節点を共有する隣のセル（ボイドのセルと \(\rho c_v\le0\) のセルは除く）である。\(S_{cd}\) は 2 つのセルの温度による \(T^{5/2}\) の割線 \(\tfrac27(T_d^{7/2}-T_c^{7/2})/(T_d-T_c)\) で、<code>face_kappa_policy="harmonic"</code> では \(S_{cd}=1\) とする。1D は面の熱流を、隣り合う 2 つのセルに同じ演算順で符号だけ反転して入れる。2D RZ の対の電力 \(G_{cd}S_{cd}(T_d-T_c)\) も、\(c\) と \(d\) で符号だけが違う。したがって、どちらの更新も保存的である（温度の床へのクランプ（clamp）が介入しないかぎり）。1D では途中の段で床のクランプを行わず、各副サイクルの末段でだけ床を適用して記録する。材料別の保存モードでも、それぞれの次元の同じ更新を適用する。</p>
+          <p>1D の電子 STS では、係数が段ごとに変わるため、どちらの <code>face_kappa_policy</code> でも 3 種の受理検査を行う。(a) 各段の入力温度での行の率 \(r_i=2g_i/C_i\) が \(L=\lambda_{plan}(1+m_b)\) を超えていないか、(b) 開いた面でつながる各断熱領域 \(r\) で段の出力が入口の範囲 \([lo_r,\,hi_r]\)（\(lo_r=\min_{i\in r}T_i^0-T_{floor}\)、\(hi_r=\max(\max_{i\in r}T_i^0,T_{floor})+T_{floor}\)）に収まっているか、(c) 副サイクル末（床適用前）に呼出し入口の熱容量重み付き領域平均 \(a_r\) からの偏差の熱容量重み付き二乗平均平方根 \(\sigma_r(Y)=\sqrt{\sum_{i\in r}C_i(Y_i-a_r)^2/\sum_{i\in r}C_i}\) が \(\sigma_r(Y_s)\le\sigma_r(Y_0)+10^{-9}T_{s,r}\)（\(T_{s,r}=\max(-lo_r,hi_r)\)）を満たして散逸しているか、である。行の率の上限違反が範囲・散逸の違反と同じ段かそれより先に起きれば、非有限の率（\(\lambda_{seen}=+\infty\)）は再計画せず即座に拒否し、有限なら \(T_e^n\) から \(\lambda_{plan}\) を計画し直す（1 回目は \((1+m_b)\max(\lambda_{seen},\lambda_{plan})\)、2 回目以降は \(2\max(\lambda_{seen},\lambda_{plan})\)、上限 <code>sts_bound_retries_max</code> 回）。範囲または散逸の違反が先に起きれば副サイクルを半減してやり直す（すでに前進オイラー 1 段 \(s=1\) であれば半減せず拒否する）。再計画や半減でも受理できないとき、またはホスト経路で開始済みの全試行の計画段数に次の試行の計画段数を加えた値が正の <code>sts_total_stages_max</code> を超えるとき（その試行の開始前に拒否）は、所有セルの温度を入口の値へビット単位で戻し、ホスト経路ではドライバへ<a href="../../overview/numerics-foundations.html#terms-retry">全ステップの再試行</a>（full-step retry）を要求する（永続カーネルでは床の記帳を 0 にしてエラーを立て、ステップ末で実行を停止する）。</p>
           <p>2D RZ で割線を使うとき、演算子のスペクトルは段のあいだで変わる。そこで各段は、入力温度で行の上界 \(\lambda_G\) を計算し直し、計画に使った値の \(1+\)<code>sts_bound_margin</code> 倍（既定 1.1 倍）を超えていないかを調べる。超えた段があれば、そのステップを \(T_e^n\) から、計画し直した段でやり直す。最初の試行は全段を最後まで進めて最大の上界を測り、その \(1+\)<code>sts_bound_margin</code> 倍で計画し直す。以後の試行は超えた段で止め、計画を 2 倍にする。やり直しは <code>sts_bound_retries_max</code>（既定 4）回までで、それでも超えるときは、ドライバに<a href="../../overview/numerics-foundations.html#terms-retry">全ステップの再試行</a>（full-step retry。時間刻みを半分にして外側のステップ全体をやり直す）を要求する。再試行が無効のとき（<code>Numerics.hydro.driver_full_step_retry_enabled</code> の既定）、または試行回数の上限（<code>driver_full_step_retry_max_attempts</code>、既定 3）か時間刻みの下限に達したときは、実行が停止する。</p>
         </li>
         <li><p><strong>最後に 1 回だけ再クロージャを行う。</strong>全段を終えたあと、温度の変化に対応する電子エネルギーの変化 \(c_{v,e}(T_e^{n+1}-T_e^n)\)（\(c_{v,e}\) はステップ入口の値）を e<sub>e</sub> に記帳し、表の EOS をもつ材料では \((\rho,e_e)\) から T<sub>e</sub>、P<sub>e</sub>、C<sub>v,e</sub> を求め直す。表のない理想気体の材料では、更新後の温度から e<sub>e</sub>、P<sub>e</sub> を求める。これは <code>Numerics.hydro.eos_closure_mode</code> が既定の <code>"energy_authoritative"</code> のときで、<code>"legacy"</code> では表の材料も、更新後の温度から e<sub>e</sub>、P<sub>e</sub> を求める。</p></li>
@@ -102,13 +135,14 @@
           <tr><th>キー</th><th>既定値</th><th>用途</th></tr>
         </thead>
         <tbody>
-          <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>許容値は <code>"sts"</code>（既定の陽的チェビシェフ・スーパータイムステッピング）、<code>"implicit"</code>、<code>"hypre"</code>、<code>"dmp_implicit"</code>。<code>"implicit"</code> は 1D で後退オイラー法の三重対角系を解き、伝導は大域ステップを制限しない。2D の単一ブロックのメッシュでは警告を出して STS で解き、マルチブロックのメッシュでは入力検査が拒否する。<code>"hypre"</code> は 2D では入力検査が拒否する。1D では hypre を有効にしたビルドでだけ受理されるが、陰解法（implicit method）は実行されず、警告を出して STS で解く。<code>"dmp_implicit"</code> は 2D RZ の電子伝導を、離散最大値原理（discrete maximum principle）を満たす非線形 2 点流束（two-point flux）の後退オイラー法で解く。電子の伝導は大域ステップを制限せず、SNB とは併用できない。反復は <code>dmp_picard_rel_tol</code>（既定 10<sup>−10</sup>）、<code>dmp_picard_max_iterations</code>（50）、<code>dmp_anderson_depth</code>（5）で制御し、上限までに収束しないステップは、状態を変えずに小さい刻みでやり直す。1D の SNB は <code>"implicit"</code> を要求する。Studio が書くのは <code>"sts"</code> と 1D の <code>"implicit"</code> である。</td></tr>
-          <tr><th><code>sts_scheme</code></th><td><code>"chebyshev"</code></td><td>STS の段の取り方。<code>"chebyshev"</code> は上の手順のチェビシェフの段、<code>"rkl2"</code> は 2 次の Runge–Kutta–Legendre（RKL2）法の段、<code>"auto"</code> は大ステップの段数が <code>sts_auto_rkl2_stages</code>（既定 10）以上になるときだけ RKL2 を使う。C<sub>cond</sub>=0.25 では、RKL2 の段数 s は奇数で、Δt<sub>sup</sub> ≤ (s<sup>2</sup>+s−2)/2 · Δt<sub>exp</sub> を満たす最小の s ≥ 3 であり、上限 s<sub>cap</sub> は <code>sts_max_stages</code> 以下の最大の奇数である。Δt が η(s<sub>cap</sub><sup>2</sup>+s<sub>cap</sub>−2)/2 · Δt<sub>exp</sub> を超えるときは、チェビシェフの段と同じ形で、Δt を等しい大ステップに分ける。<code>"rkl2"</code> と <code>"auto"</code> は 2D RZ の <code>solver="sts"</code> でだけ受理される。</td></tr>
-          <tr><th><code>sts_max_stages</code></th><td><code>40</code></td><td>1 つの大ステップの段数の上限 s<sub>max</sub>（範囲 1–200）。</td></tr>
-          <tr><th><code>sts_subcycle_eta</code></th><td><code>0.9</code></td><td>大域ステップを大ステップに分ける判定の係数 η（範囲 (0, 1]）。</td></tr>
-          <tr><th><code>sts_damping</code></th><td><code>0.01</code></td><td>チェビシェフの段の減衰 ν（範囲 (0, 1)）。</td></tr>
-          <tr><th><code>sts_bound_margin</code></th><td><code>0.1</code></td><td>2D RZ の Kirchhoff 割線で、各段の Gershgorin の上界を、計画に使った値の 1+この値 倍と比べる。超えた段があれば、ステップをやり直す。</td></tr>
-          <tr><th><code>sts_bound_retries_max</code></th><td><code>4</code></td><td>その検査でステップをやり直す回数の上限。</td></tr>
+          <tr><th><code>solver</code></th><td><code>"sts"</code></td><td>許容値は <code>"sts"</code>（既定の陽的スーパータイムステッピング。1D は段ごとの係数による RKL2、2D RZ は <code>sts_scheme</code> に従う）、<code>"implicit"</code>、<code>"hypre"</code>、<code>"dmp_implicit"</code>。<code>"implicit"</code> は 1D で後退オイラー法の三重対角系を解き、伝導は大域ステップを制限しない。2D の単一ブロックのメッシュでは警告を出して STS で解き、マルチブロックのメッシュでは入力検査が拒否する。<code>"hypre"</code> は 2D では入力検査が拒否する。1D では hypre を有効にしたビルドでだけ受理されるが、陰解法（implicit method）は実行されず、警告を出して STS で解く。<code>"dmp_implicit"</code> は 2D RZ の電子伝導を、離散最大値原理（discrete maximum principle）を満たす非線形 2 点流束（two-point flux）の後退オイラー法で解く。電子の伝導は大域ステップを制限せず、SNB とは併用できない。反復は <code>dmp_picard_rel_tol</code>（既定 10<sup>−10</sup>）、<code>dmp_picard_max_iterations</code>（50）、<code>dmp_anderson_depth</code>（5）で制御し、上限までに収束しないステップは、状態を変えずに小さい刻みでやり直す。1D の SNB は <code>"implicit"</code> を要求する。Studio が書くのは <code>"sts"</code> と 1D の <code>"implicit"</code> である。</td></tr>
+          <tr><th><code>sts_scheme</code></th><td><code>"chebyshev"</code></td><td>STS の段の取り方。1D で受理する値は互換性のため <code>"chebyshev"</code> のみで、1D の電子 STS はこのキーを読まず常に段ごとの係数による RKL2 を実行する。2D RZ では <code>"chebyshev"</code> が上の手順のチェビシェフの段、<code>"rkl2"</code> が 2 次の Runge–Kutta–Legendre（RKL2）法の段、<code>"auto"</code> が大ステップの段数が <code>sts_auto_rkl2_stages</code>（既定 10）以上になるときだけ RKL2 を使う。2D RZ の C<sub>cond</sub>=0.25 では、RKL2 の段数 s は奇数で、Δt<sub>sup</sub> ≤ (s<sup>2</sup>+s−2)/2 · Δt<sub>exp</sub> を満たす最小の s ≥ 3 であり、上限 s<sub>cap</sub> は <code>sts_max_stages</code> 以下の最大の奇数である。Δt が η(s<sub>cap</sub><sup>2</sup>+s<sub>cap</sub>−2)/2 · Δt<sub>exp</sub> を超えるときは、チェビシェフの段と同じ形で、Δt を等しい大ステップに分ける。<code>"rkl2"</code> と <code>"auto"</code> は 2D RZ の <code>solver="sts"</code> でだけ受理される。</td></tr>
+          <tr><th><code>sts_max_stages</code></th><td><code>40</code></td><td>1 つの大ステップ／副サイクルの段数の上限 s<sub>max</sub>（範囲 1–200）。1D の RKL2 では s<sub>max</sub> 以下の最大の奇数 s<sub>cap</sub> を使い、1 または 2 のときは前進オイラー法の副サイクリングになる。</td></tr>
+          <tr><th><code>sts_subcycle_eta</code></th><td><code>0.9</code></td><td>大域ステップを大ステップ／副サイクルに分ける判定の係数 η（範囲 (0, 1]）。1D の RKL2 では max(η, 10<sup>−6</sup>) c(s<sub>cap</sub>) Δt<sub>p</sub> を閾値とする。</td></tr>
+          <tr><th><code>sts_damping</code></th><td><code>0.01</code></td><td>2D RZ のチェビシェフの段の減衰 ν（範囲 (0, 1)）。1D は値の範囲を検査するが、電子 STS（RKL2）ではこのキーを読まない。</td></tr>
+          <tr><th><code>sts_bound_margin</code></th><td><code>0.1</code></td><td>各段の行の率の上界を、計画に使った値の 1+この値 倍と比べる余裕（範囲 (0, +∞)）。1D の電子 STS では両方の <code>face_kappa_policy</code> で適用する。2D RZ では Kirchhoff 割線の経路で適用する。超えた段があれば、ステップをやり直す。</td></tr>
+          <tr><th><code>sts_bound_retries_max</code></th><td><code>4</code></td><td>上の検査でステップをやり直す回数の上限（1D の電子 STS および 2D RZ の Kirchhoff 割線）。</td></tr>
+          <tr><th><code>sts_total_stages_max</code></th><td><code>200000</code></td><td>1 回の伝導呼出しで許容する総段数の上限（範囲 0 以上、0 は上限なし）。1D のホスト経路で開始済みの全試行の計画段数に次の試行の計画段数を加えた値が超過するとき、その試行を開始せずに所有セルの温度を戻して全ステップの再試行を要求する（永続カーネルでは読まない）。</td></tr>
         </tbody>
       </table>
 
@@ -117,6 +151,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
+        <li><strong>1D の標準問題による解析解との比較：</strong><a href="standard-problems.html">1D 熱伝導の解析解による検証</a>の頁で、DT–Au–DT 接触問題および平板・球の Barenblatt–Pattle 瞬間熱源に対する 1D RKL2（段ごとの係数評価）の収束次数とエネルギー保存を判定し、段数・副サイクル数を記録する。</li>
         <li><strong>STS の比較：</strong>解析解を持つ 1D の零流束固有モード（eigenmode）について、球・平面・円筒の STS の計算を、陰解法および材料別の対応する計算と突き合わせ、空間の精度次数と、閉じた領域での電子エネルギー保存を検査する。さらに <code>test_conduction_pattle_1d</code> が、Pattle の非線形拡散の相似解（similarity solution）[2] との比較で \(T^{5/2}\) 熱波面の伝播を判定する。</li>
         <li><strong>離散最大値原理を満たす陰解法（<code>test_conduction_dmp_2d</code>）：</strong>歪んだメッシュで z 方向に線形な場が保たれること、離散最大値原理とエネルギー保存、保持した境界のエネルギーの記帳と一様な場が保たれること、ビット単位の再現とセルの頂点の巻き方向に依らないこと、熱容量が大きく異なるセルの陰的な解、記帳した温度の受け入れ検査を、この試験が検査する。</li>
       </ul>
@@ -127,6 +162,7 @@
       <ol class="references">
         <li>V. Alexiades, G. Amiez, and P.-A. Gremaud, "Super-Time-Stepping Acceleration of Explicit Schemes for Parabolic Problems," Commun. Numer. Methods Eng. 12, 31–42 (1996). <a href="https://doi.org/10.1002/(SICI)1099-0887(199601)12:1%3C31::AID-CNM950%3E3.0.CO;2-5">doi:10.1002/(SICI)1099-0887(199601)12:1&lt;31::AID-CNM950&gt;3.0.CO;2-5</a></li>
         <li>R. E. Pattle, "Diffusion from an Instantaneous Point Source with a Concentration-Dependent Coefficient," Q. J. Mech. Appl. Math. 12, 407–409 (1959). <a href="https://doi.org/10.1093/qjmam/12.4.407">doi:10.1093/qjmam/12.4.407</a></li>
+        <li>C. D. Meyer, D. S. Balsara, and T. D. Aslam, "A stabilized Runge–Kutta–Legendre method for explicit super-time-stepping of parabolic and mixed equations," J. Comput. Phys. 257, 594–626 (2014). <a href="https://doi.org/10.1016/j.jcp.2013.08.021">doi:10.1016/j.jcp.2013.08.021</a></li>
       </ol>
     </section>
 

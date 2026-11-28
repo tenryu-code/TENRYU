@@ -64,6 +64,7 @@
           { id: "conduction-time", title: "Time integration", href: "physics/conduction/time-integration.html", parent: "conduction" },
           { id: "conduction-snb", title: "SNB nonlocal model", href: "physics/conduction/snb.html", parent: "conduction" },
           { id: "conduction-ion", title: "Ion heat conduction", href: "physics/conduction/ion.html", parent: "conduction" },
+          { id: "conduction-standard-problems", title: "1D heat-conduction verification against analytic solutions", href: "physics/conduction/standard-problems.html", parent: "conduction" },
           { id: "laser", title: "Laser drive & absorption", href: "physics/laser/index.html" },
           { id: "laser-beams", title: "Beams & ray launch", href: "physics/laser/beams.html", parent: "laser" },
           { id: "laser-raytrace", title: "Ray tracing", href: "physics/laser/raytrace.html", parent: "laser" },
@@ -165,6 +166,7 @@
           { id: "conduction-time", title: "時間積分", href: "physics/conduction/time-integration.html", parent: "conduction" },
           { id: "conduction-snb", title: "SNB 非局所モデル", href: "physics/conduction/snb.html", parent: "conduction" },
           { id: "conduction-ion", title: "イオン熱伝導", href: "physics/conduction/ion.html", parent: "conduction" },
+          { id: "conduction-standard-problems", title: "1D 熱伝導の解析解による検証", href: "physics/conduction/standard-problems.html", parent: "conduction" },
           { id: "laser", title: "レーザー駆動と吸収", href: "physics/laser/index.html" },
           { id: "laser-beams", title: "ビームと光線の打ち出し", href: "physics/laser/beams.html", parent: "laser" },
           { id: "laser-raytrace", title: "光線追跡", href: "physics/laser/raytrace.html", parent: "laser" },
@@ -226,7 +228,7 @@
         breadcrumb: "パンくずリスト",
         previous: "前へ",
         next: "次へ",
-        footer: "TENRYU ドキュメント — 2026-11-24。",
+        footer: "TENRYU ドキュメント — 2026-11-28。",
         subtitle: "輻射流体コード"
       }
     : {
@@ -238,7 +240,7 @@
         breadcrumb: "Breadcrumb",
         previous: "Previous",
         next: "Next",
-        footer: "TENRYU Documentation — 2026-11-24.",
+        footer: "TENRYU Documentation — 2026-11-28.",
         subtitle: "Radiation Hydrodynamics Code"
       };
 

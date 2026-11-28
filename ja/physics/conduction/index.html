@@ -16,7 +16,7 @@
   <main>
     <div id="breadcrumb" class="breadcrumb" aria-label="Breadcrumb"></div>
     <h1>熱伝導 <span class="badge">reference</span></h1>
-    <p class="abstract">TENRYU の熱伝導は、電子熱伝導とイオン熱伝導から成る。電子熱伝導の基本は、局所の Spitzer–Härm（SH）モデルに調和型の流束制限（harmonic flux limiter）を掛けたものである。1D と 2D RZ では、SNB（Schurtz–Nicolaï–Busquet）多群モデル（multigroup model）による非局所補正（nonlocal correction）を選べる。イオン熱伝導は、Braginskii の伝導率による独立のオプションで、2 温度モデルの 1D と 2D RZ で使える。時間積分は、既定ではスーパータイムステッピング（super-time-stepping、STS）による陽解法で、1D には後退オイラー法（backward Euler method）の陰解法、2D RZ には離散最大値原理（discrete maximum principle）を満たす陰解法もある。この頁は熱伝導全体の物理機構と構成を述べ、項目ごとの詳細は下の 5 頁に分けて書く。</p>
+    <p class="abstract">TENRYU の熱伝導は、電子熱伝導とイオン熱伝導から成る。電子熱伝導の基本は、局所の Spitzer–Härm（SH）モデルに調和型の流束制限（harmonic flux limiter）を掛けたものである。1D と 2D RZ では、SNB（Schurtz–Nicolaï–Busquet）多群モデル（multigroup model）による非局所補正（nonlocal correction）を選べる。イオン熱伝導は、Braginskii の伝導率による独立のオプションで、2 温度モデルの 1D と 2D RZ で使える。時間積分は、既定ではスーパータイムステッピング（super-time-stepping、STS）による陽解法で、1D には後退オイラー法（backward Euler method）の陰解法、2D RZ には離散最大値原理（discrete maximum principle）を満たす陰解法もある。この頁は熱伝導全体の物理機構と構成を述べ、項目ごとの詳細と解析解による検証は下の 6 頁に分けて書く。</p>
 
     <aside class="planned" aria-labelledby="at-a-glance">
       <h3 id="at-a-glance">要点</h3>
@@ -34,6 +34,7 @@
       <a class="card" href="time-integration.html"><h3>時間積分</h3><p>スーパータイムステッピングの手順と、1D と 2D RZ の陰解法。</p></a>
       <a class="card" href="snb.html"><h3>SNB 非局所モデル</h3><p>多群の輸送場による非局所補正と、iSNB のピカール反復。</p></a>
       <a class="card" href="ion.html"><h3>イオン熱伝導</h3><p>Braginskii の伝導率と流束制限によるイオン温度の熱伝導。</p></a>
+      <a class="card" href="standard-problems.html"><h3>1D 熱伝導の解析解による検証</h3><p>2 物質接触と Barenblatt–Pattle 瞬間熱源の 3 標準問題による収束・保存検証。</p></a>
     </div>
 
     <section aria-labelledby="mechanism">
@@ -46,8 +47,8 @@
       <p>流束制限だけでは非局所（nonlocal）輸送は表せない。平均自由行程の \(v^4\) 依存は 2 つの帰結を同時にもたらす。第一に、勾配が最も急な点では、電子が勾配スケールを衝突なしに走り抜けるため、局所勾配から期待される流束は立たず、実流束は Spitzer–Härm 値を下回る。これを流束抑制（flux inhibition）と呼ぶ。第二に、同じ電子は停止するまでの数平均自由行程のあいだ前方へ熱を運び続けるため、アブレーション面より先の物質が加熱される（予熱）。流束制限は局所流束を減らすことしかできないので、第一の効果は近似できるが、熱を勾配の前方へ運ぶ第二の効果は原理的に表せない。両方を捉えるには、電子をエネルギー別に追い、どこまで届きどこで熱を落とすかを解く非局所モデルが必要である。</p>
       <p>Schurtz–Nicolaï–Busquet（SNB）モデルは、この目的の標準的な簡約運動論モデル（reduced kinetic model）である。完全な運動論方程式を解く代わりに、SH 流束を電子エネルギー群（energy group）に分割し、各群の輸送場（transport field）\(H_g\)（次元は熱流束）に対して、その群の平均自由行程 \(\lambda_g\) を距離スケールとする拡散方程式を解く。\(H_g\) は、局所 SH 流束の群配分を源泉として周囲へ広がる。これは、その群の電子が局所の勾配から離れた位置まで熱を運ぶことを表す。そこから再構成した補正 \(\delta q=-\sum_g(\lambda_g^{tr}/3)\nabla H_g\) が、急勾配点の流束を減らすと同時に前方に予熱を作る。</p>
       <p>TENRYU の SNB は独立したソルバではなく、同じ SH 経路への加算補正である。1D では流束制限を適用しない。群、輸送場などの SNB の量は<a href="snb.html#terms-snb">SNB の頁の用語の節</a>で定義する。また、平均自由行程には Brodrick らの整理における縮尺パラメータ \(r\) で \(r=2\) に相当する形を採用しており、電場補正オプションは使用しない。1D では電場のない試験で定めた分離した \(r=2\) の式を使い、明示的な電場項を拒否する。</p>
-      <p>数値面の主課題は、陽的な拡散更新に付く安定条件（stability condition）\(\Delta t\lesssim\Delta x^2/D\) である。熱拡散率（thermal diffusivity）\(D\propto T_e^{5/2}/\rho\) は高温・希薄なコロナで急増するため、安定に許される<a href="time-integration.html#terms-sts">部分ステップ（substep）</a>幅は流体の<a href="time-integration.html#terms-sts">大域ステップ（global step）</a>よりはるかに小さくなる。典型的な <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）のコロナ（500 µm ベンチマークカプセルのコロナセル：\(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m）では、大域のドライバステップ 1 回に対して通常の部分ステップが 130–340 回必要になる。STS は、この部分ステップの列を、長さの異なる \(s\) 個の段（stage）で置き換える。段を組み合わせた安定区間が \(O(s^2)\) で広がるため、必要な段数は部分ステップ数の平方根程度（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）で済み、この例では 17–27 段になる。</p>
-      <p>係数は入口の温度で固定し（2D RZ の <a href="discretization.html#terms-face-kappa">Kirchhoff 割線</a>（secant）だけは段の温度で評価する。<a href="time-integration.html#sts">スーパータイムステッピング</a>の節参照）、ステップの最後に 1 回だけ<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ</a>（re-closure。\((\rho,e)\) から状態方程式（equation of state、EOS）で温度・圧力・比熱を求め直す操作）を行う。更新はすべて保存型であり、材料別の保存モードも同じ STS を使う。任意選択のイオン熱伝導は、1D では STS を使わず、同じ<a href="discretization.html#terms-face-kappa">面の伝導率の作り方（face-κ policy）</a>による後退オイラー（backward Euler）の三重対角（tridiagonal）系で別に解く。2D RZ では、電子と同じ節点局所の演算子にイオンの係数を入れ、電子と同じ STS で解く。</p>
+      <p>数値面の主課題は、陽的な拡散更新に付く安定条件（stability condition）\(\Delta t\lesssim\Delta x^2/D\) である。熱拡散率（thermal diffusivity）\(D\propto T_e^{5/2}/\rho\) は高温・希薄なコロナで急増するため、安定に許される<a href="time-integration.html#terms-sts">部分ステップ（substep）</a>幅は流体の<a href="time-integration.html#terms-sts">大域ステップ（global step）</a>よりはるかに小さくなる。典型的な <a href="../../verification/index.html#gxii">GXII</a>（激光 XII 号、GEKKO XII）のコロナ（500 µm ベンチマークカプセルのコロナセル：\(T_e\approx2\) keV、\(\rho\approx10^{-3}\) g/cm³、\(\Delta l\approx50\,\mu\)m）では、大域のドライバステップ 1 回に対して通常の部分ステップが 130–340 回必要になる。STS は、この部分ステップの列を \(s\) 個の段（stage）で置き換える。安定区間が \(O(s^2)\) で広がるため、必要な段数は部分ステップ数の平方根程度で済み、2D RZ の既定のチェビシェフ段（\(s\approx\lceil\sqrt{2N_{sub}}\rceil\)）ではこの例で 17–27 段、1D の 2 次 Runge–Kutta–Legendre（RKL2）段では 23–37 段になる。</p>
+      <p>1D の電子 STS では、熱容量 \(\rho c_v\) をステップ入口の値に保ちつつ、セル・面の伝導率と流束制限を RKL2 の各段の入力温度で評価し直す。2D RZ では係数を入口の温度で固定し（<a href="discretization.html#terms-face-kappa">Kirchhoff 割線</a>（secant）だけは段の温度で評価する。<a href="time-integration.html#sts">スーパータイムステッピング</a>の節参照）、いずれもステップの最後に 1 回だけ<a href="../../overview/numerics-foundations.html#operator-splitting">再クロージャ</a>（re-closure。\((\rho,e)\) から状態方程式（equation of state、EOS）で温度・圧力・比熱を求め直す操作）を行う。更新はすべて保存型であり、材料別の保存モードも同じ STS を使う。任意選択のイオン熱伝導は、1D では STS を使わず、同じ<a href="discretization.html#terms-face-kappa">面の伝導率の作り方（face-κ policy）</a>による後退オイラー（backward Euler）の三重対角（tridiagonal）系で別に解く。2D RZ では、電子と同じ節点局所の演算子にイオンの係数を入れ、電子と同じ STS で解く。</p>
     </section>
 
     <section aria-labelledby="position">
@@ -62,7 +63,7 @@
           <tr><th>局所 SH モデルと流束制限</th><td>面ごとに適用する。</td><td>セルごとに適用する。</td><td><a href="local.html">局所モデル</a></td></tr>
           <tr><th>空間離散化</th><td>保存型の有限体積。面の伝導率は <code>face_kappa_policy</code> が決める。</td><td>対称なコンダクタンスをもつ節点局所の演算子。</td><td><a href="discretization.html">空間離散化</a></td></tr>
           <tr><th>材料別の保存モード</th><td>使えない。</td><td>使える。</td><td><a href="discretization.html#terms-per-material">材料別の保存モード</a></td></tr>
-          <tr><th>時間積分（既定）</th><td>STS（<code>solver="sts"</code>）。</td><td>STS。<code>sts_scheme</code> で RKL2 も選べる。</td><td><a href="time-integration.html#sts">スーパータイムステッピング</a></td></tr>
+          <tr><th>時間積分（既定）</th><td>STS（<code>solver="sts"</code>。段ごとの係数による RKL2）。</td><td>STS。<code>sts_scheme</code> で RKL2 も選べる。</td><td><a href="time-integration.html#sts">スーパータイムステッピング</a></td></tr>
           <tr><th>時間積分（陰解法）</th><td><code>solver="implicit"</code>（後退オイラー法の三重対角系）。</td><td><code>solver="dmp_implicit"</code>（離散最大値原理を満たす後退オイラー法）。</td><td><a href="time-integration.html#implicit">陰解法</a></td></tr>
           <tr><th>SNB 非局所モデル</th><td>三重対角系。</td><td>節点局所の演算子と共役勾配法。</td><td><a href="snb.html">SNB</a></td></tr>
           <tr><th>イオン熱伝導</th><td>後退オイラー法の三重対角系。</td><td>電子と同じ節点局所の演算子と STS。</td><td><a href="ion.html">イオン熱伝導</a></td></tr>
@@ -73,6 +74,7 @@
     <section aria-labelledby="verification">
       <h2 id="verification">検証</h2>
       <ul>
+        <li><strong>1D の解析解による検証：</strong><a href="standard-problems.html">1D 熱伝導の解析解による検証</a>の頁で、2 物質接触（DT–Au–DT）と平板・球の Barenblatt–Pattle 瞬間熱源に対する収束次数、段ごとの係数評価の分離、エネルギー保存を検証している。</li>
         <li><strong>GXII の基準解：</strong>熱伝導を有効にした統合回帰試験が、吸収エネルギー、最大圧縮時刻、シェル最小半径、ピーク密度、面密度、中心温度を判定する。</li>
       </ul>
     </section>
